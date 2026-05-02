@@ -321,6 +321,58 @@ _PATTERNS_STATUS = (
     _RE(r"\b/?agent_(status|health|metrics|autonomy_status)\b", re.I),
 )
 
+# Self-introspection intents — admin asks the agent about itself.
+
+_PATTERNS_WHOAMI_MODEL = (
+    _RE(r"\b(m|mày|bot|agent)\s+(đang\s+)?(dùng|chạy|sử\s*dụng|use)\s+"
+        r"(model|llm|gì|cái\s+gì)", re.I),
+    _RE(r"\bmodel\s+nào\s+(đang\s+)?(chạy|dùng|sử\s*dụng)", re.I),
+    _RE(r"\b(agent|bot)\s+(đang\s+)?(chạy|dùng)\s+model\s+(gì|nào)", re.I),
+    _RE(r"\b(m|mày|bot|agent)\s+(đang\s+)?là\s+(model|llm)\s+(gì|nào)", re.I),
+    _RE(r"\bxem\s+model\s+đang\s+(chạy|dùng)", re.I),
+)
+
+_PATTERNS_WHOAMI_RUNTIME = (
+    _RE(r"\b(m|mày|bot|agent)\s+(dùng|chạy|sử\s*dụng)\s+claude\s+cli\b", re.I),
+    _RE(r"\bclaude\s+cli\s+hay\s+(9router|api|router)", re.I),
+    _RE(r"\b9router\s+hay\s+claude\s+cli\b", re.I),
+    _RE(r"\b(m|mày|bot|agent)\s+chạy\s+(qua\s+)?(đâu|cách\s+nào|kiểu\s+gì)", re.I),
+    _RE(r"\b(m|mày)\s+(gọi|call)\s+(model|llm)\s+(qua|kiểu)", re.I),
+    _RE(r"\bruntime\s+(của\s+)?(m|mày|agent|bot)", re.I),
+    _RE(r"\b(m|mày|bot)\s+(dùng|chạy)\s+gì\s+để\s+code\b", re.I),
+)
+
+_PATTERNS_RECENT_ACTIVITY = (
+    _RE(r"\b(m|mày|bot|agent)\s+(vừa|mới|đang|hiện)\s+làm\s+(gì|cái\s+gì)", re.I),
+    _RE(r"\b(làm|chạy)\s+(cái\s+)?gì\s+(xong|rồi|đó)\b", re.I),
+    _RE(r"\b(báo\s*cáo|recent|mới\s*nhất)\s+(activity|hoạt\s*động|"
+        r"việc\s*làm)", re.I),
+    _RE(r"\bxem\s+(việc\s+)?vừa\s+làm", re.I),
+    _RE(r"\b(m|mày|agent)\s+(làm|chạy)\s+xong\s+(cái\s+)?gì", re.I),
+)
+
+_PATTERNS_NEXT_MISSION = (
+    _RE(r"\bmục\s*(tiêu|đích)\s+(tiếp\s*theo|tiếp|kế\s*tiếp|next)", re.I),
+    _RE(r"\bnext\s+(mission|task|goal)\b", re.I),
+    _RE(r"\b(roadmap|kế\s*hoạch)\s+(kế\s*tiếp|tiếp\s*theo|tiếp)", re.I),
+    _RE(r"\bsắp\s+làm\s+gì\b", re.I),
+    _RE(r"\b(việc|task)\s+(tiếp\s*theo|kế\s*tiếp)\s+(là\s+)?gì", re.I),
+    _RE(r"\bxem\s+roadmap\b", re.I),
+    _RE(r"\b/?roadmap\b", re.I),
+    _RE(r"\bmission\s+(của\s+)?(m|mày|agent)", re.I),
+)
+
+_PATTERNS_WHOAMI = (
+    _RE(r"^\s*(m|mày|bot|agent)\s+là\s+(ai|gì|cái\s*gì)\s*[\?!\.]?$", re.I),
+    _RE(r"\bmục\s*(đích|tiêu)\s+của\s+(m|mày|agent|bot)\s+(là\s+)?gì", re.I),
+    _RE(r"\b(m|mày|bot|agent)\s+(được\s+)?train\s+để\s+(làm\s+)?(gì|cái\s+gì)",
+        re.I),
+    _RE(r"\b(giới\s*thiệu|introduce)\s+(bản\s*thân|m|mày|về\s+(m|mày|agent))",
+        re.I),
+    _RE(r"\b/?whoami\b", re.I),
+    _RE(r"\bnhiệm\s*vụ\s+của\s+(m|mày|agent)\b", re.I),
+)
+
 # Diag-style intents — "agent đang kẹt ở đâu" / "diag"
 _PATTERNS_DIAG = (
     _RE(r"\bagent\s+(đang\s+)?(kẹt|stuck|stall|treo|đứng)", re.I),
@@ -696,6 +748,30 @@ def classify(text: str) -> Intent:
                       "Thu hồi quyền session.", {}, "low", False)
 
     # 6. Status / list / search
+    # ── Self-introspection (more specific than DIAG / STATUS) ──────────
+    # RUNTIME first — "m dùng gì để code" mentions "code" so it's a
+    # runtime question, not a model-name question.
+    if _has_any(t, _PATTERNS_WHOAMI_RUNTIME):
+        return Intent("whoami_runtime", 0.95,
+                      "Giải thích kiến trúc runtime: 9Router cho chat/"
+                      "search, Claude CLI cho coding.", {}, "low", False)
+    if _has_any(t, _PATTERNS_WHOAMI_MODEL):
+        return Intent("whoami_model", 0.95,
+                      "Báo cáo model nào đang chạy (chat/coding/etc).",
+                      {}, "low", False)
+    if _has_any(t, _PATTERNS_RECENT_ACTIVITY):
+        return Intent("recent_activity", 0.95,
+                      "Tóm tắt hoạt động gần nhất: audit log + last "
+                      "code_task done + brain_evolve.", {}, "low", False)
+    if _has_any(t, _PATTERNS_NEXT_MISSION):
+        return Intent("next_mission", 0.95,
+                      "Hiển thị mission tiếp theo: roadmap + queue.",
+                      {}, "low", False)
+    if _has_any(t, _PATTERNS_WHOAMI):
+        return Intent("whoami", 0.95,
+                      "Giới thiệu agent: mission, kiến trúc, model "
+                      "policy.", {}, "low", False)
+
     if _has_any(t, _PATTERNS_DIAG):
         return Intent("agent_diag", 0.95,
                       "Hiển thị bảng diag: queue, worker, claude, "

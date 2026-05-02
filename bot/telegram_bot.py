@@ -1713,6 +1713,252 @@ def handle_brain_evolve_status() -> str:
 
 # ── /agent_diag — single-screen diagnostic ───────────────────────────────────
 
+# ── Self-introspection handlers ──────────────────────────────────────────────
+
+async def handle_whoami_model() -> str:
+    """Report which models are active (chat/coding/etc) using live
+    /router_status data. Adds the actual_model from claude_quota probe."""
+    lines = ["<b>🤖 Model đang dùng</b>"]
+    # Live /router_status
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            r = await c.get(f"{BACKEND}/router_status")
+        d = r.json() if r.status_code == 200 else {}
+        rms = d.get("role_models", {})
+        lines.append("<b>Roles (live từ 9Router):</b>")
+        for role, label in [
+            ("chat",            "chat / Telegram / TikTok"),
+            ("telegram_chat",   "telegram_chat"),
+            ("tiktok_chat",     "tiktok_chat"),
+            ("search_summary",  "search_summary"),
+            ("reasoning",       "reasoning"),
+            ("coding",          "coding (qua llm_client API)"),
+            ("critic",          "critic"),
+            ("vision",          "vision (OCR / image)"),
+            ("cheap",           "cheap / fallback"),
+        ]:
+            v = rms.get(role, "?")
+            lines.append(f"  • {label}: <code>{_esc(v)}</code>")
+    except Exception as e:
+        lines.append(f"  <i>router_status lỗi: {_esc(str(e))[:120]}</i>")
+
+    # Claude CLI worker model (from env + last probe)
+    try:
+        from bot.coding_worker_bridge import (CLAUDE_CODE_MODEL,
+                                                CLAUDE_FALLBACK_MODEL,
+                                                get_preferred_coding_tool)
+        cli_state = (_cq.get_quota_state() or {}).get("status", "unknown")
+        actual = (_cq.get_quota_state() or {}).get("actual_model", "")
+        tool = get_preferred_coding_tool()
+        lines.append("")
+        lines.append("<b>Coding worker (Claude CLI):</b>")
+        lines.append(f"  • primary:  <code>{_esc(CLAUDE_CODE_MODEL)}</code>")
+        lines.append(f"  • fallback: <code>{_esc(CLAUDE_FALLBACK_MODEL)}</code>")
+        if tool:
+            lines.append(f"  • binary:   <code>{_esc(tool.binary)}</code> "
+                         f"({_esc(tool.version)})")
+        lines.append(f"  • status:   <b>{_esc(cli_state)}</b>")
+        if actual:
+            lines.append(f"  • last_probe_model: <code>{_esc(actual)}</code>")
+    except Exception as e:
+        lines.append(f"  <i>CLI lookup lỗi: {_esc(str(e))[:120]}</i>")
+    return "\n".join(lines)
+
+
+async def handle_whoami_runtime() -> str:
+    """Explain the dual-runtime architecture in Vietnamese."""
+    lines = [
+        "<b>🧩 Runtime kiến trúc</b>",
+        "",
+        "<b>1. Telegram chat / TikTok / search → 9Router</b>",
+        "  Đi qua <code>bot/llm_client.complete(role=...)</code> "
+        "(HTTP API, async).",
+        "  Roles dùng <code>cx/gpt-5.5</code> (chat / tiktok_chat / "
+        "telegram_chat / search_summary).",
+        "  Backend xử lý: <code>backend/server.py /message</code>.",
+        "",
+        "<b>2. Coding tasks → Claude CLI (Opus 4.7)</b>",
+        "  Đi <b>trực tiếp</b> qua local Claude CLI binary "
+        "(<code>~/.local/bin/claude --print</code>), KHÔNG qua 9Router.",
+        "  Module: <code>bot/coding_worker_bridge.py</code>. "
+        "Spawn <code>sudo -u levanrin2404 -H env "
+        "ANTHROPIC_MODEL=opus claude --model opus "
+        "--fallback-model sonnet --print &lt; prompt.md</code>.",
+        "  Quota tracking: <code>bot/claude_quota.py</code> probe + "
+        "error parser + 1h backoff.",
+        "",
+        "<b>3. OCR / Vision → 9Router (openai/gpt-4o)</b>",
+        "  Module: <code>bot/ocr.py</code>, "
+        "<code>llm_client.complete(role='vision')</code>.",
+        "",
+        "<b>Lý do dùng cả hai:</b>",
+        "  • cx/gpt-5.5 nhanh + rẻ cho chat / tóm tắt / sales consult.",
+        "  • Claude Opus 4.7 mạnh nhất cho coding self-improvement.",
+        "  • Tách 2 đường giúp chat không tốn quota Claude và ngược lại.",
+    ]
+    # Append live status
+    try:
+        async with httpx.AsyncClient(timeout=4) as c:
+            r = await c.get(f"{BACKEND}/router_status")
+        d = r.json() if r.status_code == 200 else {}
+        if d.get("reachable"):
+            lines.append("")
+            lines.append(f"<i>9Router live: ✅ reachable ({d.get('model_count','?')} models)</i>")
+    except Exception:
+        pass
+    cqs = _cq.get_quota_state() or {}
+    lines.append(f"<i>Claude CLI: {cqs.get('status', 'unknown')}</i>")
+    return "\n".join(lines)
+
+
+async def handle_recent_activity() -> str:
+    """Summarise last N audit-log entries + last code_task done +
+    brain_evolve last action."""
+    lines = ["<b>📋 Hoạt động gần đây</b>"]
+    # Last 5 audit lines
+    try:
+        from bot.agent.audit_log import tail_audit
+        recent = tail_audit(8)
+        if recent:
+            lines.append("<b>Audit (8 mới nhất):</b>")
+            for a in reversed(recent):  # newest first
+                ts     = (a.get("timestamp") or "")[:16].replace("T", " ")
+                action = _esc((a.get("action") or "")[:30])
+                summary = _esc((a.get("result_summary") or "")[:80])
+                risk   = a.get("risk_level", "low")
+                icon   = {"low": "🟢", "medium": "🟡",
+                          "high": "🔴"}.get(risk, "⚪")
+                lines.append(f"  {icon} <code>{action}</code> "
+                             f"<i>{ts}</i> — {summary}")
+    except Exception as e:
+        lines.append(f"  <i>audit_log lỗi: {_esc(str(e))[:80]}</i>")
+
+    # Last code_task done
+    try:
+        done = code_list_tasks(status="done", limit=1)
+        if done:
+            t = done[0]
+            lines.append("")
+            lines.append("<b>Code task done gần nhất:</b>")
+            lines.append(f"  ✅ <code>{t['id']}</code> — "
+                         f"{_esc((t.get('title') or '')[:60])}")
+            if t.get("commit_hash"):
+                lines.append(f"  commit <code>{_esc(t['commit_hash'])}</code>")
+            if t.get("test_summary"):
+                lines.append(f"  <i>{_esc(t['test_summary'][:120])}</i>")
+    except Exception:
+        pass
+
+    # brain_evolve
+    try:
+        from bot.agent import brain_evolve as _be
+        s = _be.state()
+        lines.append("")
+        lines.append(f"<b>Brain evolve:</b> "
+                     f"{'🟢 enabled' if s.get('enabled') else '⚪ stopped'} "
+                     f"· run_count={s.get('run_count', 0)}")
+        if s.get("last_status"):
+            lines.append(f"  last_status: <i>{_esc(str(s['last_status']))[:80]}</i>")
+        if s.get("last_summary"):
+            lines.append(f"  <i>{_esc(s['last_summary'][:120])}</i>")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+async def handle_next_mission() -> str:
+    """Vietnamese roadmap+queue overview — what's next on the agent's plate."""
+    lines = ["<b>➡ Mục tiêu tiếp theo</b>"]
+    # Roadmap unchecked items
+    try:
+        roadmap_path = Path("/opt/tiktok-bot/docs/ROADMAP.md")
+        if roadmap_path.exists():
+            txt = roadmap_path.read_text(encoding="utf-8")
+            import re as _re
+            done    = len(_re.findall(r"^- \[x\] ", txt, _re.MULTILINE))
+            pending = _re.findall(r"^- \[ \] (.+)$", txt, _re.MULTILINE)
+            lines.append(f"<b>Roadmap:</b> {done} done · {len(pending)} pending")
+            for i, item in enumerate(pending[:5], 1):
+                lines.append(f"  {i}. {_esc(item[:120])}")
+            if not pending:
+                lines.append("  <i>(roadmap đang sạch — chưa có item unchecked)</i>")
+        else:
+            lines.append("<i>docs/ROADMAP.md chưa có.</i>")
+    except Exception as e:
+        lines.append(f"<i>roadmap lỗi: {_esc(str(e))[:80]}</i>")
+
+    # Top queued code_tasks
+    try:
+        queued = code_list_tasks(status="queued", limit=3)
+        if queued:
+            lines.append("")
+            lines.append("<b>🛠 Code task đang queue:</b>")
+            risk_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+            for t in queued:
+                ic = risk_icon.get(t.get("risk_level", "low"), "⚪")
+                lines.append(f"  {ic} <code>{t['id']}</code> "
+                             f"p{t.get('priority',5)} "
+                             f"{_esc((t.get('title') or '')[:60])}")
+        else:
+            lines.append("")
+            lines.append("<i>(chưa có code_task nào trong queue)</i>")
+    except Exception:
+        pass
+
+    # Brain evolve hint
+    try:
+        from bot.agent import brain_evolve as _be
+        s = _be.state()
+        if s.get("enabled"):
+            lines.append("")
+            lines.append("<i>🟢 Brain evolution loop đang chạy — "
+                         "sẽ tự pick task tiếp theo khi đủ điều kiện.</i>")
+        else:
+            lines.append("")
+            lines.append("<i>Brain evolve hiện đã tắt. Gõ "
+                         "<code>“tự cải thiện brain đi”</code> để bật.</i>")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+async def handle_whoami() -> str:
+    """Mission statement + architecture summary in Vietnamese."""
+    lines = [
+        "<b>🤖 Em là gì</b>",
+        "",
+        "Em là <b>Business Agent Platform</b> của muaesim.vn / "
+        "Chatgibiti — một AI agent đang tự train để trở thành "
+        "<b>agent thông minh nhất cho doanh nghiệp eSIM Nhật Bản</b>.",
+        "",
+        "<b>Mission:</b>",
+        "  • Trả lời TikTok DM (Chatgibiti) bằng product DB đã verify.",
+        "  • Quản lý catalog eSIM + lead + consulting log qua Telegram.",
+        "  • Self-improve liên tục: planner → code task → Claude Opus → "
+        "smoke + evals → commit → push.",
+        "",
+        "<b>Học từ:</b> OpenClaw (gateway hub), LangGraph (durable "
+        "graph), OpenHands (coding worker loop), CrewAI (role-based "
+        "agents). Xem <code>research/agents/AGENT_FRAMEWORK_STUDY.md</code>.",
+        "",
+        "<b>Kiến trúc 2 đường:</b>",
+        "  1. Chat / search / sales → 9Router <code>cx/gpt-5.5</code>",
+        "  2. Coding self-improve → Claude CLI <code>opus</code> "
+        "(fallback <code>sonnet</code>)",
+        "",
+        "<b>Quy tắc owner-tooling:</b>",
+        "  • Tool có sẵn → chạy ngay (low/medium auto, high cần "
+        "✅ Đồng ý).",
+        "  • Tool thiếu → tạo code_task để build, không refuse.",
+        "  • Không bao giờ post / DM / merge main / xóa data tự động.",
+        "",
+        "<b>Câu lệnh hữu ích:</b>",
+        "  /agent_diag, /agent_status, /claude_status, "
+        "/code_status, /brain_evolve_status, /workers_remote",
+    ]
+    return "\n".join(lines)
+
+
 async def handle_agent_diag() -> str:
     """Vietnamese single-screen diagnostic. Always returns a non-empty
     answer even if some subsystem is broken.  No await on the long
@@ -2925,6 +3171,12 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/brain_evolve_stop":    return handle_brain_evolve_stop()
     if cmd == "/brain_evolve_status":  return handle_brain_evolve_status()
     if cmd == "/agent_diag":           return await handle_agent_diag()
+    if cmd == "/whoami":               return await handle_whoami()
+    if cmd == "/whoami_model":         return await handle_whoami_model()
+    if cmd == "/whoami_runtime":       return await handle_whoami_runtime()
+    if cmd == "/recent":               return await handle_recent_activity()
+    if cmd == "/next_mission":         return await handle_next_mission()
+    if cmd == "/roadmap":              return await handle_next_mission()
     # ── Remote workers ───────────────────────────────────────────────────
     if cmd == "/workers_remote":   return handle_workers_remote()
     if cmd == "/worker_add":       return handle_worker_add(arg)
@@ -3246,6 +3498,16 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     # ── Status / list / search / receive_file_context ────────────────────
     if name == "agent_diag":
         return await handle_agent_diag()
+    if name == "whoami_model":
+        return await handle_whoami_model()
+    if name == "whoami_runtime":
+        return await handle_whoami_runtime()
+    if name == "recent_activity":
+        return await handle_recent_activity()
+    if name == "next_mission":
+        return await handle_next_mission()
+    if name == "whoami":
+        return await handle_whoami()
     if name == "status":
         return await handle_agent_status()
     if name == "list_tasks":
