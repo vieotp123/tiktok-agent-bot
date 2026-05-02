@@ -279,6 +279,17 @@ _PATTERNS_QUOTA_STATUS = (
     _RE(r"\b(kiểm\s*tra|check|test|probe)\s+(quota|claude)\b", re.I),
     _RE(r"\b/?claude_probe\b", re.I),
     _RE(r"\bclaude\s+(còn|đang)\s+(work|chạy\s+được|available)", re.I),
+    # Yes/no question forms — admin asking "is claude limited?".
+    # These must be QUOTA_STATUS (read state), NOT QUOTA_SCHEDULE.
+    _RE(r"\bclaude\s+(đã\s+|bị\s+)?limit\s+(chưa|không|hay)", re.I),
+    _RE(r"\bclaude\s+(có\s+)?limit\s+(không|hay)\b", re.I),
+    _RE(r"\bclaude\s+(đã\s+)?hết\s+quota\s+(chưa|không)", re.I),
+    _RE(r"\bclaude\s+(còn\s+)?(xài|dùng|chạy)\s+(được\s+)?(không|chưa)", re.I),
+    _RE(r"\bclaude\s+available\s+(chưa|không)", re.I),
+    _RE(r"\bclaude\s+(ok|okay|ổn)\s+(không|chưa)", re.I),
+    _RE(r"\bclaude\s+(rảnh|free)\s+(chưa|không)", re.I),
+    _RE(r"\bclaude\s+(còn\s+)?(work|hoạt\s+động)\s+(không|chưa)", re.I),
+    _RE(r"\bclaude\s+(đang|hiện)\s+sao\b", re.I),
 )
 
 _PATTERNS_GRANT_PERM = (
@@ -503,9 +514,12 @@ def classify(text: str) -> Intent:
 
     high_risk = _has_any(t, _PATTERNS_HIGH_RISK)
 
-    # 2. Quota intents take precedence over run-next when the message
-    #    mentions quota — "claude hết quota 3 tiếng nữa chạy 1 task" must
-    #    classify as quota_schedule, not as run_next_code_task.
+    # 2. Quota intents — STATUS (yes/no questions) BEFORE SCHEDULE so
+    #    "claude đã limit chưa" / "claude limit chưa" goes to read-state
+    #    not schedule-retry.
+    if _has_any(t, _PATTERNS_QUOTA_STATUS):
+        return Intent("quota_status", 0.9,
+                      "Xem trạng thái quota Claude.", {}, "low", False)
     if _has_any(t, _PATTERNS_QUOTA):
         mins = parse_duration_vi(t) or 0
         m2 = re.search(r"\bchạy\s+(\d+)\s+task", t, re.I)
@@ -514,9 +528,6 @@ def classify(text: str) -> Intent:
                       "Hẹn lịch chạy lại Claude khi hồi quota.",
                       {"minutes": mins, "max_tasks": max_tasks,
                        "raw": t}, "low", False)
-    if _has_any(t, _PATTERNS_QUOTA_STATUS):
-        return Intent("quota_status", 0.9,
-                      "Xem trạng thái quota Claude.", {}, "low", False)
 
     # 3. Run-batch BEFORE run-next
     for p in _PATTERNS_RUN_BATCH:

@@ -3192,7 +3192,41 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
                 await asyncio.to_thread(_cq.probe_claude_available, False)
         except Exception:
             pass
-        return _cq.format_claude_status_vi()
+
+        # Yes/no preface — when the admin asked a yes/no question
+        # ("claude đã limit chưa", "claude còn xài được không"), lead
+        # with a one-line direct answer in Vietnamese before the panel.
+        rt = (raw_text or "").lower()
+        is_yesno = any(k in rt for k in
+                       ("chưa", "không", "available", "ok không", "ổn không"))
+        prefix = ""
+        if is_yesno:
+            try:
+                st = (_cq.get_quota_state() or {}).get("status", "unknown")
+            except Exception:
+                st = "unknown"
+            limited_q = ("limit" in rt or "hết" in rt or "quota" in rt)
+            available_q = ("xài" in rt or "dùng" in rt or "chạy" in rt
+                           or "available" in rt or "ok" in rt
+                           or "ổn" in rt or "rảnh" in rt or "free" in rt
+                           or "work" in rt or "hoạt" in rt)
+            if st == "limited":
+                if limited_q:
+                    prefix = "🔴 <b>Đã limit rồi.</b> "
+                elif available_q:
+                    prefix = "🔴 <b>Chưa xài được — Claude đang limit.</b> "
+            elif st == "available":
+                if limited_q:
+                    prefix = "🟢 <b>Chưa limit — Claude đang xài bình thường.</b> "
+                elif available_q:
+                    prefix = "🟢 <b>Còn xài được — Claude available.</b> "
+            elif st == "auth_required":
+                prefix = ("🔒 <b>Cần đăng nhập lại Claude</b> "
+                          "(<code>claude login</code>). ")
+            elif st in ("error", "unknown"):
+                prefix = ("❓ <b>Chưa biết chắc</b> — chạy "
+                          "<code>/claude_probe</code> để probe ngay. ")
+        return prefix + ("\n\n" if prefix else "") + _cq.format_claude_status_vi()
 
     # ── Permission grant / revoke ────────────────────────────────────────
     if name == "grant_permission":
