@@ -498,7 +498,8 @@ _PATTERNS_AGENT_AUTORUN_STATUS = (
 
 # ── Agent progress — "đang làm tới đâu rồi" / "sao im vậy" ──────────────────
 _PATTERNS_AGENT_PROGRESS = (
-    _RE(r"\bđang\s+làm\s+(tới|đến)\s+đâu\s+(rồi|chưa)?", re.I),
+    # "đang làm tới đâu rồi" / "làm tới đâu rồi" / "làm tới đâu" — đang optional
+    _RE(r"\b(đang\s+)?làm\s+(tới|đến)\s+đâu(\s+(rồi|chưa))?\b", re.I),
     _RE(r"\bsao\s+im\s+(vậy|thế)\b", re.I),
     _RE(r"\bxem\s+tiến\s*độ\b", re.I),
     _RE(r"\b(kẹt|stuck)\s+(ở\s+)?đâu", re.I),
@@ -508,6 +509,9 @@ _PATTERNS_AGENT_PROGRESS = (
     _RE(r"\bcòn\s+(task|việc)\s+gì\s+chưa\s+làm\b", re.I),
     _RE(r"\bxem\s+log\s+gần\s+(nhất|đây)\b", re.I),
     _RE(r"\btiến\s*độ\s+task\b", re.I),
+    # "task chạy đến đâu rồi" / "task xong chưa"
+    _RE(r"\btask\s+(đang\s+)?(chạy|làm)\s+(đến|tới)\s+đâu", re.I),
+    _RE(r"\btask\s+xong\s+(chưa|rồi)\b", re.I),
 )
 
 # ── EsimAccess / API integration intents ────────────────────────────────────

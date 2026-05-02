@@ -373,8 +373,26 @@ def build_worker_command(tool: ToolInfo, prompt_path: Path, task_id: str
         # already authenticated the CLI (claude login). --model pins
         # the family (default 'opus'); --fallback-model lets the CLI
         # auto-switch to sonnet if Opus is overloaded.
+        #
+        # --permission-mode bypassPermissions: required for autonomous
+        # coding via --print. Without it, the CLI's permission system
+        # blocks Edit / Bash / Write tools and the worker exits with
+        # "edit was denied" → no_changes. The bridge has its own safety
+        # gates AFTER the run (forbidden-path filter, smoke + evals,
+        # dirty-tree gate, commit only on green) so this is acceptable.
+        # Owner Authority Policy explicitly allows the agent to edit
+        # repo files. Aligns with /opt/tiktok-bot/docs/OPERATING_RULES
+        # §10 (owner tooling doctrine — never refuse generically).
+        # --add-dir pins the working directory for tool sandbox
+        # discovery. We do NOT use --dangerously-skip-permissions
+        # since the bridge runs with internet access (9Router, github,
+        # etc); bypassPermissions still applies the CLI's intrinsic
+        # safety nets while skipping per-edit prompts.
         return (_run_as_prefix("claude")
-                + [tool.binary, *_claude_model_args(), "--print"])
+                + [tool.binary, *_claude_model_args(),
+                   "--permission-mode", "bypassPermissions",
+                   "--add-dir", str(REPO),
+                   "--print"])
     if tool.name == "codex":
         return [tool.binary, "exec", "--cd", str(REPO)]
     # Unknown tool — refuse to invent flags
