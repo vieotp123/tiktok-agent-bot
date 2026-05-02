@@ -1,6 +1,17 @@
 """
 Audit log — append-only JSONL at data/audit/actions.jsonl.
 Logs every task/action. Never logs secrets.
+
+Schema (one JSON object per line):
+  timestamp      UTC ISO 8601
+  user           actor (tg_admin, tiktok_chatgibiti, task_<id>, ...)
+  channel        source channel (telegram | tiktok | internal | task)
+  action         skill or command name (run_task:search_web, /status, ...)
+  risk_level     low | medium | high
+  status         ok | done | failed | pending | cancelled
+  result_summary truncated to 200 chars, no secrets
+  task_id        task_queue row id if applicable
+  goal           user intent, truncated to 120 chars
 """
 import json
 from datetime import datetime, timezone
@@ -23,12 +34,27 @@ def log_action(
     status: str = "ok",
     result_summary: str = "",
     task_id: str = "",
+    channel: str = "",
     **extra,
 ) -> None:
-    """Append one audit entry. Silently drops keys that look like secrets."""
+    """
+    Append one audit entry. Silently drops keys that look like secrets.
+
+    channel: "telegram" | "tiktok" | "internal" | "task" (auto-inferred if empty)
+    """
+    if not channel:
+        u = user.lower()
+        if u.startswith("tg_"):
+            channel = "telegram"
+        elif u.startswith("task_"):
+            channel = "task"
+        else:
+            channel = "tiktok"
+
     entry: dict = {
         "timestamp":      _now(),
         "user":           user,
+        "channel":        channel,
         "action":         action,
         "risk_level":     risk_level,
         "status":         status,
@@ -57,3 +83,30 @@ def tail_audit(n: int = 20) -> list[dict]:
         except Exception:
             pass
     return entries
+
+
+# Alias used by Telegram /audit_recent command
+tail_recent = tail_audit
+
+
+def format_audit_recent(n: int = 10) -> str:
+    """Human-readable audit entries for Telegram /audit_recent command."""
+    entries = tail_audit(n)
+    if not entries:
+        return "No audit entries yet."
+    icon_map = {"low": "🔵", "medium": "🟡", "high": "🔴"}
+    lines = [f"<b>Audit log</b> (last {len(entries)})"]
+    for e in entries:
+        icon = icon_map.get(e.get("risk_level", "low"), "⚪")
+        status = e.get("status", "")
+        status_icon = "✅" if status in ("ok", "done") else ("❌" if status == "failed" else "⏳")
+        ts = e.get("timestamp", "")[:16]
+        action = e.get("action", "")
+        summary = e.get("result_summary", "")[:80]
+        channel = e.get("channel", "")
+        lines.append(
+            f"{icon}{status_icon} <b>{action}</b> [{channel}]"
+            + (f"\n   {summary}" if summary else "")
+            + f"\n   <i>{ts}</i>"
+        )
+    return "\n\n".join(lines)

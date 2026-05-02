@@ -114,3 +114,149 @@ register(Skill(
     handler="systemctl_restart",
     examples=["restart tiktok-bot", "restart tiktok-backend"],
 ))
+
+register(Skill(
+    name="file_summary",
+    description="Tóm tắt nội dung file upload qua Telegram bằng LLM.",
+    risk_level="low",
+    enabled=True,
+    handler="_summarize_via_backend",
+    examples=["/file <path>", "tóm tắt file vừa upload"],
+))
+
+register(Skill(
+    name="task_runner",
+    description="Chạy task mới trong task queue (search/chat/btc).",
+    risk_level="medium",
+    enabled=True,
+    handler="run_task",
+    examples=["/task tìm mới nhất về AI 2026", "/task giá btc"],
+))
+
+register(Skill(
+    name="agent_blueprint",
+    description="Xem tóm tắt kiến trúc agent platform.",
+    risk_level="low",
+    enabled=True,
+    handler="handle_agent_blueprint",
+    examples=["/agent_blueprint"],
+))
+
+register(Skill(
+    name="workers",
+    description="Xem danh sách workers đang đăng ký.",
+    risk_level="low",
+    enabled=True,
+    handler="handle_workers",
+    examples=["/workers"],
+))
+
+register(Skill(
+    name="memory_search",
+    description="Tìm kiếm trong semantic memory.",
+    risk_level="low",
+    enabled=True,
+    handler="handle_memory_search",
+    examples=["/memory_search Python 3.13"],
+))
+
+register(Skill(
+    name="lessons",
+    description="Xem episodic lessons từ các lần chạy skill trước.",
+    risk_level="low",
+    enabled=True,
+    handler="handle_lessons",
+    examples=["/lessons", "/lessons search_web"],
+))
+
+register(Skill(
+    name="audit_recent",
+    description="Xem 10 audit entries gần nhất.",
+    risk_level="low",
+    enabled=True,
+    handler="handle_audit_recent",
+    examples=["/audit_recent"],
+))
+
+# ── Future skills (disabled — placeholders for roadmap) ──────────────────────
+
+register(Skill(
+    name="product_lookup",
+    description="[FUTURE] Tìm kiếm sản phẩm trong catalog hoặc web.",
+    risk_level="low",
+    enabled=False,
+    handler="product_lookup_handler",
+    examples=["tìm sản phẩm X giá bao nhiêu"],
+))
+
+register(Skill(
+    name="sales_consult",
+    description="[FUTURE] Tư vấn bán hàng dựa trên context.",
+    risk_level="medium",
+    enabled=False,
+    handler="sales_consult_handler",
+    examples=["tư vấn khách hỏi về sản phẩm Y"],
+))
+
+register(Skill(
+    name="seo_research",
+    description="[FUTURE] Nghiên cứu từ khóa và đối thủ SEO.",
+    risk_level="medium",
+    enabled=False,
+    handler="seo_research_handler",
+    examples=["nghiên cứu SEO chủ đề Z"],
+))
+
+register(Skill(
+    name="content_factory",
+    description="[FUTURE] Tạo nội dung bài đăng / caption.",
+    risk_level="medium",
+    enabled=False,
+    handler="content_factory_handler",
+    examples=["viết caption TikTok cho sản phẩm X"],
+))
+
+register(Skill(
+    name="browser_search",
+    description="[FUTURE] Tự động hóa trình duyệt với Playwright.",
+    risk_level="medium",
+    enabled=False,
+    handler="browser_search_handler",
+    examples=["mở trang web X và lấy giá"],
+))
+
+register(Skill(
+    name="ocr_remote",
+    description="[FUTURE] Trích xuất text từ ảnh/screenshot.",
+    risk_level="medium",
+    enabled=False,
+    handler="ocr_handler",
+    examples=["đọc text trong ảnh này"],
+))
+
+register(Skill(
+    name="image_generate",
+    description="[FUTURE] Tạo ảnh từ prompt.",
+    risk_level="medium",
+    enabled=False,
+    handler="image_gen_handler",
+    examples=["tạo ảnh banner cho sản phẩm X"],
+))
+
+register(Skill(
+    name="git_commit",
+    description="[FUTURE] Commit code lên GitHub — cần xác nhận.",
+    risk_level="high",
+    enabled=False,
+    handler="git_commit_handler",
+    examples=["commit thay đổi với message '...'"],
+))
+
+register(Skill(
+    name="deploy",
+    description="[FUTURE] Trigger deployment — cần xác nhận.",
+    risk_level="high",
+    enabled=False,
+    handler="deploy_handler",
+    examples=["deploy branch dev-agent"],
+))

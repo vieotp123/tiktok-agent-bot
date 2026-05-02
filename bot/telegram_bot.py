@@ -24,11 +24,16 @@ sys.path.insert(0, "/opt/tiktok-bot")
 from bot.agent.task_queue import list_tasks, get_task, cancel_task, create_task
 from bot.agent.skill_registry import list_skills, get_skill
 from bot.agent.permissions import list_pending, confirm_pending, cancel_pending
-from bot.agent.audit_log import log_action
+from bot.agent.audit_log import log_action, format_audit_recent
 from bot.agent.runner import run_task
 from bot.telegram_files import (
     download_telegram_file, list_files, get_file_record,
     is_safe_send_path, read_text_file,
+)
+from bot.worker_manager import format_workers_list, touch_worker
+from bot.memory_store import (
+    search_memory_simple, format_search_results,
+    list_lessons, format_lessons_list,
 )
 
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -573,6 +578,61 @@ def handle_tiktok_chat_info() -> str:
     ])
 
 
+def handle_agent_blueprint() -> str:
+    """Return a concise architecture summary from AGENT_BLUEPRINT.md."""
+    bp = Path("/opt/tiktok-bot/docs/AGENT_BLUEPRINT.md")
+    if not bp.exists():
+        return "❌ Blueprint not found."
+    # Extract the first ~40 lines (overview + brain table)
+    lines = bp.read_text(encoding="utf-8").splitlines()
+    # Skip markdown headers, show first meaningful sections
+    out = [
+        "<b>Agent Platform Blueprint</b>",
+        "",
+        "<b>Brain components:</b>",
+        "• LLM Gateway (9Router → cx/gpt-5.5 / cc/claude-opus-4-7)",
+        "• Task Queue (SQLite, durable task state)",
+        "• Skill Registry (low/medium/high risk)",
+        "• Worker Manager (channels + future agents)",
+        "• Memory Store (raw_events / memories / lessons / skill_notes)",
+        "• Permissions (pending_actions, confirm_action flow)",
+        "• Audit Log (append-only JSONL)",
+        "",
+        "<b>Channels:</b> Telegram (cmd center) | TikTok (social worker)",
+        "<b>Future:</b> Browser | OCR | Image-gen | Coding worker",
+        "",
+        "<b>Risk levels:</b> low → run | medium → log | high → confirm",
+        "",
+        "Full doc: /opt/tiktok-bot/docs/AGENT_BLUEPRINT.md",
+    ]
+    return "\n".join(out)
+
+
+def handle_workers() -> str:
+    """Return formatted worker list."""
+    touch_worker("telegram_bot")   # update our own last_seen
+    return format_workers_list()
+
+
+async def handle_memory_search(query: str) -> str:
+    """Search semantic memory for the admin user."""
+    if not query.strip():
+        return "Usage: /memory_search <query>"
+    results = search_memory_simple("tg_admin", query, limit=5)
+    return format_search_results(results, query)
+
+
+def handle_lessons(arg: str = "") -> str:
+    """Return episodic lessons list, optionally filtered by skill name."""
+    skill = arg.strip() or None
+    return format_lessons_list(skill=skill, limit=10)
+
+
+def handle_audit_recent() -> str:
+    """Return last 10 audit log entries."""
+    return format_audit_recent(n=10)
+
+
 async def handle_run_task(goal: str) -> str:
     if not goal:
         return "Usage: /run_task <goal>"
@@ -873,7 +933,18 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
 
     if cmd in ("/start", "/help"):
         _, kb = menu_main()
-        await send(chat_id, "👋 <b>Bot Control Panel</b>\nUse /menu for the full menu.", kb)
+        await send(
+            chat_id,
+            "👋 <b>Bot Control Panel</b>\n"
+            "Use /menu for the full inline menu.\n\n"
+            "<b>Agent commands:</b>\n"
+            "/agent_blueprint — architecture overview\n"
+            "/workers — active workers\n"
+            "/memory_search &lt;q&gt; — search memory\n"
+            "/lessons [skill] — past lessons\n"
+            "/audit_recent — last audit entries",
+            kb,
+        )
         return ""
     if cmd == "/menu":
         text_m, kb = menu_main()
@@ -902,6 +973,11 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/send_file":    return await handle_send_file(arg, chat_id)
     if cmd == "/logs":         return await handle_logs()
     if cmd == "/tiktok_chat_info": return handle_tiktok_chat_info()
+    if cmd == "/agent_blueprint":  return handle_agent_blueprint()
+    if cmd == "/workers":          return handle_workers()
+    if cmd == "/memory_search":    return await handle_memory_search(arg)
+    if cmd == "/lessons":          return handle_lessons(arg)
+    if cmd == "/audit_recent":     return handle_audit_recent()
 
     if low.startswith("/"):
         return (
@@ -909,6 +985,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
             "/skills /skill <name> /tasks /task <id> /run_task <goal> /cancel_task <id>\n"
             "/pending_actions /confirm_action <id> /cancel_action <id>\n"
             "/files /file <id> /send_file <path> /logs /tiktok_chat_info\n"
+            "/agent_blueprint /workers /memory_search <q> /lessons [skill] /audit_recent\n"
             "/start /help /menu /cancel"
         )
 
