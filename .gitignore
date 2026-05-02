@@ -12,5 +12,10 @@ data/uploads/
 data/cache/
 data/memory.json
 data/reminders.json
+data/tasks.db
+data/pending_actions.json
+data/chat_info.json
+data/audit/
+data/telegram/
 *.log
 .DS_Store

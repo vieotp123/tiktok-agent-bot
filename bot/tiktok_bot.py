@@ -511,6 +511,53 @@ _JS_CHAT_INFO = r"""() => {
 }"""
 
 
+async def verify_current_chat(page: Page) -> bool:
+    """
+    Soft guard: verify the active chat matches TARGET_CHAT_NAME.
+    Returns True if verified or uncertain (no chatbox selector), False if mismatch.
+    Sends a Telegram alert on confirmed mismatch.
+    """
+    try:
+        result = await page.evaluate(f"""() => {{
+            const target = {json.dumps(TARGET_CHAT_NAME)};
+            const chatBox = document.querySelector('[class*="DivChatBox"]');
+            if (!chatBox) return {{found: null, title: '', reason: 'no_chatbox'}};
+            // First child is typically the header; fall back to whole chatbox
+            const header = chatBox.children[0] || chatBox;
+            // Walk all leaf text nodes in the header looking for the target name
+            for (const el of header.querySelectorAll('span, p, h1, h2, h3, a')) {{
+                if (el.children.length === 0) {{
+                    const t = el.textContent.trim();
+                    if (t && t.toLowerCase().includes(target.toLowerCase()))
+                        return {{found: true, title: t, reason: 'match'}};
+                }}
+            }}
+            // Collect what the header actually shows (for debugging)
+            const hTexts = [];
+            for (const el of header.querySelectorAll('span, p')) {{
+                const t = el.textContent.trim();
+                if (t && t.length < 80 && el.children.length === 0) {{
+                    hTexts.push(t);
+                    if (hTexts.length >= 4) break;
+                }}
+            }}
+            return {{found: false, title: hTexts.join(' | '), reason: 'no_match'}};
+        }}""")
+        found  = result.get("found")
+        title  = result.get("title", "")
+        reason = result.get("reason", "")
+        # found=None means no DivChatBox (uncertain) → allow
+        # found=False means header found but TARGET_CHAT_NAME not in it → mismatch
+        ok = found is not False
+        log("tiktok", f"active_chat={title!r} target={TARGET_CHAT_NAME!r} ok={ok} reason={reason}")
+        if not ok:
+            await tg_send(f"⚠️ TikTok chat mismatch: header={title!r} expected={TARGET_CHAT_NAME!r}")
+        return ok
+    except Exception as e:
+        log("tiktok", f"verify_current_chat error: {e}")
+        return True  # allow on error rather than blocking
+
+
 async def get_chat_info(page: Page) -> dict:
     """Return {chatTitle, memberCount, membersVisible} from the current chat DOM."""
     try:
@@ -980,6 +1027,9 @@ async def bot_loop():
                 except Exception as _e:
                     log("chat", f"chat_info save error: {_e}")
 
+                # Verify we're in the correct chat before starting to poll
+                await verify_current_chat(page)
+
                 async def send_reminder(msg: str):
                     await send_message(page, msg)
                     await refresh_seen(page)
@@ -988,10 +1038,17 @@ async def bot_loop():
                     reminder_loop(send_reminder, interval=30)
                 )
 
+                _poll_count = 0  # for periodic verify_current_chat
+
                 while True:
                     try:
                         if page.is_closed():
                             raise PlaywrightError("page closed")
+
+                        # Periodic chat guard (every 60 polls ≈ every 72 sec)
+                        _poll_count += 1
+                        if _poll_count % 60 == 0:
+                            await verify_current_chat(page)
 
                         msgs = await read_new_messages(page)
                         for m in msgs:

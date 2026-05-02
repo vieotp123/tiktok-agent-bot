@@ -3,16 +3,19 @@ SQLite-backed task queue.
 
 Task fields:
   task_id        TEXT PRIMARY KEY
-  type           TEXT   -- search_web / btc_price / chat / ...
+  type           TEXT   -- search_web / btc_price / chat / ocr_file / summarize_file / ...
   goal           TEXT   -- human-readable objective
   status         TEXT   -- queued / running / done / failed / cancelled / waiting_confirm
   progress       TEXT
   result_summary TEXT
   result_path    TEXT
   error          TEXT
+  input_files    TEXT   -- JSON array of local file paths / file_ids
+  output_files   TEXT   -- JSON array of generated output paths
   created_at     TEXT   (ISO-8601 UTC)
   updated_at     TEXT
 """
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -40,26 +43,39 @@ def init_db() -> None:
                 result_summary TEXT NOT NULL DEFAULT '',
                 result_path    TEXT NOT NULL DEFAULT '',
                 error          TEXT NOT NULL DEFAULT '',
+                input_files    TEXT NOT NULL DEFAULT '[]',
+                output_files   TEXT NOT NULL DEFAULT '[]',
                 created_at     TEXT NOT NULL,
                 updated_at     TEXT NOT NULL
             )
         """)
+        # Migration: add new columns to existing databases without breaking them
+        for col, default in [("input_files", "[]"), ("output_files", "[]")]:
+            try:
+                c.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT NOT NULL DEFAULT '{default}'")
+            except Exception:
+                pass  # column already exists
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def create_task(type_: str, goal: str, status: str = "queued") -> str:
+def create_task(
+    type_: str,
+    goal: str,
+    status: str = "queued",
+    input_files: list | None = None,
+) -> str:
     init_db()
     task_id = str(uuid.uuid4())[:8]
     now = _now()
     with _conn() as c:
         c.execute(
             "INSERT INTO tasks"
-            " (task_id, type, goal, status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (task_id, type_, goal, status, now, now),
+            " (task_id, type, goal, status, input_files, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (task_id, type_, goal, status, json.dumps(input_files or []), now, now),
         )
     return task_id
 
