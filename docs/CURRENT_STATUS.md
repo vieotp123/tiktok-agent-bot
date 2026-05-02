@@ -8,6 +8,43 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 > `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
 > contract this task exercised.
 
+## Brain Evolution Loop v1
+
+- **`bot/agent/brain_evolve.py`** — controlled continuous self-improve.
+  NOT an infinite daemon. ONE task/run, cap 3, reports each result.
+- State `data/brain_evolve.json` (gitignored): `enabled`,
+  `max_tasks_per_run`, `started_at`, `stopped_at`, `last_run_at`,
+  `last_task_id`, `last_status`, `last_summary`, `run_count`,
+  `consecutive_failures`.
+- Auto-stop conditions:
+  - admin says stop / `/brain_evolve_stop`
+  - next task is high-risk → bridge returns `pending_action`, loop stops
+  - tests fail twice consecutively
+  - queue empty (`status="noop"`)
+  - status `quota_limited` / `auth_required` → **pause** (enabled
+    stays True; resume via `claude_quota` autorun when quota returns)
+- New commands + Vietnamese NL:
+  - `/brain_evolve_start [n]` ← "tự cải thiện brain đi" /
+    "làm đến khi hết quota" / "bắt đầu brain evolve"
+  - `/brain_evolve_stop` ← "dừng tự cải thiện" / "t dừng thì mới dừng"
+  - `/brain_evolve_status` ← "xem brain evolve" / "tiến độ tự cải thiện"
+
+### Memory NL (extends classify)
+
+- `nhớ là …` / `nhớ rằng …` / `lưu lại …` → `memory_add`.
+- `tìm trong memory …` / `xem memory …` → `memory_search`.
+- `quên cái <id>` → `memory_forget`.
+- 8 owner-preference memories seeded at id 15–22 (model policy,
+  Vietnamese control, brain-before-SEO, high-risk confirm, owner
+  wording, quota-no-percent).
+
+### Owner-friendly permission wording
+
+`_ask_confirm_action` now opens with **"Việc này thuộc high-risk nên
+cần anh bấm Đồng ý trước khi chạy."** instead of generic "no
+permission". Low/medium auto-runs silently with audit log; high-risk
+shows the inline ✅ Đồng ý / ❌ Hủy keyboard.
+
 ## Claude Quota Probe + Retry v1
 
 - **`bot/claude_quota.py`** extended with v2 honest-tracking schema.

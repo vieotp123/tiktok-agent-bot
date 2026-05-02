@@ -265,6 +265,10 @@ _PATTERNS_QUOTA = (
     _RE(r"\b(\d+\s*(?:h|tiếng|giờ|m|phút))\s+(nữa|sau)\s+(chạy|cho|run)",
         re.I),
     _RE(r"\bkhi\s+nào\s+(hồi|reset|về)\s+quota", re.I),
+    # "hết quota thì hẹn chạy tiếp" / "khi có quota thì chạy tiếp"
+    _RE(r"\bhết\s+quota\s+thì\s+(hẹn|chạy)", re.I),
+    _RE(r"\bkhi\s+(có|hồi|về)\s+quota\s+thì", re.I),
+    _RE(r"\bquota\s+về\s+thì", re.I),
 )
 
 _PATTERNS_QUOTA_STATUS = (
@@ -318,9 +322,50 @@ _PATTERNS_SEARCH = (
 )
 
 _PATTERNS_SELF_IMPROVE = (
-    _RE(r"\btự\s+(cải\s*thiện|improve|hoàn\s*thiện)", re.I),
+    _RE(r"\btự\s+(cải\s*thiện|improve|hoàn\s*thiện)\s+(brain|agent|bản\s*thân)?",
+        re.I),
     _RE(r"\b(làm|cho)\s+(brain|agent)\s+(thông\s*minh|xịn|tốt\s*hơn)", re.I),
     _RE(r"\b/?self_improve(_once)?\b", re.I),
+)
+
+# Brain-Evolution loop — continuous self-improve until quota / stop
+_PATTERNS_BRAIN_EVOLVE_START = (
+    _RE(r"\bbrain\s*[_\s]?evolve\s*(start|begin)?\b", re.I),
+    _RE(r"\bbắt\s*đầu\s+(brain\s*evolve|tự\s*cải\s*thiện)", re.I),
+    _RE(r"\blàm\s+đến\s+khi\s+(hết|cạn)\s+quota", re.I),
+    _RE(r"\b/?brain_evolve_start\b", re.I),
+    # "tự cải thiện brain" (with the explicit word "brain") → loop, not
+    # one-shot. Plain "tự cải thiện" without "brain" still hits the
+    # legacy self_improve one-shot path.
+    _RE(r"\btự\s*cải\s*thiện\s+brain\b", re.I),
+)
+_PATTERNS_BRAIN_EVOLVE_STOP = (
+    _RE(r"\bdừng\s+(tự\s*cải\s*thiện|brain\s*evolve)", re.I),
+    _RE(r"\bstop\s+brain\s*evolve\b", re.I),
+    _RE(r"\b/?brain_evolve_stop\b", re.I),
+    _RE(r"\bt(?:ao|ôi)?\s+dừng\s+thì\s+mới\s+dừng", re.I),
+)
+_PATTERNS_BRAIN_EVOLVE_STATUS = (
+    _RE(r"\b(tiến\s*độ|status)\s+(tự\s*cải\s*thiện|brain\s*evolve)", re.I),
+    _RE(r"\b/?brain_evolve_status\b", re.I),
+    _RE(r"\bxem\s+brain\s*evolve\b", re.I),
+)
+
+# Memory NL: "nhớ X" / "quên X" / "tìm trong memory X"
+_PATTERNS_MEMORY_ADD = (
+    _RE(r"^nhớ\s+(?:là\s+|rằng\s+)?(.+)$", re.I),
+    _RE(r"^lưu\s+(?:lại\s+)?(?:nhớ\s+)?(.+)$", re.I),
+    _RE(r"\bremember\s+(?:that\s+)?(.+)$", re.I),
+    _RE(r"\b/?memory_add\b\s*(.+)?", re.I),
+)
+_PATTERNS_MEMORY_SEARCH = (
+    _RE(r"\btìm\s+(?:trong\s+)?memory\s+(.+)$", re.I),
+    _RE(r"\b/?memory_search\b\s*(.+)?", re.I),
+    _RE(r"\b(xem|check)\s+memory\s+(.+)$", re.I),
+)
+_PATTERNS_MEMORY_FORGET = (
+    _RE(r"\bquên\s+(?:cái\s+)?(.+)$", re.I),
+    _RE(r"\b/?memory_forget\b\s*(.+)?", re.I),
 )
 
 _PATTERNS_SHOW_FILES = (
@@ -429,6 +474,51 @@ def classify(text: str) -> Intent:
                       "Tạo task code mới và queue cho worker.",
                       {"description": t}, risk,
                       requires_confirm=high_risk)
+
+    # Brain-evolve START matches BEFORE self_improve so "tự cải thiện brain"
+    # without a stop word goes to the loop, not the one-shot.
+    if _has_any(t, _PATTERNS_BRAIN_EVOLVE_STOP):
+        return Intent("brain_evolve_stop", 0.95,
+                      "Dừng brain evolution loop.", {}, "low", False)
+    if _has_any(t, _PATTERNS_BRAIN_EVOLVE_STATUS):
+        return Intent("brain_evolve_status", 0.95,
+                      "Xem trạng thái brain evolution loop.",
+                      {}, "low", False)
+    if _has_any(t, _PATTERNS_BRAIN_EVOLVE_START):
+        # Pick max_tasks from "X task" if mentioned
+        m = re.search(r"\b(\d+)\s+task", t, re.I)
+        n = int(m.group(1)) if m else 1
+        return Intent("brain_evolve_start", 0.9,
+                      f"Bắt đầu brain evolution loop (max={n}).",
+                      {"max_tasks": max(1, min(n, 3))},
+                      "medium", False)
+
+    # Memory NL — must come BEFORE generic self_improve so "nhớ là …"
+    # doesn't get swallowed.
+    for p in _PATTERNS_MEMORY_ADD:
+        m = p.search(t)
+        if m:
+            content = (m.group(1) or "").strip() if m.lastindex else ""
+            if content:
+                return Intent("memory_add", 0.9,
+                              "Lưu vào memory.",
+                              {"content": content}, "low", False)
+    for p in _PATTERNS_MEMORY_SEARCH:
+        m = p.search(t)
+        if m:
+            q = (m.group(1) if m.lastindex else "") or ""
+            q = q.strip().strip('?.,!')
+            if q:
+                return Intent("memory_search", 0.9,
+                              "Tìm trong semantic memory.",
+                              {"query": q}, "low", False)
+    for p in _PATTERNS_MEMORY_FORGET:
+        m = p.search(t)
+        if m:
+            target = (m.group(1) or "").strip() if m.lastindex else ""
+            return Intent("memory_forget", 0.85,
+                          "Xóa memory theo id hoặc nội dung.",
+                          {"target": target}, "medium", False)
 
     if _has_any(t, _PATTERNS_SELF_IMPROVE):
         return Intent("self_improve", 0.85,

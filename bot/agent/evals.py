@@ -502,6 +502,99 @@ def eval_sessions(rep: EvalReport) -> None:
             f"VALID_SCOPES={set(VALID_SCOPES)}")
 
 
+def eval_brain_evolve(rep: EvalReport) -> None:
+    """Lock the brain-evolve loop semantics."""
+    from bot.agent import brain_evolve as be
+
+    # Reset baseline
+    be.stop(reason="eval_reset")
+    rep.add("be_disabled_after_stop", "brain_evolve",
+            not be.is_enabled(), "")
+
+    s = be.start(2, user="eval")
+    rep.add("be_start_enabled", "brain_evolve",
+            s["enabled"] and s["max_tasks_per_run"] == 2,
+            f"max={s['max_tasks_per_run']}")
+
+    # done → loop continues
+    cont = be.on_task_done({"task_id": "ctk_eval_done",
+                             "status":  "done", "summary": "ok"},
+                            user="eval")
+    rep.add("be_done_continues", "brain_evolve",
+            cont and be.is_enabled(),
+            "loop continues after done")
+
+    # noop → stop (queue empty)
+    cont = be.on_task_done({"task_id": "", "status": "noop",
+                             "summary": "no queue"}, user="eval")
+    rep.add("be_noop_stops", "brain_evolve",
+            (not cont) and (not be.is_enabled()),
+            "")
+
+    # quota_limited → pause (enabled stays True)
+    be.start(1, user="eval")
+    cont = be.on_task_done({"task_id": "ctk_q",
+                             "status": "quota_limited",
+                             "summary": "paused"}, user="eval")
+    rep.add("be_quota_pause", "brain_evolve",
+            (not cont) and be.is_enabled(),
+            "pause but stay enabled")
+
+    # pending_action → stop
+    be.start(1, user="eval")
+    cont = be.on_task_done({"task_id": "ctk_p",
+                             "status": "pending_action",
+                             "summary": "high"}, user="eval")
+    rep.add("be_pending_stops", "brain_evolve",
+            (not cont) and (not be.is_enabled()),
+            "")
+
+    # Two consecutive failures → stop
+    be.start(1, user="eval")
+    be.on_task_done({"task_id": "ctk_a", "status": "worker_failed",
+                      "summary": "fail1"}, user="eval")
+    cont = be.on_task_done({"task_id": "ctk_b",
+                             "status": "smoke_failed",
+                             "summary": "fail2"}, user="eval")
+    rep.add("be_two_failures_stop", "brain_evolve",
+            (not cont) and (not be.is_enabled()),
+            "")
+
+    # Status panel non-empty
+    panel = be.status_panel_vi()
+    rep.add("be_status_panel", "brain_evolve",
+            ("Brain Evolution" in panel
+             and ("đang chạy" in panel or "đã dừng" in panel)),
+            f"len={len(panel)}")
+
+    # Cleanup
+    be.stop(reason="eval_cleanup")
+
+
+def eval_nl_router_v2(rep: EvalReport) -> None:
+    """Vietnamese NL classifier coverage for the brain-evolve era."""
+    from bot.agent.nl_router import classify
+    cases = [
+        ("tự cải thiện brain đi",                "brain_evolve_start"),
+        ("làm đến khi hết quota",                 "brain_evolve_start"),
+        ("dừng tự cải thiện",                     "brain_evolve_stop"),
+        ("xem brain evolve",                      "brain_evolve_status"),
+        ("nhớ là coding dùng opus 4.7",           "memory_add"),
+        ("tìm trong memory opus",                 "memory_search"),
+        ("quên cái 99",                           "memory_forget"),
+        ("hết quota thì hẹn chạy tiếp",           "quota_schedule"),
+        ("khi có quota thì tự làm tiếp",          "quota_schedule"),
+        ("kiểm tra quota claude",                 "quota_status"),
+        ("probe claude",                          "quota_status"),
+        ("hello",                                 "chat"),
+    ]
+    for text, want in cases:
+        got = classify(text)
+        rep.add(f"nl[{text[:30]!r}]", "nl_router_v2",
+                got.name == want,
+                f"got={got.name} want={want}")
+
+
 def eval_lifecycle_edges(rep: EvalReport) -> None:
     """Edge cases the basic lifecycle eval doesn't cover."""
     from bot.agent.task_lifecycle import (validate_transition, can_auto_execute,
@@ -691,6 +784,10 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_sessions(rep)
     if category in (None, "lifecycle_edges"):
         eval_lifecycle_edges(rep)
+    if category in (None, "brain_evolve"):
+        eval_brain_evolve(rep)
+    if category in (None, "nl_router_v2"):
+        eval_nl_router_v2(rep)
 
     rep.finished_at = time.time()
     return rep

@@ -1611,6 +1611,68 @@ async def handle_agent_autonomy_status() -> str:
     return "\n".join(parts)
 
 
+async def handle_brain_evolve_start(arg: str = "") -> str:
+    """Start the brain-evolution loop. arg = optional max_tasks (1..3)."""
+    from bot.agent import brain_evolve as _be
+    try:
+        n = int((arg or "").strip()) if arg else 1
+    except ValueError:
+        n = 1
+    n = max(1, min(n, 3))
+    _be.start(max_tasks=n, user="tg_admin")
+    # Kick off the FIRST pass immediately so the admin sees movement.
+    initial_msg = (f"🟢 Brain Evolution loop đã bật "
+                   f"(max <b>{n}</b> task/lần).\n"
+                   f"Đang chạy task đầu tiên…")
+    await send_chat_reply(0 if False else
+                          (await _tg_admin_id_or_zero()), initial_msg)
+    # Use a background task so the Telegram reply isn't blocked
+    asyncio.create_task(_brain_evolve_first_pass(n))
+    return _REPLY_HANDLED
+
+
+async def _brain_evolve_first_pass(n: int) -> None:
+    from bot.agent import brain_evolve as _be
+    chat = await _tg_admin_id_or_zero()
+    for i in range(n):
+        if not _be.is_enabled():
+            break
+        result = await _be.advance_one(user="tg_admin")
+        try:
+            msg = _vi_format_run_result(result)
+        except Exception as e:
+            msg = f"❌ format error: {e}"
+        try:
+            await send_chat_reply(chat,
+                f"<b>Brain-evolve {i+1}/{n}</b>\n{msg}")
+        except Exception:
+            pass
+        # Respect bridge signals: stop loop on pause / pending / failure
+        if not _be.on_task_done(result, user="tg_admin"):
+            break
+
+
+async def _tg_admin_id_or_zero() -> int:
+    try:
+        return int(TG_ADMIN)
+    except Exception:
+        return 0
+
+
+def handle_brain_evolve_stop() -> str:
+    from bot.agent import brain_evolve as _be
+    _be.stop(user="tg_admin", reason="user")
+    return ("🛑 Đã dừng Brain Evolution loop.\n"
+            "<i>Có thể bật lại bất kỳ lúc nào: "
+            "<code>/brain_evolve_start</code> hoặc nói "
+            "“tự cải thiện brain đi”.</i>")
+
+
+def handle_brain_evolve_status() -> str:
+    from bot.agent import brain_evolve as _be
+    return _be.status_panel_vi()
+
+
 async def handle_claude_probe() -> str:
     """Force a fresh Claude probe and return the rich Vietnamese status."""
     try:
@@ -2451,6 +2513,10 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     # ── Claude quota scheduler ────────────────────────────────────────────
     if cmd == "/claude_status":        return _cq.format_claude_status_vi()
     if cmd == "/claude_probe":         return await handle_claude_probe()
+    # ── Brain Evolution Loop ──────────────────────────────────────────────
+    if cmd == "/brain_evolve_start":   return await handle_brain_evolve_start(arg)
+    if cmd == "/brain_evolve_stop":    return handle_brain_evolve_stop()
+    if cmd == "/brain_evolve_status":  return handle_brain_evolve_status()
     if cmd == "/claude_quota_reset":   return handle_claude_quota_reset(arg)
     if cmd == "/claude_quota_in":      return handle_claude_quota_in(arg)
     if cmd == "/claude_limited":       _cq.set_limited(True);  return _cq.status_summary()
@@ -2611,6 +2677,31 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
                 f"Bridge sẽ chạy khi mình ra lệnh "
                 f"<i>“làm tiếp task code tiếp theo”</i>, hoặc gõ "
                 f"<code>/code_worker_run_once</code>.")
+
+    # ── Brain Evolution Loop ─────────────────────────────────────────────
+    if name == "brain_evolve_start":
+        n = int(intent.args.get("max_tasks") or 1)
+        return await handle_brain_evolve_start(str(n))
+    if name == "brain_evolve_stop":
+        return handle_brain_evolve_stop()
+    if name == "brain_evolve_status":
+        return handle_brain_evolve_status()
+
+    # ── Memory NL ────────────────────────────────────────────────────────
+    if name == "memory_add":
+        content = intent.args.get("content") or raw_text
+        # Reuse the existing handler; expects "title | content | tags" or
+        # plain content. Pass plain content — it will use first 60 chars
+        # as title.
+        return await handle_memory_add(content)
+    if name == "memory_search":
+        return await handle_memory_search(intent.args.get("query") or raw_text)
+    if name == "memory_forget":
+        target = (intent.args.get("target") or "").strip()
+        if target.isdigit():
+            return handle_memory_forget(target)
+        return ("Để xóa memory, gõ <code>/memory_forget &lt;id&gt;</code> "
+                "(lấy id từ <i>tìm trong memory ...</i>).")
 
     # ── Self-improve once ────────────────────────────────────────────────
     if name == "self_improve":
@@ -2775,9 +2866,10 @@ async def _ask_confirm_action(chat_id, *, action: str, goal: str,
         [("✅ Đồng ý", f"confirm:{pid}"),
          ("❌ Hủy",     f"cancel:{pid}")],
     ])
-    text_html = (f"⚠️ <b>Hành động rủi ro cao</b>\n"
+    text_html = (f"⚠️ <b>Việc này thuộc high-risk nên cần anh bấm "
+                 f"Đồng ý trước khi chạy.</b>\n"
                  f"{_esc(pretty)}\n\n"
-                 f"id: <code>{pid}</code>")
+                 f"<i>id: <code>{pid}</code></i>")
     await send_chat_reply(chat_id, text_html, kb)
     return _REPLY_HANDLED   # signal: do NOT send a duplicate / fallback
 

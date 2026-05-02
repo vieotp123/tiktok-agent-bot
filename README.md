@@ -154,6 +154,13 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 /code_task_from_file <id> <description>
 /run_task_with_file <id> <goal>
 
+# Brain Evolution Loop
+/brain_evolve_start [n]   # n in 1..3 — continuous self-improve
+/brain_evolve_stop        # stop loop
+/brain_evolve_status      # status panel
+#   NL: "tự cải thiện brain đi", "làm đến khi hết quota",
+#       "dừng tự cải thiện", "xem brain evolve"
+
 # Vietnamese natural-language commands (no slash needed)
 # The bot understands plain Vietnamese in admin DMs:
 #   "làm tiếp task code tiếp theo"   → runs the worker bridge
