@@ -183,7 +183,22 @@ If a phase or test fails twice in a row, **stop**:
   call. Chat models never run coding workloads.
 - Never wrap a tool call in dynamic `eval()` / `exec()`.
 
-## 9. Worth re-reading every loop
+## 9. Model selection
+
+- `coding_worker_bridge` pins the model passed to the Claude CLI via
+  `--model $CLAUDE_CODE_MODEL` and provides automatic CLI-level
+  fallback via `--fallback-model sonnet`. Both are also exposed
+  through `ANTHROPIC_MODEL` (set inside the sudo `env` wrapper) so any
+  Claude SDK reads pick the same model.
+- Default: `opus` → `claude-opus-4-7`. To pin Sonnet instead, set
+  `CLAUDE_CODE_MODEL=sonnet` in `.env` and restart `tiktok-telegram`.
+- `/code_worker_status` reports `selected_model`, `model_source`
+  (`env` vs `default`), and `actual_model` — the model that actually
+  answered a probe ping, which is the only honest fallback indicator.
+- `/code_worker_run_once` summary echoes the actual model used and
+  appends `⚠ fallback` if `--fallback-model` fired during the probe.
+
+## 10. Worth re-reading every loop
 
 - Risk policy → `bot/agent/risk.py`
 - Model policy → `bot/llm_client.py`
