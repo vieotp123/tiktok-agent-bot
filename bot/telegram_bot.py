@@ -121,7 +121,12 @@ async def send(chat_id: str | int, text: str,
     if reply_markup:
         payload["reply_markup"] = reply_markup
     r = await tg_call("sendMessage", payload)
-    return (r.get("result") or {}).get("message_id")
+    if not r.get("ok"):
+        log(f"send error: {r.get('description','?')} text_preview={text[:40]!r}")
+    mid = (r.get("result") or {}).get("message_id")
+    if reply_markup and mid:
+        log(f"menu sent chat_id={chat_id} message_id={mid}")
+    return mid
 
 
 async def edit_msg(chat_id: str | int, message_id: int, text: str,
@@ -1037,20 +1042,24 @@ async def bot_loop() -> None:
             # ── Callback query (inline button press) ──────────────────────────
             cb = update.get("callback_query")
             if cb:
-                chat_id = str((cb.get("message") or {}).get("chat", {}).get("id", TG_ADMIN))
-                if chat_id != str(TG_ADMIN):
+                cb_chat_id = str((cb.get("message") or {}).get("chat", {}).get("id", TG_ADMIN))
+                cb_data    = cb.get("data", "")
+                authorized = cb_chat_id == str(TG_ADMIN)
+                log(f"callback data={cb_data!r} chat_id={cb_chat_id} authorized={authorized}")
+                if not authorized:
                     await tg_call("answerCallbackQuery", {
                         "callback_query_id": cb["id"],
                         "text": "Not authorized.",
                     })
                     continue
                 try:
-                    await dispatch_callback(cb, chat_id)
+                    await dispatch_callback(cb, cb_chat_id)
+                    log(f"callback answered data={cb_data!r}")
                 except Exception as e:
-                    log(f"callback error: {e}")
+                    log(f"callback error data={cb_data!r} err={e}")
                     try:
                         await answer_cb(cb["id"])
-                        await send(chat_id, f"Error: {e}")
+                        await send(cb_chat_id, f"❌ Error: {e}")
                     except Exception:
                         pass
                 continue
@@ -1062,8 +1071,9 @@ async def bot_loop() -> None:
 
             chat_id = str(msg["chat"]["id"])
             text    = (msg.get("text") or "").strip()
+            authorized = chat_id == str(TG_ADMIN)
 
-            if chat_id != str(TG_ADMIN):
+            if not authorized:
                 log(f"unauthorized chat_id={chat_id}")
                 try:
                     await tg_call("sendMessage", {"chat_id": chat_id, "text": "Not authorized."})
@@ -1071,14 +1081,22 @@ async def bot_loop() -> None:
                     pass
                 continue
 
+            # Detect update type for logging
+            update_type = "message"
+            if text.startswith("/"):
+                cmd_name = text.split()[0].lower()
+                log(f"command={cmd_name} authorized=true chat_id={chat_id}")
+            else:
+                log(f"recv: {text[:80]!r}")
+
             # File message (no text)
             has_file = any(k in msg for k in ("photo","document","audio","video","voice"))
             if not text and has_file:
-                log(f"file_recv")
+                log(f"file_recv chat_id={chat_id}")
                 try:
                     reply = await handle_file_message(msg, chat_id)
                     await send(chat_id, reply)
-                    log_action(user="tg_admin", action="file_upload",
+                    log_action(user="tg_admin", action="file_upload", channel="telegram",
                                risk_level="low", status="ok", result_summary=reply[:100])
                 except Exception as e:
                     log(f"file error: {e}")
@@ -1091,37 +1109,44 @@ async def bot_loop() -> None:
             if not text:
                 continue
 
-            log(f"recv: {text[:80]!r}")
-
             # Check pending session state
             session = _session_get()
             if session and not text.startswith("/"):
+                pending_action = session["action"]
+                log(f"pending_input action={pending_action} text={text[:40]!r}")
                 try:
-                    reply = await handle_pending_input(session["action"], text, chat_id)
+                    reply = await handle_pending_input(pending_action, text, chat_id)
                     await send(chat_id, reply)
-                    log_action(user="tg_admin", action=f"input:{session['action']}",
-                               risk_level="low", status="ok", result_summary=reply[:100])
+                    log_action(user="tg_admin", action=f"input:{pending_action}",
+                               channel="telegram", risk_level="low",
+                               status="ok", result_summary=reply[:100])
                 except Exception as e:
-                    log(f"pending_input error: {e}")
-                    await send(chat_id, f"Error: {e}")
+                    log(f"pending_input error action={pending_action} err={e}")
+                    await send(chat_id, f"❌ Error: {e}")
                 continue
 
             # Normal dispatch
             try:
                 reply = await dispatch(text, chat_id)
                 if reply:
-                    await send(chat_id, reply)
+                    mid = await send(chat_id, reply)
+                    if text.startswith("/"):
+                        log(f"cmd_reply cmd={text.split()[0]} message_id={mid}")
                     log_action(
                         user="tg_admin",
                         action=text.split()[0][:30] if text.startswith("/") else "chat",
+                        channel="telegram",
                         risk_level="low",
                         status="ok",
                         result_summary=reply[:100],
                     )
+                elif text.startswith("/"):
+                    # menu/start/cancel send their own message inside dispatch
+                    log(f"cmd_done cmd={text.split()[0]} (sent inline)")
             except Exception as e:
-                log(f"dispatch error: {e}")
+                log(f"dispatch error cmd={text[:30]!r} err={e}")
                 try:
-                    await send(chat_id, f"Error: {e}")
+                    await send(chat_id, f"❌ Error: {e}")
                 except Exception:
                     pass
 
