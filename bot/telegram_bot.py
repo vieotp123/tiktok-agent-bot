@@ -4709,6 +4709,43 @@ async def bot_loop() -> None:
 
     log(f"start admin_chat={TG_ADMIN}")
 
+    # Auto-resume agent_autorun if state.enabled=True on bot start.
+    # Survives Telegram restarts mid-autorun: if pump_loop was killed
+    # by the restart, we re-spawn it here so the long-horizon work
+    # session continues without admin retyping the trigger.
+    try:
+        from bot.agent import agent_autorun as _aa
+        d = _aa.state()
+        if d.get("enabled"):
+            log(f"autorun resume: enabled=True hours={d.get('hours')} "
+                f"completed={d.get('completed_tasks',0)}/"
+                f"{d.get('max_tasks',0)} mode="
+                f"{'self-improve' if d.get('auto_self_improve') else 'owner'}")
+
+            async def _autorun_report_boot(text: str) -> None:
+                try:
+                    await send_chat_reply(TG_ADMIN, text)
+                except Exception:
+                    pass
+
+            asyncio.create_task(
+                _aa.pump_loop(user="tg_admin",
+                               report_callback=_autorun_report_boot,
+                               poll_interval_sec=2.0),
+            )
+            try:
+                await send_chat_reply(
+                    TG_ADMIN,
+                    "▶ <b>Autorun resumed on boot</b>\n"
+                    f"  ✓ Đã xong: <b>{d.get('completed_tasks',0)}</b> / "
+                    f"<b>{d.get('max_tasks',0)}</b> task\n"
+                    f"  Mode: <i>{'self-improve' if d.get('auto_self_improve') else 'owner'}</i>",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"autorun resume on boot error: {e}")
+
     # Resume from disk-persisted offset to avoid dropping messages during
     # bot restarts. If no offset file, use 0 = "give me all pending updates".
     OFFSET_FILE = Path("/opt/tiktok-bot/data/telegram/getupdates_offset.txt")
