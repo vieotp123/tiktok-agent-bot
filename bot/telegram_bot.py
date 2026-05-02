@@ -30,12 +30,18 @@ except Exception:
 
 
 def _fmt_iso_local(iso_str: str | None) -> str:
-    """Convert a UTC ISO string into 12-hour AM/PM local time.
+    """Convert a UTC ISO string into 12-hour AM/PM local time + a date
+    qualifier when the date differs from "today".
 
-    Owner request: "chỉ cần ghi AM PM là được". Format:
-        "5:29:17 AM" (no extra labels — owner's clock is local)
-    Returns the original string on parse failure so we never crash
-    a panel just because of a bad timestamp. Empty/None → "".
+    Owner saw "Stop_at: 5:54:34 AM" with NO date qualifier and asked
+    "nó có đang chạy không vậy" — they thought autorun expired when
+    in fact stop_at was 24h away on the next calendar day.
+
+    Format:
+        same day  → "5:29:17 AM"
+        tomorrow  → "5:29:17 AM (mai)"
+        yesterday → "5:29:17 AM (hôm qua)"
+        further   → "5:29:17 AM (05-04)" or full ISO date
     """
     if not iso_str:
         return ""
@@ -47,10 +53,21 @@ def _fmt_iso_local(iso_str: str | None) -> str:
         if dt_utc.tzinfo is None:
             dt_utc = dt_utc.replace(tzinfo=timezone.utc)
         dt_local = dt_utc.astimezone(_OWNER_TZ)
-        # 12-hour AM/PM, drop leading zero on hour (e.g. "5:29:17 AM")
         h12 = int(dt_local.strftime("%I"))
         ampm = dt_local.strftime("%p")
-        return f"{h12}:{dt_local.strftime('%M:%S')} {ampm}"
+        time_part = f"{h12}:{dt_local.strftime('%M:%S')} {ampm}"
+
+        now_local = datetime.now(timezone.utc).astimezone(_OWNER_TZ)
+        delta_days = (dt_local.date() - now_local.date()).days
+        if delta_days == 0:
+            return time_part
+        if delta_days == 1:
+            return f"{time_part} (mai)"
+        if delta_days == -1:
+            return f"{time_part} (hôm qua)"
+        if -30 <= delta_days <= 30:
+            return f"{time_part} ({dt_local.strftime('%m-%d')})"
+        return f"{time_part} ({dt_local.strftime('%Y-%m-%d')})"
     except Exception:
         return iso_str
 
@@ -90,7 +107,10 @@ load_dotenv("/opt/tiktok-bot/.env")
 sys.path.insert(0, "/opt/tiktok-bot")
 
 from bot.agent.task_queue import list_tasks, get_task, cancel_task, create_task
-from bot.agent.skill_registry import list_skills, get_skill
+from bot.agent.skill_registry import (
+    list_skills, get_skill, discover_skills, compute_skill_stats,
+    set_skill_enabled,
+)
 from bot.agent.permissions import list_pending, confirm_pending, cancel_pending
 from bot.agent.audit_log import log_action, format_audit_recent
 from bot.agent.runner import run_task
@@ -928,17 +948,37 @@ async def handle_models() -> str:
 
 
 def handle_skills_list() -> str:
-    skills = list_skills()
-    if not skills:
+    rows = discover_skills()
+    if not rows:
         return "No skills registered."
+    stats = compute_skill_stats()
     RISK = {"low": "🟢", "medium": "🟡", "high": "🔴"}
-    lines = ["<b>Skills</b>"]
-    for s in skills:
-        name = _esc(s.name)
-        desc = _esc(s.description[:60])
-        lines.append(f"{'✅' if s.enabled else '❌'} {RISK.get(s.risk_level,'⚪')} "
-                     f"<b>{name}</b> — {desc}")
-    lines.append("\nUse /skill &lt;name&gt; for details.")
+    lines = [f"<b>Skills</b> ({len(rows)} registered)"]
+    for row in rows:
+        s     = row["skill"]
+        st    = stats.get(s.name, {})
+        name  = _esc(s.name)
+        desc  = _esc(s.description[:50])
+        runs  = st.get("runs", 0)
+        srate = int(round(st.get("success_rate", 0.0) * 100))
+        last  = (st.get("last_used") or "")[:10]  # YYYY-MM-DD
+        flags = []
+        if not row["handler_found"]:
+            flags.append("⚠handler")
+        if runs > 0 and st.get("stale"):
+            flags.append("⚠stale")
+        flag_str = (" " + " ".join(flags)) if flags else ""
+        meta = (f"runs={runs} success={srate}%" if runs else "never run")
+        last_str = f" · last={last}" if last else ""
+        lines.append(
+            f"{'✅' if s.enabled else '❌'} {RISK.get(s.risk_level,'⚪')} "
+            f"<b>{name}</b> — {desc}\n"
+            f"   <i>{meta}{last_str}</i>{flag_str}"
+        )
+    lines.append(
+        "\nUse /skill &lt;name&gt; for details. "
+        "<i>“tắt skill X” / “bật skill X” để toggle.</i>"
+    )
     return "\n".join(lines)
 
 
@@ -947,6 +987,7 @@ def handle_skill_detail(name: str) -> str:
     if not s:
         return f"Skill <b>{_esc(name)}</b> not found."
     RISK = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+    stats = compute_skill_stats().get(s.name, {})
     parts = [
         f"<b>{_esc(s.name)}</b> {RISK.get(s.risk_level,'⚪')}",
         f"Description: {_esc(s.description)}",
@@ -954,9 +995,38 @@ def handle_skill_detail(name: str) -> str:
         f"Enabled: {'yes' if s.enabled else 'no'}",
         f"Handler: <code>{_esc(s.handler)}</code>",
     ]
+    runs = stats.get("runs", 0)
+    if runs:
+        srate = int(round(stats.get("success_rate", 0.0) * 100))
+        parts.append(
+            f"Runs: <b>{runs}</b> · Success: <b>{srate}%</b> · "
+            f"Last used: <code>{_esc((stats.get('last_used') or '')[:19])}</code>"
+            + (" ⚠stale" if stats.get("stale") else "")
+        )
+    else:
+        parts.append("Runs: <i>never run</i>")
     if s.examples:
         parts.append("Examples: " + " | ".join(_esc(e) for e in s.examples[:3]))
     return "\n".join(parts)
+
+
+def handle_skill_toggle(name: str, enable: bool) -> str:
+    """Enable/disable a skill via persisted override.
+    Used by both NL ("tắt skill X") and `/skill_enable` / `/skill_disable`."""
+    name = (name or "").strip().strip("\"'`")
+    if not name:
+        return ("Cú pháp: <i>“tắt skill &lt;name&gt;”</i> hoặc "
+                "<i>“bật skill &lt;name&gt;”</i>.")
+    if not set_skill_enabled(name, enable):
+        return f"❌ Skill <b>{_esc(name)}</b> không tồn tại trong registry."
+    log_action(user="tg_admin",
+               action=f"skill_{'enable' if enable else 'disable'}",
+               risk_level="medium", status="ok",
+               result_summary=f"skill={name} enabled={enable}",
+               channel="telegram")
+    verb = "Bật" if enable else "Tắt"
+    return (f"✅ {verb} skill <b>{_esc(name)}</b>. "
+            f"Trạng thái lưu vào <code>data/skill_overrides.json</code>.")
 
 
 def handle_tasks_list() -> str:
@@ -3927,6 +3997,8 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/model_policy": return await handle_model_policy()
     if cmd == "/skills":       return handle_skills_list()
     if cmd == "/skill":        return handle_skill_detail(arg)
+    if cmd == "/skill_enable":  return handle_skill_toggle(arg, True)
+    if cmd == "/skill_disable": return handle_skill_toggle(arg, False)
     if cmd == "/tasks":        return handle_tasks_list()
     if cmd == "/task":         return handle_task_detail(arg)
     if cmd == "/run_task":     return await handle_run_task(arg)
@@ -4346,6 +4418,15 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     # ── Show files ────────────────────────────────────────────────────────
     if name == "show_files":
         return handle_files_list()
+
+    # ── Tool Registry v2 — list / toggle skill ───────────────────────────
+    if name == "skill_list":
+        return handle_skills_list()
+    if name == "skill_toggle":
+        return handle_skill_toggle(
+            (intent.args.get("name") or "").strip(),
+            bool(intent.args.get("enabled")),
+        )
 
     # ── Quota schedule ───────────────────────────────────────────────────
     if name == "quota_schedule":

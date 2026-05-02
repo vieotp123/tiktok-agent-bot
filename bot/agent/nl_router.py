@@ -664,6 +664,27 @@ _PATTERNS_SHOW_FILES = (
     _RE(r"\bfile\s+(gần\s*đây|recent|mới\s+nhất)\b", re.I),
 )
 
+# ── Skill registry NL controls (Tool Registry v2) ──────────────────────────
+# "xem skills" / "list skills" / "danh sách skill"
+_PATTERNS_LIST_SKILLS = (
+    _RE(r"\b(xem|liệt\s*kê|list|show)\s+(skill|skills|tool|tools|"
+        r"capabilities)\b", re.I),
+    _RE(r"\bdanh\s+sách\s+skill", re.I),
+    _RE(r"\bskill\s+(nào|có|đang)\s+(đang\s+)?(bật|tắt|chạy|dùng)", re.I),
+    _RE(r"\b/?skills\b", re.I),
+)
+
+# "tắt skill X" / "bật skill X" / "disable skill X" / "enable skill X".
+# Capture group 1 = name. Verb captured separately to set `enabled`.
+_PATTERNS_SKILL_DISABLE = (
+    _RE(r"\b(?:tắt|disable|tat|off)\s+skill\s+([A-Za-z0-9_\-]+)", re.I),
+    _RE(r"\bturn\s+off\s+skill\s+([A-Za-z0-9_\-]+)", re.I),
+)
+_PATTERNS_SKILL_ENABLE = (
+    _RE(r"\b(?:bật|enable|bat|on)\s+skill\s+([A-Za-z0-9_\-]+)", re.I),
+    _RE(r"\bturn\s+on\s+skill\s+([A-Za-z0-9_\-]+)", re.I),
+)
+
 # OCR run intents — admin asks to extract text from a saved image.
 # Scoped so they DO NOT collide with `build_missing_tool` (which matches
 # "thêm/tạo/cài tool ocr"). Build-tool patterns require a verb prefix;
@@ -823,6 +844,28 @@ def classify(text: str) -> Intent:
                       "Hẹn lịch chạy lại Claude khi hồi quota.",
                       {"minutes": mins, "max_tasks": max_tasks,
                        "raw": t}, "low", False)
+
+    # 2.5 Tool Registry v2 — skill toggle / list. Checked early so
+    # "tắt skill ocr_image" / "bật skill chat" / "xem skills" don't
+    # leak to create_code or chat fallback.
+    for p in _PATTERNS_SKILL_DISABLE:
+        m = p.search(t)
+        if m:
+            return Intent("skill_toggle", 0.95,
+                          f"Tắt skill {m.group(1)}.",
+                          {"name": m.group(1), "enabled": False},
+                          "medium", False)
+    for p in _PATTERNS_SKILL_ENABLE:
+        m = p.search(t)
+        if m:
+            return Intent("skill_toggle", 0.95,
+                          f"Bật skill {m.group(1)}.",
+                          {"name": m.group(1), "enabled": True},
+                          "medium", False)
+    if _has_any(t, _PATTERNS_LIST_SKILLS):
+        return Intent("skill_list", 0.9,
+                      "Xem registry skills + stats (runs, success, "
+                      "last_used).", {}, "low", False)
 
     # 3. Run-batch BEFORE run-next
     for p in _PATTERNS_RUN_BATCH:

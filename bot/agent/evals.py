@@ -1308,6 +1308,111 @@ async def eval_content_factory(rep: EvalReport) -> None:
 
 # ── Driver ────────────────────────────────────────────────────────────────────
 
+def eval_skill_registry_v2(rep: EvalReport) -> None:
+    """Tool Registry v2 — auto-discovery, stats, NL toggle, persistence."""
+    import json as _json
+    import tempfile as _tmp
+    from pathlib import Path as _Path
+    from bot.agent import skill_registry as _sr
+    from bot.agent.nl_router import classify as _classify
+
+    # Discovery: returns the live registry, never empty on a healthy boot.
+    rows = _sr.discover_skills()
+    rep.add("skill_v2_discover_nonempty", "skill_registry_v2",
+            len(rows) >= 15, f"discovered={len(rows)}")
+    rep.add("skill_v2_discover_shape", "skill_registry_v2",
+            all("skill" in r and "handler_found" in r for r in rows),
+            f"keys={sorted(rows[0].keys()) if rows else []}")
+    # `chat` is the canonical built-in skill — every healthy boot has it
+    # AND it MUST resolve to a real callable.
+    chat_row = next((r for r in rows if r["skill"].name == "chat"), None)
+    rep.add("skill_v2_chat_handler_found", "skill_registry_v2",
+            chat_row is not None and chat_row["handler_found"] is True,
+            "")
+
+    # Stats: known shape, no NaN/None where we expect numbers.
+    stats = _sr.compute_skill_stats()
+    chat_stats = stats.get("chat", {})
+    expected_keys = {"runs", "successes", "success_rate",
+                     "last_used", "stale"}
+    rep.add("skill_v2_stats_shape", "skill_registry_v2",
+            expected_keys.issubset(set(chat_stats.keys())),
+            f"have={sorted(chat_stats.keys())}")
+    rep.add("skill_v2_stats_success_rate_bounded", "skill_registry_v2",
+            all(0.0 <= s["success_rate"] <= 1.0 for s in stats.values()),
+            "all rates within [0,1]")
+    rep.add("skill_v2_stats_no_unknown_skills", "skill_registry_v2",
+            set(stats.keys()) == {r["skill"].name for r in rows},
+            "stats covers exactly the registry")
+
+    # Stale flag: a known never-run skill (`deploy` is FUTURE/disabled
+    # and has no audit entries) must be flagged stale.
+    deploy_stats = stats.get("deploy", {})
+    rep.add("skill_v2_stats_stale_for_unused", "skill_registry_v2",
+            deploy_stats.get("stale") is True
+            and deploy_stats.get("runs") == 0,
+            f"deploy={deploy_stats}")
+
+    # NL toggle classification — both directions and "xem skills".
+    nl_cases = [
+        ("tắt skill ocr_image",  "skill_toggle", False, "ocr_image"),
+        ("bật skill chat",       "skill_toggle", True,  "chat"),
+        ("disable skill foo",    "skill_toggle", False, "foo"),
+        ("enable skill bar",     "skill_toggle", True,  "bar"),
+        ("turn off skill baz",   "skill_toggle", False, "baz"),
+    ]
+    for text, want_name, want_enabled, want_target in nl_cases:
+        got = _classify(text)
+        ok = (got.name == want_name
+              and bool(got.args.get("enabled")) == want_enabled
+              and got.args.get("name") == want_target)
+        rep.add(f"skill_v2_nl[{text[:28]!r}]", "skill_registry_v2", ok,
+                f"got={got.name} args={got.args}")
+    list_got = _classify("xem skills")
+    rep.add("skill_v2_nl_list", "skill_registry_v2",
+            list_got.name == "skill_list", f"got={list_got.name}")
+
+    # Persistence: set + revert via a tmp override file so we don't
+    # leave a real disable on prod.
+    real_path     = _sr.OVERRIDES_FILE
+    backup_text   = real_path.read_text(encoding="utf-8") if real_path.exists() else None
+    target_skill  = "btc_price"
+    original      = _sr.get_skill(target_skill)
+    original_flag = bool(original.enabled) if original else None
+    try:
+        rep.add("skill_v2_set_unknown_returns_false", "skill_registry_v2",
+                _sr.set_skill_enabled("__nope_xyz__", True) is False,
+                "unknown skill rejected")
+        rep.add("skill_v2_set_known_returns_true", "skill_registry_v2",
+                _sr.set_skill_enabled(target_skill, False) is True,
+                f"toggled {target_skill}")
+        rep.add("skill_v2_set_persists_on_disk", "skill_registry_v2",
+                real_path.exists()
+                and _json.loads(real_path.read_text(encoding="utf-8"))
+                       .get(target_skill) is False,
+                f"overrides_file={real_path}")
+        rep.add("skill_v2_set_applies_to_registry", "skill_registry_v2",
+                _sr.get_skill(target_skill).enabled is False,
+                "live skill flipped")
+        # apply_overrides() re-applies after a reset
+        _sr.get_skill(target_skill).enabled = True   # simulate fresh import
+        n = _sr.apply_overrides()
+        rep.add("skill_v2_apply_reapplies", "skill_registry_v2",
+                n >= 1 and _sr.get_skill(target_skill).enabled is False,
+                f"changed={n}")
+    finally:
+        # Restore prior state — registry flag and override file.
+        if original is not None and original_flag is not None:
+            original.enabled = original_flag
+        if backup_text is not None:
+            real_path.write_text(backup_text, encoding="utf-8")
+        else:
+            try:
+                real_path.unlink()
+            except Exception:
+                pass
+
+
 async def run_all_evals(category: str | None = None) -> EvalReport:
     rep = EvalReport(started_at=time.time())
 
@@ -1355,6 +1460,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         await eval_seo(rep)
     if category in (None, "content_factory"):
         await eval_content_factory(rep)
+    if category in (None, "skill_registry_v2"):
+        eval_skill_registry_v2(rep)
 
     rep.finished_at = time.time()
     return rep
