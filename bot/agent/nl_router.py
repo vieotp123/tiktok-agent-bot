@@ -442,11 +442,9 @@ _PATTERNS_SELF_IMPROVE = (
     _RE(r"\b/?self_improve(_once)?\b", re.I),
 )
 
-# Brain-Evolution loop — continuous self-improve until quota / stop
 _PATTERNS_BRAIN_EVOLVE_START = (
     _RE(r"\bbrain\s*[_\s]?evolve\s*(start|begin)?\b", re.I),
     _RE(r"\bbắt\s*đầu\s+(brain\s*evolve|tự\s*cải\s*thiện)", re.I),
-    _RE(r"\blàm\s+đến\s+khi\s+(hết|cạn)\s+quota", re.I),
     _RE(r"\b/?brain_evolve_start\b", re.I),
     # "tự cải thiện brain" (with the explicit word "brain") → loop, not
     # one-shot. Plain "tự cải thiện" without "brain" still hits the
@@ -480,9 +478,41 @@ _PATTERNS_AGENT_AUTORUN_START = (
         r"(dừng|stop)", re.I),
     _RE(r"\b/?agent_autorun_start\b", re.I),
     _RE(r"\bautorun\s+(start|on|begin)\b", re.I),
+    # ── Self-improve flavour: "tự hoàn thiện agent đi" / "tự cải thiện
+    # liên tục" / "làm tới khi hết quota" — same loop, but the start
+    # handler will queue self_improve tasks when the queue empties
+    # so the loop never stops on noop. Detected via the broader phrase
+    # patterns; classify() flags `auto_self_improve=True` in args so
+    # the handler knows to enable the auto-populate behaviour.
+    _RE(r"\btự\s+(hoàn\s*thiện|cải\s*thiện|nâng\s*cấp|train)\s+"
+        r"(agent|brain|bản\s*thân|mình|tao|m)\s*(đi|nha|liên\s*tục)?", re.I),
+    _RE(r"\btự\s+(làm|code)\s+(việc\s+)?(tới|cho\s*tới|đến)\s+(khi|lúc)\s+"
+        r"(hết|cạn)\s+quota", re.I),
+    _RE(r"\blàm\s+tới\s+(khi|lúc)\s+(hết|cạn)\s+quota", re.I),
+    _RE(r"\b(làm|chạy)\s+liên\s*tục\s+(tới\s+khi\s+)?(hết|cạn)\s+quota", re.I),
+    _RE(r"\btự\s+(làm|code|cải\s*thiện)\s+đi\s*(nha)?\s*$", re.I),
+    _RE(r"\bagent\s+tự\s+(làm|cải\s*thiện|hoàn\s*thiện)\b", re.I),
+    _RE(r"\b/?self_improve_loop\b", re.I),
+    # "làm đến khi hết quota" — until quota — fits autorun self-improve
+    # better than brain_evolve's cap-3 loop.
+    _RE(r"\blàm\s+(đến|tới|cho\s*tới)\s+khi\s+(hết|cạn)\s+quota", re.I),
     # "tự code 12 tiếng" (only when hours are present) — handled by the
     # \d+\s*tiếng patterns above. "tự code tiếp đi" without an hour
     # falls through to run_next_code_task / create_code_task.
+)
+
+# Subset of START patterns that ALSO indicate "self-improve mode"
+# (auto-populate queue from roadmap when empty).
+_PATTERNS_AGENT_AUTORUN_SELF_IMPROVE = (
+    _RE(r"\btự\s+(hoàn\s*thiện|cải\s*thiện|nâng\s*cấp|train)\s+"
+        r"(agent|brain|bản\s*thân|mình|tao|m)", re.I),
+    _RE(r"\btự\s+(làm|code)\s+(việc\s+)?(tới|cho\s*tới|đến)\s+(khi|lúc)\s+"
+        r"(hết|cạn)\s+quota", re.I),
+    _RE(r"\blàm\s+(tới|đến|cho\s*tới)\s+(khi|lúc)\s+(hết|cạn)\s+quota", re.I),
+    _RE(r"\b(làm|chạy)\s+liên\s*tục\s+(tới\s+khi\s+)?(hết|cạn)\s+quota", re.I),
+    _RE(r"\btự\s+(làm|code|cải\s*thiện)\s+đi\b", re.I),
+    _RE(r"\bagent\s+tự\s+(làm|cải\s*thiện|hoàn\s*thiện)\b", re.I),
+    _RE(r"\b/?self_improve_loop\b", re.I),
 )
 
 # ── Admin shell-style intents — apt/restart/git/cat .env ─────────────────
@@ -891,16 +921,45 @@ def classify(text: str) -> Intent:
         return Intent("agent_autorun_status", 0.95,
                       "Xem trạng thái agent autorun.",
                       {}, "low", False)
+    # BRAIN_EVOLVE has more specific phrasing ("brain evolve" /
+    # "tự cải thiện brain") and should beat the broader autorun
+    # self-improve patterns when admin explicitly says "brain".
+    # Checked BEFORE agent_autorun_start so the cap-3 controlled
+    # loop can still be reached.
+    if _has_any(t, _PATTERNS_BRAIN_EVOLVE_STOP):
+        return Intent("brain_evolve_stop", 0.95,
+                      "Dừng brain evolution loop.", {}, "low", False)
+    if _has_any(t, _PATTERNS_BRAIN_EVOLVE_STATUS):
+        return Intent("brain_evolve_status", 0.95,
+                      "Xem trạng thái brain evolution loop.",
+                      {}, "low", False)
+    if _has_any(t, _PATTERNS_BRAIN_EVOLVE_START):
+        m = re.search(r"\b(\d+)\s+task", t, re.I)
+        n_tasks = int(m.group(1)) if m else 1
+        return Intent("brain_evolve_start", 0.9,
+                      f"Bắt đầu brain evolution loop (max={n_tasks}).",
+                      {"max_tasks": max(1, min(n_tasks, 3))},
+                      "medium", False)
     if _has_any(t, _PATTERNS_AGENT_AUTORUN_START):
         # Hours + max_tasks parsed from text
         from bot.agent.agent_autorun import (parse_hours_vi,
                                               parse_max_tasks_vi)
-        hrs = parse_hours_vi(t, default=12.0)
-        mx  = parse_max_tasks_vi(t, default=20)
+        # Self-improve mode: keep loop alive even when queue empties
+        # by pulling roadmap items via self_improve_once. Uses 24h /
+        # 999 task default so the loop genuinely runs "until quota".
+        is_self_improve = _has_any(t, _PATTERNS_AGENT_AUTORUN_SELF_IMPROVE)
+        if is_self_improve:
+            hrs = parse_hours_vi(t, default=24.0)
+            mx  = parse_max_tasks_vi(t, default=999)
+        else:
+            hrs = parse_hours_vi(t, default=12.0)
+            mx  = parse_max_tasks_vi(t, default=20)
         return Intent("agent_autorun_start", 0.95,
-                      f"Khởi động agent autorun {hrs}h, max {mx} task.",
+                      f"Khởi động agent autorun {hrs}h, max {mx} task"
+                      f"{' [self-improve]' if is_self_improve else ''}.",
                       {"hours": hrs, "max_tasks": mx,
-                       "objective": t[:300]},
+                       "objective": t[:300],
+                       "auto_self_improve": is_self_improve},
                       "medium", False)
     if _has_any(t, _PATTERNS_AGENT_AUTORUN_STOP):
         return Intent("agent_autorun_stop", 0.95,

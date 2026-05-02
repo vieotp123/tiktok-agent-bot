@@ -57,6 +57,12 @@ _DEFAULT: dict = {
     "last_status":          "",
     "last_summary":         "",
     "user":                 "",
+    # Self-improve mode: when True, autorun pulls roadmap items via
+    # bot.agent.self_improve.run_once() when the code-task queue is
+    # empty, so the loop runs "tới khi hết quota" instead of stopping
+    # on the first noop.
+    "auto_self_improve":    False,
+    "self_improve_runs":    0,
 }
 
 _FAIL_STATUSES = {
@@ -112,9 +118,13 @@ def start(
     objective: str = "",
     *,
     user: str = "tg_admin",
+    auto_self_improve: bool = False,
 ) -> dict:
     h = float(max(0.1, min(hours, 24.0)))
-    n = int(max(1, min(int(max_tasks), 200)))
+    # Self-improve mode allows up to 999 tasks (effectively unlimited
+    # for the hour budget); regular autorun caps at 200.
+    cap = 999 if auto_self_improve else 200
+    n = int(max(1, min(int(max_tasks), cap)))
     started = _now()
     stop_at = started + timedelta(hours=h)
     d = state()
@@ -129,12 +139,15 @@ def start(
     d["paused_reason"]        = ""
     d["next_probe_at"]        = None
     d["user"]                 = user
+    d["auto_self_improve"]    = bool(auto_self_improve)
+    d["self_improve_runs"]    = 0
     _save(d)
     try:
         from bot.agent.audit_log import log_action
         log_action(user=user, action="agent_autorun_start",
                    risk_level="medium", status="ok",
                    result_summary=f"hours={h} max_tasks={n} "
+                                  f"self_improve={auto_self_improve} "
                                   f"obj={(objective or '')[:60]}")
     except Exception:
         pass
@@ -243,11 +256,38 @@ def record_outcome(result: dict) -> None:
         d["enabled"] = False
         d["last_status"] = "stopped:pending_action"
     elif status == "noop":
-        # Queue empty — stop politely.
-        d["enabled"] = False
-        d["last_status"] = "stopped:queue_empty"
+        # Queue empty.
+        if d.get("auto_self_improve"):
+            # Self-improve mode: don't stop — caller will populate
+            # queue from roadmap and try again.
+            d["last_status"] = "queue_empty_will_self_improve"
+        else:
+            d["enabled"] = False
+            d["last_status"] = "stopped:queue_empty"
 
     _save(d)
+
+
+def populate_queue_from_roadmap() -> dict:
+    """When queue is empty in self-improve mode, run self_improve_once
+    to pull the next roadmap item into the code_task queue.
+
+    Returns a dict describing what was queued (or noop if roadmap empty).
+    Safe to call repeatedly — self_improve.run_once de-dupes by checking
+    the queue first.
+    """
+    try:
+        from bot.agent import self_improve as _si
+        result = _si.run_once()  # already idempotent
+        d = state()
+        d["self_improve_runs"] = int(d.get("self_improve_runs") or 0) + 1
+        _save(d)
+        return result if isinstance(result, dict) else {
+            "status": "ran",
+            "summary": str(result)[:200],
+        }
+    except Exception as e:
+        return {"status": "error", "summary": f"self_improve error: {e}"}
 
 
 # ── Vietnamese parsing helpers ────────────────────────────────────────────────
@@ -345,8 +385,28 @@ async def advance_one(user: str = "tg_admin") -> dict:
 
     Caller (claude_quota scheduler / Telegram NL) must check is_due_to_stop()
     BEFORE invoking this and stop() if True.
+
+    In self-improve mode, when bridge returns noop (queue empty), this
+    will try to populate the queue from the roadmap once and retry —
+    so a single advance_one call can both grow and execute the queue.
     """
     from bot import coding_worker_bridge as bridge
     result = await bridge.run_once(user=user)
     record_outcome(result)
+
+    # Self-improve auto-populate: if queue is empty AND we're in
+    # self-improve mode AND not stopped yet, pull next roadmap item
+    # and run once more.
+    d = state()
+    if (d.get("enabled") and d.get("auto_self_improve")
+            and (result or {}).get("status") == "noop"):
+        pop = populate_queue_from_roadmap()
+        if pop.get("status") in ("queued", "ran", "ok"):
+            # Try again with the newly-queued task
+            result2 = await bridge.run_once(user=user)
+            record_outcome(result2)
+            return result2
+        # If self_improve produced nothing actionable, leave state as
+        # "queue_empty_will_self_improve" — scheduler will retry on
+        # next quota tick.
     return result

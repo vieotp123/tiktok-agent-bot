@@ -168,11 +168,37 @@ def set_reset_in(text: str) -> dict:
 
 
 def set_limited(flag: bool) -> dict:
+    """Manual admin mark for Claude quota state.
+
+    Keeps the legacy ``limited`` flag and the v2 ``status`` enum in
+    sync so /claude_status doesn't show "limited: yes" while
+    "Status: available" — the inconsistency that confused admins
+    previously.
+
+    When marking limited without an explicit reset_at, schedules the
+    next probe for 1 hour later so the loop tries again automatically.
+    When clearing, resets status back to ``unknown`` so the next probe
+    establishes ground truth.
+    """
     d = state()
     d["limited"] = bool(flag)
-    if not flag:
+    if flag:
+        d["status"]            = "limited"
+        d["last_limited_at"]   = _now_iso()
+        # Default 1h backoff if no explicit reset_at known
+        if not d.get("reset_at"):
+            from datetime import timedelta
+            nxt = (datetime.now(timezone.utc)
+                   + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            d["next_probe_at"] = nxt
+    else:
         d["reset_at"]         = None
         d["last_notified_at"] = None
+        d["next_probe_at"]    = None
+        # Don't clobber status if last probe already proved available;
+        # otherwise reset to unknown so next probe establishes truth.
+        if d.get("status") == "limited":
+            d["status"] = "unknown"
     _save(d)
     return d
 

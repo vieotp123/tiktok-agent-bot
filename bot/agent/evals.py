@@ -576,7 +576,11 @@ def eval_nl_router_v2(rep: EvalReport) -> None:
     from bot.agent.nl_router import classify
     cases = [
         ("tự cải thiện brain đi",                "brain_evolve_start"),
-        ("làm đến khi hết quota",                 "brain_evolve_start"),
+        # "làm đến khi hết quota" was originally brain_evolve_start (cap=3
+        # loop); migrated to agent_autorun_start in self-improve mode
+        # because cap-3 stops well before quota actually hits, while the
+        # autorun self-improve mode genuinely runs until quota.
+        ("làm đến khi hết quota",                 "agent_autorun_start"),
         ("dừng tự cải thiện",                     "brain_evolve_stop"),
         ("xem brain evolve",                      "brain_evolve_status"),
         ("nhớ là coding dùng opus 4.7",           "memory_add"),

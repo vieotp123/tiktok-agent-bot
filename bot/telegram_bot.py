@@ -1785,21 +1785,23 @@ def handle_brain_evolve_status() -> str:
 
 # ── Agent Autorun (10-12h owner work session) ────────────────────────────────
 
-async def handle_agent_autorun_start(arg: str = "") -> str:
+async def handle_agent_autorun_start(arg: str = "",
+                                       auto_self_improve: bool = False) -> str:
     """Start owner-directed long-horizon autorun loop.
 
     Usage: /agent_autorun_start [hours] [max_tasks] [objective...]
     Or NL: "làm việc độc lập 12 tiếng"
+    Or NL self-improve: "tự hoàn thiện agent đi"
     """
     from bot.agent import agent_autorun as _aa
     arg = (arg or "").strip()
-    hours = 12.0
-    max_tasks = 20
+    hours = 24.0 if auto_self_improve else 12.0
+    max_tasks = 999 if auto_self_improve else 20
     objective = ""
     if arg:
         parts = arg.split(None, 2)
         try:
-            hours = float(parts[0]) if parts else 12.0
+            hours = float(parts[0]) if parts else hours
         except ValueError:
             pass
         if len(parts) >= 2:
@@ -1810,17 +1812,28 @@ async def handle_agent_autorun_start(arg: str = "") -> str:
         if len(parts) >= 3:
             objective = parts[2]
     d = _aa.start(hours=hours, max_tasks=max_tasks,
-                  objective=objective, user="tg_admin")
+                  objective=objective, user="tg_admin",
+                  auto_self_improve=auto_self_improve)
+    mode_label = ("self-improve (auto-populate từ roadmap)"
+                   if auto_self_improve else "owner-directed")
     return (f"🟢 <b>Agent Autorun started</b>\n"
+            f"Mode: <b>{mode_label}</b>\n"
             f"Thời lượng: <b>{d['hours']}h</b> · "
             f"max <b>{d['max_tasks']}</b> task\n"
             f"stop_at: <code>{d['stop_at']}</code>\n"
             f"Mục tiêu: <i>{_esc((objective or '(tự chọn từ roadmap/queue)')[:200])}</i>\n\n"
-            f"Em sẽ tự pick task → refine prompt qua GPT-5.5 → "
-            f"chạy Claude CLI → test → commit/push → report. "
-            f"Hết quota thì pause 1h rồi probe lại.\n\n"
-            f"Lệnh dừng: <code>/agent_autorun_stop</code> hoặc "
-            f"nhắn <i>“dừng”</i>.")
+            + ("Em sẽ tự pick task từ <code>docs/ROADMAP.md</code> → "
+               "queue qua self_improve → refine prompt qua GPT-5.5 → "
+               "Claude CLI edit + test + commit + push → loop. "
+               "Hết quota thì pause 1h rồi probe lại tự resume. "
+               "Chỉ dừng khi anh bảo dừng, hoặc 2 fail liên tiếp, "
+               "hoặc hết hours."
+               if auto_self_improve else
+               "Em sẽ tự pick task → refine prompt qua GPT-5.5 → "
+               "chạy Claude CLI → test → commit/push → report. "
+               "Hết quota thì pause 1h rồi probe lại.")
+            + "\n\nLệnh dừng: <code>/agent_autorun_stop</code> hoặc "
+              "nhắn <i>“dừng”</i>.")
 
 
 def handle_agent_autorun_stop() -> str:
@@ -3943,8 +3956,10 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         hrs       = float(intent.args.get("hours")     or 12.0)
         max_tasks = int(intent.args.get("max_tasks")   or 20)
         objective = (intent.args.get("objective") or raw_text)[:300]
+        is_self_improve = bool(intent.args.get("auto_self_improve"))
         return await handle_agent_autorun_start(
             f"{hrs} {max_tasks} {objective}".strip(),
+            auto_self_improve=is_self_improve,
         )
     if name == "agent_autorun_stop":
         return handle_agent_autorun_stop()
