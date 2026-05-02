@@ -1413,6 +1413,141 @@ def eval_skill_registry_v2(rep: EvalReport) -> None:
                 pass
 
 
+def eval_nl_router_v3(rep: EvalReport) -> None:
+    """NL router v3 — confidence calibration, build-question routing,
+    explain_intent API, and VN↔EN translation table.
+
+    Locks invariants the v3 spec promised:
+      - short stub directives ("claude", "task") return `ambiguous`,
+        not `chat`, so the backend can't hallucinate from stale state.
+      - "có tool X không / làm sao để X" routes to `build_missing_tool`.
+      - explain_intent surfaces a Vietnamese decision trail.
+      - translate_command normalises pure-English imperatives to VN
+        before classify() (no-op when text already has diacritics).
+      - existing pass-throughs (`hello` → chat, `ok` → confirm_action)
+        still hold after calibration.
+    """
+    from bot.agent.nl_router import (
+        VN_EN_TABLE, classify, explain_intent, translate_command,
+    )
+
+    # ── A. Ambiguous stubs — historically chat, now must clarify ──────────
+    stub_cases = [
+        ("claude",       "ambiguous"),
+        ("claude?",      "ambiguous"),
+        ("task",         "ambiguous"),
+        ("code",         "ambiguous"),
+        ("tự",           "ambiguous"),
+        ("làm",          "ambiguous"),
+        ("làm gì",       "ambiguous"),
+        ("chạy",         "ambiguous"),
+    ]
+    for text, want in stub_cases:
+        got = classify(text)
+        rep.add(f"v3_stub[{text!r}]", "nl_router_v3",
+                got.name == want and got.risk_level == "low",
+                f"got={got.name} risk={got.risk_level}")
+
+    # ── B. Build-question — capability-question must offer to build, not
+    #    fall to chat where the LLM might invent a fake "yes I can" reply.
+    build_cases = [
+        "có tool web_scraper không",
+        "có tool slack_notify không",
+        "có cách nào để gửi email",
+        "có api nào cho gửi sms",
+        "bot làm được i18n không",
+        "bot có deploy được không",
+        "agent chạy được headless không",
+        "how to export csv",
+        "how do i deploy a remote vps",
+        "có thể parse pdf được không",
+    ]
+    for text in build_cases:
+        got = classify(text)
+        rep.add(f"v3_build[{text[:30]!r}]", "nl_router_v3",
+                got.name == "build_missing_tool"
+                and got.risk_level == "medium",
+                f"got={got.name} risk={got.risk_level}")
+
+    # ── C. Translate command — EN tokens → VN equivalents ────────────────
+    translate_cases = [
+        ("stop",          "dừng"),
+        ("cancel",        "hủy"),
+        ("next",          "tiếp tục"),
+        ("continue",      "tiếp tục"),
+        ("list tasks",    "liệt kê task"),
+        ("list skills",   "xem skills"),
+        ("show files",    "xem file"),
+        ("search",        "tìm"),
+        ("remember",      "nhớ"),
+        ("forget",        "quên"),
+    ]
+    for text, want_substr in translate_cases:
+        norm = translate_command(text)
+        rep.add(f"v3_tr[{text!r}]", "nl_router_v3",
+                want_substr in norm,
+                f"got={norm!r}")
+
+    # Diacritic-bearing input must NOT be re-translated (no-op).
+    for text in ("dừng", "tìm thông tin", "nhớ là claude xài opus"):
+        norm = translate_command(text)
+        rep.add(f"v3_tr_noop[{text[:24]!r}]", "nl_router_v3",
+                norm == text, f"got={norm!r}")
+
+    # ── D. Cross-lingual end-to-end: translate → classify ────────────────
+    cross_cases = [
+        ("stop",        "cancel_action"),
+        ("next",        "run_next_code_task"),
+        ("continue",    "run_next_code_task"),
+        ("list tasks",  "list_tasks"),
+        ("list skills", "skill_list"),
+    ]
+    for text, want in cross_cases:
+        got = classify(translate_command(text))
+        rep.add(f"v3_cross[{text!r}]", "nl_router_v3",
+                got.name == want, f"got={got.name} want={want}")
+
+    # ── E. explain_intent shape — keys + key facts ───────────────────────
+    e1 = explain_intent("hello")
+    rep.add("v3_explain_chat_keys", "nl_router_v3",
+            {"intent", "confidence", "risk_level", "reason_vi"}
+                .issubset(e1.keys())
+            and e1["intent"] == "chat",
+            f"got_keys={sorted(e1.keys())} intent={e1['intent']}")
+    e2 = explain_intent("claude")
+    rep.add("v3_explain_ambiguous", "nl_router_v3",
+            e2["intent"] == "ambiguous"
+            and "stub" in e2["reason_vi"].lower(),
+            f"reason={e2['reason_vi'][:80]}")
+    e3 = explain_intent("có tool web_scraper không")
+    rep.add("v3_explain_build", "nl_router_v3",
+            e3["intent"] == "build_missing_tool"
+            and "build" in e3["reason_vi"].lower(),
+            f"reason={e3['reason_vi'][:80]}")
+
+    # ── F. Regression — existing classifications still hold ──────────────
+    regress = [
+        ("hello",                 "chat"),
+        ("đồng ý",                "confirm_action"),
+        ("dừng",                  "cancel_action"),
+        ("tự cải thiện brain đi", "brain_evolve_start"),
+        ("xem skills",            "skill_list"),
+        ("kiểm tra quota claude", "quota_status"),
+    ]
+    for text, want in regress:
+        got = classify(text)
+        rep.add(f"v3_regress[{text[:24]!r}]", "nl_router_v3",
+                got.name == want, f"got={got.name} want={want}")
+
+    # ── G. VN_EN_TABLE shape ──────────────────────────────────────────────
+    rep.add("v3_table_size", "nl_router_v3",
+            len(VN_EN_TABLE) >= 15,
+            f"len={len(VN_EN_TABLE)}")
+    rep.add("v3_table_lowercase_keys", "nl_router_v3",
+            all(k == k.lower() for k in VN_EN_TABLE),
+            "all keys lowercase")
+
+
 async def run_all_evals(category: str | None = None) -> EvalReport:
     rep = EvalReport(started_at=time.time())
 
@@ -1462,6 +1597,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         await eval_content_factory(rep)
     if category in (None, "skill_registry_v2"):
         eval_skill_registry_v2(rep)
+    if category in (None, "nl_router_v3"):
+        eval_nl_router_v3(rep)
 
     rep.finished_at = time.time()
     return rep

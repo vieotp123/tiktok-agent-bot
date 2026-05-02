@@ -4533,6 +4533,13 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     if name == "cancel_action":
         return await _cancel_latest_pending(chat_id)
 
+    # ── v3 confidence calibration: ambiguous stub ────────────────────────
+    # Short single-word inputs ("claude", "task", "tự") that historically
+    # leaked to the chat backend. Reply with the disambiguation question
+    # built into intent.summary_vi so admin picks the actual intent.
+    if name == "ambiguous":
+        return f"🤔 {intent.summary_vi}"
+
     # ── Status / list / search / receive_file_context ────────────────────
     if name == "agent_diag":
         return await handle_agent_diag()

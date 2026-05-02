@@ -743,6 +743,81 @@ _PATTERNS_SSH_EXEC = (
     _RE(r"\b(restart|khởi\s*động\s*lại)\s+(bot|service)\s+(?:trên|bên)?\s*(vps|worker)\s*(\w+)", re.I),
 )
 
+# ── v3 confidence calibration ─────────────────────────────────────────────
+#
+# Stub directives — single-word inputs ("claude", "task", "tự") that
+# historically fell to the chat fallback even though they carry intent.
+# Routing them to chat let the backend hallucinate from stale context;
+# v3 returns an `ambiguous` intent that asks the user to clarify
+# instead. Each entry is (pattern, "ý anh là X hay Y?" prompt).
+_PATTERNS_AMBIGUOUS_STUB: tuple[tuple[re.Pattern, str], ...] = (
+    (_RE(r"^\s*(claude|opus|sonnet)\s*[\?!\.]*$", re.I),
+     "ý anh là <i>kiểm tra quota Claude</i> hay "
+     "<i>chạy task code tiếp theo</i>?"),
+    (_RE(r"^\s*task\s*[\?!\.]*$", re.I),
+     "ý anh là <i>liệt kê task code</i> hay "
+     "<i>chạy task tiếp theo</i>?"),
+    (_RE(r"^\s*code\s*[\?!\.]*$", re.I),
+     "ý anh là <i>tạo task code mới</i> hay "
+     "<i>chạy task code tiếp theo</i>?"),
+    (_RE(r"^\s*tự\s*[\?!\.]*$", re.I),
+     "ý anh là <i>tự code tiếp đi</i> hay "
+     "<i>tự cải thiện brain</i>?"),
+    (_RE(r"^\s*làm\s*(gì|đi)?\s*[\?!\.]*$", re.I),
+     "ý anh là <i>làm task tiếp theo</i> hay "
+     "<i>báo cáo đang làm tới đâu</i>?"),
+    (_RE(r"^\s*chạy\s*[\?!\.]*$", re.I),
+     "ý anh là <i>chạy task code</i> hay "
+     "<i>autorun start</i>?"),
+)
+
+# Build-missing-tool questions — owner asks if a capability exists
+# ("có tool X không / làm sao để X / bot có chạy được X không").
+# Differs from `_PATTERNS_BUILD_TOOL` which catches the imperative
+# "thêm/tạo tool X" form. Together they cover both phrasings.
+_PATTERNS_BUILD_QUESTION = (
+    _RE(r"\bcó\s+tool\s+\S+.*\b(không|chưa|kh\b|ko)\b", re.I),
+    _RE(r"\bcó\s+(cách|api|module|skill)\s+nào\s+(để|cho)\b", re.I),
+    _RE(r"\bbot\s+(làm|chạy)\s+được\s+\S+.*\b(không|chưa|ko)\b", re.I),
+    _RE(r"\bbot\s+có\s+(thể\s+)?\S+.*\b(không|chưa|ko)\b", re.I),
+    _RE(r"\b(làm\s+sao|how\s+to|how\s+do)\b\s+\w+", re.I),
+    _RE(r"\bagent\s+(làm|chạy)\s+được\s+\S+.*\b(không|chưa|ko)\b", re.I),
+    _RE(r"\bcó\s+thể\s+.+\s+được\s+(không|chưa)\b", re.I),
+)
+
+# VN ↔ EN intent translation table. Used by `translate_command()` as
+# a deterministic preprocessing step so pure-English imperatives
+# ("stop", "next", "list skills") match the Vietnamese-first patterns.
+# Keys: lowercase tokens. Values: VN equivalent inserted in place.
+VN_EN_TABLE: dict[str, str] = {
+    "stop":           "dừng",
+    "cancel":         "hủy",
+    "yes":            "đồng ý",
+    "no":             "hủy",
+    "next":           "tiếp tục",
+    "continue":       "tiếp tục",
+    "run next":       "chạy tiếp",
+    "run code":       "chạy task code",
+    "run batch":      "chạy batch",
+    "build tool":     "tạo tool",
+    "create tool":    "tạo tool",
+    "list tasks":     "liệt kê task",
+    "list skills":    "xem skills",
+    "show files":     "xem file",
+    "show skills":    "xem skills",
+    "search":         "tìm",
+    "remember":       "nhớ",
+    "forget":         "quên",
+    "status":         "trạng thái",
+    "progress":       "tiến độ",
+    "claude status":  "kiểm tra claude",
+    "claude probe":   "probe claude",
+    "quota":          "quota",
+    "autorun start":  "autorun start",
+    "autorun stop":   "dừng autorun",
+}
+
+
 _PATTERNS_HIGH_RISK = (
     _RE(r"(?:^|\s|/)\.env\b"),       # match `.env` even after whitespace
     _RE(r"\bstorage[_\s]?state\b", re.I),
@@ -805,6 +880,87 @@ def is_cancel_phrase(text: str) -> bool:
 
 def _has_any(text: str, patterns) -> bool:
     return any(p.search(text) for p in patterns)
+
+
+_VI_DIACRITIC_RE = re.compile(
+    r"[ăâđêôơưáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợ"
+    r"úùủũụứừửữựýỳỷỹỵ]",
+    re.I,
+)
+
+
+def translate_command(text: str) -> str:
+    """Translate English command tokens → Vietnamese equivalents.
+
+    Deterministic preprocessing for cross-cultural commands. No-op
+    when text already contains Vietnamese diacritics (the existing
+    VN-first patterns will handle it). Multi-word keys are matched
+    longest-first so "list tasks" wins over "list".
+    """
+    if not text:
+        return text
+    s = text.strip()
+    if _VI_DIACRITIC_RE.search(s):
+        return text
+    out = s
+    for k in sorted(VN_EN_TABLE, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(k)}\b", out, re.I):
+            out = re.sub(rf"\b{re.escape(k)}\b", VN_EN_TABLE[k], out,
+                         flags=re.I)
+    return out
+
+
+def _ambiguous_stub(text: str) -> _Optional[Intent]:
+    """Stub directive → ambiguous Intent that asks for disambiguation.
+    Returns None when the input is not a known stub.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    for pat, ask in _PATTERNS_AMBIGUOUS_STUB:
+        if pat.search(s):
+            return Intent("ambiguous", 0.4, ask,
+                          {"raw": text}, "low", False)
+    return None
+
+
+def explain_intent(text: str) -> dict:
+    """Return a debug-friendly explanation of how `text` was classified.
+
+    Surfaces the deterministic decision trail for "vì sao em hiểu thế"
+    queries. Never raises; always returns at minimum
+    {"intent", "confidence", "reason_vi"}.
+    """
+    intent = classify(text)
+    norm = translate_command(text)
+    used_translation = norm != text and norm.strip() != (text or "").strip()
+    parts = [
+        f"Input: <code>{(text or '')[:80]}</code>",
+        f"→ intent <b>{intent.name}</b> "
+        f"(confidence {intent.confidence:.2f}, "
+        f"risk {intent.risk_level}).",
+    ]
+    if used_translation:
+        parts.append(f"Đã dịch EN→VN: <code>{norm[:80]}</code>.")
+    if intent.name == "chat":
+        parts.append("Không pattern nào match — fallback "
+                     "<code>chat</code> đi tới backend.")
+    elif intent.name == "ambiguous":
+        parts.append("Match kiểu stub — em hỏi lại "
+                     "vì lệnh quá ngắn.")
+    elif intent.name == "build_missing_tool":
+        parts.append("Match build-question — em đề xuất "
+                     "tạo code_task build tool.")
+    return {
+        "intent":           intent.name,
+        "confidence":       intent.confidence,
+        "risk_level":       intent.risk_level,
+        "requires_confirm": intent.requires_confirm,
+        "summary_vi":       intent.summary_vi,
+        "args":             intent.args,
+        "translated":       norm if used_translation else None,
+        "reason_vi":        " ".join(parts),
+    }
 
 
 def classify(text: str) -> Intent:
@@ -1199,7 +1355,18 @@ def classify(text: str) -> Intent:
         return Intent("search", 0.7,
                       "Tìm kiếm web.", {"query": t}, "low", False)
 
-    # 7. Default: chat
+    # 7. Default — v3 confidence calibration:
+    #    a) short stub directives → ambiguous (ask "ý anh là X hay Y?")
+    #    b) "có tool X không / làm sao để X" → build_missing_tool
+    #    c) else fall through to backend chat
+    stub = _ambiguous_stub(t)
+    if stub is not None:
+        return stub
+    if _has_any(t, _PATTERNS_BUILD_QUESTION):
+        return Intent("build_missing_tool", 0.75,
+                      "Owner hỏi về capability chưa có — đề xuất "
+                      "build tool thay vì trả lời chat.",
+                      {"description": t}, "medium", False)
     return Intent("chat", 0.5,
                   "Chat thường — chuyển backend trả lời.",
                   {"text": t}, "low", False)
