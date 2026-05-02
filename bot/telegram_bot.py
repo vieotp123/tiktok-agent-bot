@@ -1002,17 +1002,53 @@ def handle_file_detail(file_id: str) -> str:
     ])
 
 
-async def handle_send_file(path: str, chat_id: str | int) -> str:
-    path = path.strip()
+def _resolve_file_arg(arg: str) -> tuple[str, str]:
+    """Resolve a /send_file or /send_photo arg to a local path.
+
+    Accepts either an internal file_id from /files (8-12 hex chars) or a
+    raw filesystem path. Returns (path, label_for_caption).
+    """
+    arg = arg.strip()
+    if arg and "/" not in arg and "\\" not in arg and \
+       all(c in "0123456789abcdefABCDEF" for c in arg) and 4 <= len(arg) <= 16:
+        rec = get_file_record(arg)
+        if rec and rec.get("local_path"):
+            return rec["local_path"], rec.get("filename") or arg
+    return arg, os.path.basename(arg)
+
+
+async def handle_send_file(arg: str, chat_id: str | int) -> str:
+    if not arg.strip():
+        return ("Usage: <code>/send_file &lt;file_id|path&gt;</code>\n"
+                "file_id from /files, or absolute path under an allowed root.")
+    path, label = _resolve_file_arg(arg)
     ok, reason = is_safe_send_path(path)
     if not ok:
         return reason
     ext = Path(path).suffix.lower()
     if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-        sent = await send_photo(chat_id, path, caption=f"📤 {os.path.basename(path)}")
+        sent = await send_photo(chat_id, path, caption=f"📤 {label}")
     else:
-        sent = await send_document(chat_id, path, caption=f"📤 {os.path.basename(path)}")
-    return f"✅ Sent: <code>{path}</code>" if sent else f"❌ Failed to send: <code>{path}</code>"
+        sent = await send_document(chat_id, path, caption=f"📤 {label}")
+    return (f"✅ Sent: <code>{label}</code>" if sent
+            else f"❌ Failed to send: <code>{label}</code>")
+
+
+async def handle_send_photo(arg: str, chat_id: str | int) -> str:
+    if not arg.strip():
+        return ("Usage: <code>/send_photo &lt;file_id|path&gt;</code>\n"
+                "file_id from /files, or path to an image (jpg/png/webp/gif).")
+    path, label = _resolve_file_arg(arg)
+    ok, reason = is_safe_send_path(path)
+    if not ok:
+        return reason
+    ext = Path(path).suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        return (f"❌ <code>{label}</code> is not an image extension. "
+                "Use /send_file for non-image files.")
+    sent = await send_photo(chat_id, path, caption=f"📤 {label}")
+    return (f"✅ Photo sent: <code>{label}</code>" if sent
+            else f"❌ Failed to send photo: <code>{label}</code>")
 
 
 def handle_upload_guide() -> str:
@@ -2308,6 +2344,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/files":        return handle_files_list()
     if cmd == "/file":         return handle_file_detail(arg)
     if cmd == "/send_file":    return await handle_send_file(arg, chat_id)
+    if cmd == "/send_photo":   return await handle_send_photo(arg, chat_id)
     if cmd == "/logs":         return await handle_logs()
     if cmd == "/tiktok_chat_info": return handle_tiktok_chat_info()
     if cmd == "/agent_blueprint":  return handle_agent_blueprint()

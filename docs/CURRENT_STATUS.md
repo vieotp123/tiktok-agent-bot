@@ -28,6 +28,10 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
   `credential`). New allowed-send roots: `data/code_prompts`,
   `data/code_worker_logs`, `docs`, `research`, `generated`. New
   commands: `/code_task_from_file <id> <desc>`, `/run_task_with_file`.
+  `/send_file` and `/send_photo` now accept either a file_id from
+  `/files` or an absolute path. Brain-side helpers
+  `bot.telegram_report.send_telegram_file()` and
+  `send_telegram_photo()` enforce the same allow/block lists.
 - **Telegram commands** added:
   - `/code_worker_run_once`, `/code_worker_run_batch <n>`,
     `/code_worker_status`, `/code_worker_pause`, `/code_worker_resume`

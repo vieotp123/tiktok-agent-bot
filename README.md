@@ -114,8 +114,8 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 # Skills
 /skills /skill <name>
 
-# Files
-/files /file <id> /send_file <path>
+# Files (see "File Hub 2-way" below for full list)
+/files /file <id> /send_file <id_or_path> /send_photo <id_or_path>
 
 # Memory
 /memory_search <q> /memory_add /memory_forget <id>

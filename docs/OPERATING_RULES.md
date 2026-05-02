@@ -101,7 +101,29 @@ Backend logs every consult with intent, confidence, products_used, and
 lead score. No customer message content is logged beyond a 60-char
 summary.
 
-## 9. Failure handling
+## 9. Telegram File Hub (2-way)
+
+- **Receive**: any document/photo/audio/video/voice from
+  `TELEGRAM_ADMIN_CHAT_ID` is downloaded via `getFile`, saved under
+  `data/telegram/inbox/YYYY/MM/DD/`, indexed in
+  `data/telegram/files.jsonl`, and acknowledged with a `file_id`.
+  Hard 50 MB cap per upload; uploads are never executed.
+- **Send (bot side)**: `/send_file <file_id|path>` and
+  `/send_photo <file_id|path>`. `file_id` is resolved against the
+  inbox index; `path` must resolve under one of the allowed roots:
+  `data/telegram/inbox`, `data/code_prompts`, `data/code_worker_logs`,
+  `reports`, `screenshots`, `generated`, `docs`, `research`.
+- **Send (brain side)**: `bot.telegram_report.send_telegram_file(path)`
+  and `send_telegram_photo(path)` — same allow-list, same block-list,
+  enforced by `bot.telegram_files.is_safe_send_path`.
+- **Always blocked by filename pattern** (regardless of root):
+  `.env`, `storage_state`, `tiktok_storage_state`, `cookies`,
+  `private_key`, `secret`, `token`, `id_rsa`, `.pem`, `.key`, `.p12`,
+  `auth.json`, `credential`, `.log`.
+- `data/telegram/` is gitignored — uploads and the JSONL index are
+  never committed.
+
+## 10. Failure handling
 
 - If a phase or test fails twice, stop and report the root cause.
   Don't loop indefinitely.
