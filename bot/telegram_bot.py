@@ -1785,8 +1785,27 @@ def handle_brain_evolve_status() -> str:
 
 # ── Agent Autorun (10-12h owner work session) ────────────────────────────────
 
+def _autorun_control_keyboard() -> dict:
+    """Inline-keyboard panel for the most common autorun commands.
+
+    Owner asked: "các lệnh để điều khiển trong bot telegram nên hiện
+    kiểu button". One row per logical group; callback ids match
+    existing dispatch_callback do:* handlers.
+    """
+    return make_keyboard([
+        [("📊 Tiến độ",      "do:agent_progress"),
+         ("🩺 Diag",          "do:agent_diag")],
+        [("✅ Probe Claude",  "do:claude_probe"),
+         ("📅 Quota status",  "do:claude_status")],
+        [("⏹ Dừng autorun",  "do:autorun_stop"),
+         ("📋 Code queue",    "do:code_status")],
+    ])
+
+
 async def handle_agent_autorun_start(arg: str = "",
-                                       auto_self_improve: bool = False) -> str:
+                                       auto_self_improve: bool = False,
+                                       chat_id: str | int | None = None,
+                                       ) -> str:
     """Start owner-directed long-horizon autorun loop.
 
     Usage: /agent_autorun_start [hours] [max_tasks] [objective...]
@@ -1833,6 +1852,19 @@ async def handle_agent_autorun_start(arg: str = "",
                        report_callback=_autorun_report,
                        poll_interval_sec=8.0),
     )
+
+    # Surface the control panel as inline buttons so admin can pause /
+    # check progress / probe Claude without typing commands.
+    if chat_id is not None:
+        try:
+            asyncio.create_task(send(
+                chat_id,
+                "<b>🎛 Autorun control panel</b>\n"
+                "<i>Bấm nút để điều khiển — không cần gõ lệnh.</i>",
+                reply_markup=_autorun_control_keyboard(),
+            ))
+        except Exception:
+            pass
 
     return (f"🟢 <b>Agent Autorun started</b>\n"
             f"Mode: <b>{mode_label}</b>\n"
@@ -3604,6 +3636,14 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return handle_agent_next()
     if action == "agent_progress":
         return await handle_agent_progress()
+    if action == "autorun_stop":
+        return handle_agent_autorun_stop()
+    if action == "autorun_status":
+        return handle_agent_autorun_status()
+    if action == "claude_probe":
+        return await handle_claude_probe()
+    if action == "claude_status":
+        return _cq.format_claude_status_vi()
     if action == "products":
         return handle_products()
     if action == "products_active":
@@ -3766,7 +3806,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/brain_evolve_stop":    return handle_brain_evolve_stop()
     if cmd == "/brain_evolve_status":  return handle_brain_evolve_status()
     # ── Agent Autorun (10–12h owner work session) ────────────────────────
-    if cmd == "/agent_autorun_start":  return await handle_agent_autorun_start(arg)
+    if cmd == "/agent_autorun_start":  return await handle_agent_autorun_start(arg, chat_id=chat_id)
     if cmd == "/agent_autorun_stop":   return handle_agent_autorun_stop()
     if cmd == "/agent_autorun_status": return handle_agent_autorun_status()
     if cmd == "/agent_progress":       return await handle_agent_progress()
@@ -4044,6 +4084,7 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         return await handle_agent_autorun_start(
             f"{hrs} {max_tasks} {objective}".strip(),
             auto_self_improve=is_self_improve,
+            chat_id=chat_id,
         )
     if name == "agent_autorun_stop":
         return handle_agent_autorun_stop()

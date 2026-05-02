@@ -430,6 +430,13 @@ async def pump_loop(user: str = "tg_admin",
     """
     import asyncio as _asy
 
+    # Track local state to avoid spamming the same notification every
+    # 30s while paused. Owner reported: "khi gặp limit thì 1 tiếng sau
+    # vào thử lại, ko spam." We send ONE pause notice on entry, ONE
+    # resume notice on exit, silent in between.
+    last_pause_signature: str = ""
+    was_paused: bool = False
+
     while True:
         # Check stop conditions
         should_stop, reason = is_due_to_stop()
@@ -448,17 +455,36 @@ async def pump_loop(user: str = "tg_admin",
         if not can_probe_now():
             d = state()
             nxt = d.get("next_probe_at") or ""
-            if report_callback:
+            paused_reason = d.get("paused_reason", "")
+            # Signature lets us detect a transition: same reason + same
+            # next_probe_at = same pause; only notify once per signature.
+            sig = f"{paused_reason}|{nxt}"
+            if sig != last_pause_signature and report_callback:
                 try:
                     await report_callback(
-                        f"⏸ Autorun paused (<i>{_esc(d.get('paused_reason',''))}</i>) "
-                        f"— probe lại lúc <code>{nxt}</code>",
+                        f"⏸ <b>Autorun paused</b> — {_esc(paused_reason)}\n"
+                        f"Probe lại lúc <code>{_esc(nxt)}</code>. Em sẽ "
+                        f"tự resume khi quota về, không spam thêm.",
                     )
                 except Exception:
                     pass
+                last_pause_signature = sig
+            was_paused = True
             # Sleep in 30s chunks so admin stop is detected promptly
             await _asy.sleep(30)
             continue
+
+        # If we were paused and just got out, send ONE resume notice
+        if was_paused and report_callback:
+            try:
+                await report_callback(
+                    "▶ <b>Autorun resumed</b> — quota probe arrived, "
+                    "đang chạy tiếp.",
+                )
+            except Exception:
+                pass
+            was_paused = False
+            last_pause_signature = ""
 
         # Run one bridge cycle
         try:
@@ -483,10 +509,13 @@ async def pump_loop(user: str = "tg_admin",
             await _asy.sleep(30)
             continue
 
-        # Report result to admin
-        if report_callback:
+        # Report result to admin — but suppress noisy noop/no_changes
+        # cycles that follow each other quickly. Only meaningful state
+        # transitions get a notification: done / failed / paused /
+        # auth_required / pending_action. Plain noop is silent.
+        rstatus = (result or {}).get("status", "?")
+        if report_callback and rstatus not in ("noop",):
             try:
-                rstatus = (result or {}).get("status", "?")
                 tid     = (result or {}).get("task_id", "")
                 summ    = ((result or {}).get("summary") or "")[:200]
                 d = state()
@@ -495,11 +524,17 @@ async def pump_loop(user: str = "tg_admin",
                 hdr_icon = {
                     "done":           "✅",
                     "no_changes":     "💤",
-                    "noop":           "💤",
                     "quota_limited":  "🚫",
                     "auth_required":  "🔒",
                     "no_tool":        "❌",
                     "pending_action": "⏸",
+                    "worker_failed":  "💥",
+                    "smoke_failed":   "🚫",
+                    "evals_failed":   "🚫",
+                    "commit_failed":  "💥",
+                    "push_failed":    "💥",
+                    "exec_error":     "💥",
+                    "blocked_staged": "🛑",
                 }.get(rstatus, "•")
                 msg = (f"{hdr_icon} <b>Autorun cycle</b> — task "
                        f"<code>{_esc(str(tid))}</code> → <i>{_esc(rstatus)}</i>"
