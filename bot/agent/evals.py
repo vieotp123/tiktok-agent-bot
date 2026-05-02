@@ -213,7 +213,7 @@ def eval_memory(rep: EvalReport) -> None:
             len(ctx2) < 4000, f"len={len(ctx2)}")
 
 
-def eval_bridge(rep: EvalReport) -> None:
+async def eval_bridge(rep: EvalReport) -> None:
     """Coding-worker bridge dirty-tree gate.
 
     Uses an isolated tmp git repo to verify:
@@ -222,13 +222,18 @@ def eval_bridge(rep: EvalReport) -> None:
          that file.
       3. _files_changed_since() reports only paths newly dirty after
          the snapshot — pre-existing dirty files are excluded.
+      4. run_once() refuses with status=dirty_tree when the tree is
+         dirty — exercises the full gate, not just the snapshot helper.
+      5. The refused task is NOT mutated (no start/finish/fail call).
     """
+    import asyncio
     import os
     import subprocess
     import tempfile
     from pathlib import Path as _Path
 
     from bot import coding_worker_bridge as _cwb
+    from bot import code_tasks as _ct
 
     with tempfile.TemporaryDirectory() as td:
         tdp = _Path(td)
@@ -245,7 +250,7 @@ def eval_bridge(rep: EvalReport) -> None:
         run("git", "commit", "-q", "-m", "init")
 
         # Patch REPO so the bridge helpers query our tmp repo
-        original = _cwb.REPO
+        original_repo = _cwb.REPO
         _cwb.REPO = tdp
         try:
             snap_clean = _cwb.dirty_tree_snapshot()
@@ -267,8 +272,67 @@ def eval_bridge(rep: EvalReport) -> None:
             rep.add("bridge_delta_excludes_pre_dirty", "bridge",
                     delta == ["b.txt"],
                     f"delta={delta} (must not include a.txt)")
+
+            # 4–5. End-to-end gate: run_once must refuse on the dirty
+            # tree and leave the queued task untouched. Mock the queue
+            # and tool detection so the gate is the only thing under
+            # test; no real CLI is invoked, no real task mutated.
+            fake_task = {
+                "id":          "ctk_eval_gate",
+                "title":       "eval gate task",
+                "description": "",
+                "risk_level":  "low",
+                "status":      "queued",
+                "branch":      "dev-agent",
+                "priority":    1,
+            }
+            fake_tool = _cwb.ToolInfo(
+                name="claude", binary="/bin/false", version="fake",
+                noninteractive_ok=True, notes="eval-only fake tool",
+            )
+            mutations: list[tuple] = []
+            saved = {
+                "tool_fn":        _cwb.get_preferred_coding_tool,
+                "is_paused":      _cwb.is_paused,
+                "next_queued":    _ct.next_queued_task,
+                "update_task":    _ct.update_task,
+                "fail_task":      _ct.fail_task,
+                "finish_task":    _ct.finish_task,
+                "code_is_paused": _ct.is_paused,
+            }
+            _cwb.get_preferred_coding_tool = lambda: fake_tool
+            _cwb.is_paused                 = lambda: False
+            _ct.next_queued_task           = lambda: dict(fake_task)
+            _ct.is_paused                  = lambda: False
+            _ct.update_task = lambda *a, **k: (
+                mutations.append(("update", a, k)) or True)
+            _ct.fail_task   = lambda *a, **k: (
+                mutations.append(("fail",   a, k)) or True)
+            _ct.finish_task = lambda *a, **k: (
+                mutations.append(("finish", a, k)) or True)
+            try:
+                result = await _cwb.run_once(user="eval", allow_dirty=False)
+            finally:
+                _cwb.get_preferred_coding_tool = saved["tool_fn"]
+                _cwb.is_paused                 = saved["is_paused"]
+                _ct.next_queued_task           = saved["next_queued"]
+                _ct.update_task                = saved["update_task"]
+                _ct.fail_task                  = saved["fail_task"]
+                _ct.finish_task                = saved["finish_task"]
+                _ct.is_paused                  = saved["code_is_paused"]
+
+            rep.add("bridge_run_once_refuses_dirty", "bridge",
+                    result.get("status") == "dirty_tree",
+                    f"status={result.get('status')!r} "
+                    f"summary={(result.get('summary') or '')[:80]!r}")
+            rep.add("bridge_run_once_dirty_files_reported", "bridge",
+                    "a.txt" in (result.get("dirty_files_before") or []),
+                    f"dirty_files_before={result.get('dirty_files_before')}")
+            rep.add("bridge_run_once_no_state_change_on_refuse", "bridge",
+                    not mutations,
+                    f"mutations={[m[0] for m in mutations]}")
         finally:
-            _cwb.REPO = original
+            _cwb.REPO = original_repo
 
 
 def eval_files_safety(rep: EvalReport) -> None:
@@ -616,7 +680,7 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
     if category in (None, "files"):
         eval_files_safety(rep)
     if category in (None, "bridge"):
-        eval_bridge(rep)
+        await eval_bridge(rep)
     if category in (None, "tasks"):
         eval_code_tasks(rep)
     if category in (None, "prompt"):
