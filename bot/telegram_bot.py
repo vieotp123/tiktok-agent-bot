@@ -331,22 +331,23 @@ async def handle_router_status() -> str:
             return f"❌ 9Router unreachable: {d.get('reason', '?')}"
 
         role_models = d.get("role_models", {})
+        chat  = role_models.get("chat", d.get("chat_model", "?"))
         lines = [
             "✅ <b>9Router reachable</b>",
             f"Models available: {d.get('model_count', '?')}",
             "",
-            "<b>Active model policy:</b>",
-            f"  chat/fast     : <code>{role_models.get('chat', d.get('chat_model','?'))}</code>",
-            f"  tiktok_chat   : <code>{role_models.get('tiktok_chat','?')}</code>",
-            f"  telegram_chat : <code>{role_models.get('telegram_chat','?')}</code>",
-            f"  search_summary: <code>{role_models.get('search_summary','?')}</code>",
-            f"  reasoning     : <code>{role_models.get('reasoning','?')}</code>",
-            f"  coding        : <code>{role_models.get('coding','?')}</code>",
-            f"  critic        : <code>{role_models.get('critic','?')}</code>",
-            f"  cheap/fallback: <code>{role_models.get('cheap','openai/gpt-4o-mini')}</code>",
+            "<b>Active model policy (live-resolved):</b>",
+            f"  chat/fast       : <code>{chat}</code>",
+            f"  tiktok_chat     : <code>{role_models.get('tiktok_chat', '?')}</code>",
+            f"  telegram_chat   : <code>{role_models.get('telegram_chat', '?')}</code>",
+            f"  search_summary  : <code>{role_models.get('search_summary', '?')}</code>",
+            f"  reasoning       : <code>{role_models.get('reasoning', '?')}</code>",
+            f"  coding          : <code>{role_models.get('coding', '?')}</code>",
+            f"  critic          : <code>{role_models.get('critic', '?')}</code>",
+            f"  cheap/fallback  : <code>{role_models.get('cheap', 'openai/gpt-4o-mini')}</code>",
             "",
-            f"Test ({role_models.get('chat','?')}): "
-            f"{'✅ ' + d.get('test_reply','')[:40] if d.get('test_pass') else '❌ failed'}",
+            f"Test ({chat}): "
+            f"{'✅ ' + d.get('test_reply', '')[:40] if d.get('test_pass') else '❌ failed'}",
         ]
         return "\n".join(lines)
     except Exception as e:
@@ -354,15 +355,16 @@ async def handle_router_status() -> str:
 
 
 async def handle_model_policy() -> str:
-    """Show current resolved model for each role."""
+    """Show current live-resolved model for each role."""
     try:
-        from bot.llm_client import resolve_model, ROLE_MODEL_DEFAULT
-        lines = ["<b>Model Policy (resolved)</b>"]
+        from bot.llm_client import get_role_models, ROLE_MODEL_DEFAULT
+        role_models = await get_role_models()
+        lines = ["<b>Model Policy (live-resolved)</b>"]
         for role in ("chat", "fast", "tiktok_chat", "telegram_chat", "search_summary",
-                     "reasoning", "coding", "critic", "vision", "cheap"):
-            model = await resolve_model(role)
+                     "reasoning", "coding", "critic", "vision", "cheap", "fallback"):
+            model   = role_models.get(role, "?")
             default = ROLE_MODEL_DEFAULT.get(role, "?")
-            tag = "" if model == default else " ⚠️"
+            tag     = "" if model == default else " ⚠️"
             lines.append(f"  <b>{role}</b>: <code>{model}</code>{tag}")
         return "\n".join(lines)
     except Exception as e:
@@ -371,21 +373,35 @@ async def handle_model_policy() -> str:
 
 async def handle_models() -> str:
     try:
-        from bot.llm_client import list_models_top, resolve_model, ROLE_MODEL_DEFAULT
-        top = await list_models_top(20)
-        # Mark roles
-        role_map: dict[str, list[str]] = {}
-        for role in ROLE_MODEL_DEFAULT:
-            m = await resolve_model(role)
-            role_map.setdefault(m, []).append(role)
+        from bot.llm_client import (
+            get_role_models, list_models_relevant, ROLE_MODEL_DEFAULT,
+        )
+        role_models = await get_role_models()
+        groups      = await list_models_relevant()
 
-        lines = ["<b>Top models (9Router)</b>"]
-        for m in top:
-            tag = ""
-            if m in role_map:
-                tag = " <i>[" + ", ".join(role_map[m]) + "]</i>"
-            lines.append(f"  <code>{m}</code>{tag}")
-        lines.append(f"\n({len(top)} shown)")
+        # Active role assignments at the top
+        lines = ["<b>🎯 Active role assignments</b>"]
+        for role in ("chat", "tiktok_chat", "telegram_chat", "search_summary",
+                     "reasoning", "coding", "critic", "cheap"):
+            m = role_models.get(role, "?")
+            lines.append(f"  <b>{role}</b>: <code>{m}</code>")
+
+        # Relevant available models grouped
+        lines.append("")
+        lines.append("<b>📋 Available models (9Router)</b>")
+        group_labels = [
+            ("claude", "🧠 Claude/Sonnet/Opus"),
+            ("codex",  "💻 Codex"),
+            ("gpt5",   "⚡ GPT-5"),
+            ("reasoning", "🔭 Reasoning (o3/o4)"),
+            ("gpt4",   "📦 GPT-4"),
+        ]
+        for key, label in group_labels:
+            items = groups.get(key, [])
+            if items:
+                lines.append(f"<i>{label} ({len(items)})</i>")
+                for m in items[:6]:  # cap at 6 per group
+                    lines.append(f"  <code>{m}</code>")
         return "\n".join(lines)
     except Exception as e:
         return f"error: {e}"
