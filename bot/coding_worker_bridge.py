@@ -605,6 +605,46 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
                           f"manually with the saved prompt.")
         return out
 
+    # ── 2.4 Quota gate (Claude only) ─────────────────────────────────────
+    # Probe before running. If limited / auth_required / error, leave the
+    # task queued and surface the schedule. The task is NOT marked failed.
+    if tool.name == "claude":
+        try:
+            from bot import claude_quota as _cq
+            if _cq.should_probe_now():
+                _cq.probe_claude_available(force=False)
+            qstate = _cq.get_quota_state()
+        except Exception as e:
+            qstate = {"status": "unknown",
+                      "last_error_summary": f"quota probe error: {e}"}
+        st = qstate.get("status", "unknown")
+        if st == "limited":
+            nxt = qstate.get("reset_at") or qstate.get("next_probe_at") or "?"
+            out["status"]  = "quota_limited"
+            out["summary"] = (
+                f"⏸ Claude bị giới hạn — sẽ thử lại lúc {nxt}. "
+                f"Task <code>{nx['id']}</code> giữ nguyên trạng thái queued."
+            )
+            # Do NOT mark task failed — keep queued for retry.
+            log_action(user=user, action="code_worker_quota_limited",
+                       risk_level="low", status="ok",
+                       result_summary=f"task={nx['id']} retry_at={nxt}")
+            return out
+        if st == "auth_required":
+            out["status"]  = "auth_required"
+            out["summary"] = (
+                "🔒 Claude CLI yêu cầu đăng nhập lại. Chạy "
+                "<code>claude login</code> trên VPS rồi thử lại. "
+                f"Task <code>{nx['id']}</code> giữ queued."
+            )
+            log_action(user=user, action="code_worker_auth_required",
+                       risk_level="low", status="ok",
+                       result_summary=f"task={nx['id']}")
+            return out
+        # status="unknown"/"error" → proceed (probe may have failed for
+        # transient reasons; let the actual run reveal the issue and
+        # parse_claude_error will catch it post-hoc).
+
     # ── 2.5 Dirty-tree gate ──────────────────────────────────────────────
     # If the working tree is already dirty, refuse to run by default.
     # Otherwise the bridge would sweep unrelated in-flight edits into
@@ -724,6 +764,53 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
 
     # ── 6. Post-run checks ───────────────────────────────────────────────
     if rc != 0:
+        # Was it a quota / auth issue? Parse the captured log so the
+        # task is paused (queued for retry) instead of marked failed.
+        log_tail = ""
+        try:
+            log_tail = log_path.read_text(encoding="utf-8",
+                                           errors="replace")[-4000:]
+        except Exception:
+            pass
+        if tool.name == "claude" and log_tail:
+            try:
+                from bot import claude_quota as _cq
+                parsed = _cq.parse_claude_error(log_tail)
+            except Exception:
+                parsed = {"kind": "ok"}
+            if parsed["kind"] == "limited":
+                _cq.mark_limited(reset_at=parsed["reset_at"],
+                                 retry_after_seconds=parsed["retry_after_seconds"],
+                                 note=parsed["summary"])
+                # Re-queue the task — flip back to status='queued'.
+                from bot.code_tasks import update_task as _ct_update
+                _ct_update(nx["id"], status="queued")
+                out["status"]  = "quota_limited"
+                out["summary"] = (
+                    f"⏸ Claude bị giới hạn giữa task. "
+                    f"Đã re-queue <code>{nx['id']}</code>. "
+                    f"Sẽ thử lại lúc "
+                    f"{parsed.get('reset_at') or 'theo lịch backoff'}."
+                )
+                code_state = _cq.get_quota_state()
+                out["claude_state"] = code_state.get("status")
+                out["next_probe_at"] = code_state.get("next_probe_at")
+                log_action(user=user,
+                           action="code_worker_paused_quota_midrun",
+                           risk_level="low", status="ok",
+                           result_summary=f"task={nx['id']}")
+                return out
+            if parsed["kind"] == "auth_required":
+                _cq.mark_auth_required(note=parsed["summary"])
+                from bot.code_tasks import update_task as _ct_update
+                _ct_update(nx["id"], status="queued")
+                out["status"]  = "auth_required"
+                out["summary"] = (
+                    "🔒 Claude yêu cầu đăng nhập lại giữa task. "
+                    f"Đã re-queue <code>{nx['id']}</code>. Chạy "
+                    "<code>claude login</code> trên VPS."
+                )
+                return out
         out["status"]  = "worker_failed"
         out["summary"] = (f"{tool.name} exited rc={rc} after {duration}s. "
                           f"Log: {log_path.name}")

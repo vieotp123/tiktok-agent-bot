@@ -1611,6 +1611,15 @@ async def handle_agent_autonomy_status() -> str:
     return "\n".join(parts)
 
 
+async def handle_claude_probe() -> str:
+    """Force a fresh Claude probe and return the rich Vietnamese status."""
+    try:
+        _cq.probe_claude_available(force=True)
+    except Exception as e:
+        return f"❌ Probe lỗi: <code>{_esc(str(e))[:200]}</code>"
+    return _cq.format_claude_status_vi()
+
+
 def handle_claude_quota_reset(arg: str) -> str:
     if not arg.strip():
         return ("Usage: /claude_quota_reset &lt;YYYY-MM-DD HH:MM&gt; "
@@ -2440,7 +2449,8 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
         code_resume(); _cwb.resume()
         return "▶ Code worker + bridge resumed."
     # ── Claude quota scheduler ────────────────────────────────────────────
-    if cmd == "/claude_status":        return _cq.status_summary()
+    if cmd == "/claude_status":        return _cq.format_claude_status_vi()
+    if cmd == "/claude_probe":         return await handle_claude_probe()
     if cmd == "/claude_quota_reset":   return handle_claude_quota_reset(arg)
     if cmd == "/claude_quota_in":      return handle_claude_quota_in(arg)
     if cmd == "/claude_limited":       _cq.set_limited(True);  return _cq.status_summary()
@@ -2640,7 +2650,13 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         return "\n".join(replies)
 
     if name == "quota_status":
-        return _cq.status_summary()
+        # Force a fresh probe so the answer reflects reality, not stale state.
+        try:
+            if _cq.should_probe_now():
+                _cq.probe_claude_available(force=False)
+        except Exception:
+            pass
+        return _cq.format_claude_status_vi()
 
     # ── Permission grant / revoke ────────────────────────────────────────
     if name == "grant_permission":

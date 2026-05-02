@@ -139,8 +139,9 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 /code_worker_status           # CLI detection + queue + recent logs
 /code_worker_pause /code_worker_resume
 
-# Claude quota scheduler
-/claude_status
+# Claude quota scheduler (probe + retry)
+/claude_status            # rich VN panel: model, status, reset_at, autorun
+/claude_probe             # run one fresh probe right now (~30s)
 /claude_quota_reset <YYYY-MM-DD HH:MM>     # UTC
 /claude_quota_in <30m|2h30m>
 /claude_limited /claude_available

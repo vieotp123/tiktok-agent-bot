@@ -272,6 +272,9 @@ _PATTERNS_QUOTA_STATUS = (
     _RE(r"\bclaude\s+(còn|sao\s*rồi|thế\s*nào)", re.I),
     _RE(r"\bquota\s+claude\b", re.I),
     _RE(r"\b/?claude_status\b", re.I),
+    _RE(r"\b(kiểm\s*tra|check|test|probe)\s+(quota|claude)\b", re.I),
+    _RE(r"\b/?claude_probe\b", re.I),
+    _RE(r"\bclaude\s+(còn|đang)\s+(work|chạy\s+được|available)", re.I),
 )
 
 _PATTERNS_GRANT_PERM = (

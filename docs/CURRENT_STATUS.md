@@ -8,6 +8,51 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 > `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
 > contract this task exercised.
 
+## Claude Quota Probe + Retry v1
+
+- **`bot/claude_quota.py`** extended with v2 honest-tracking schema.
+  No fake quota %. State enums: `unknown / available / limited /
+  auth_required / error`.
+- **`probe_claude_available(force=False)`** — runs a one-shot
+  `claude --print "Reply only: CLAUDE_PROBE_OK"` (≤60s, output
+  redacted). Success cached 5 min. Limited / auth state honors the
+  stored `next_probe_at` so we never spam Claude.
+- **`parse_claude_error(text)`** — broad regex over CLI stderr/stdout
+  detecting limit / auth / rate-limit phrasing. Extracts:
+  - `reset_at` if "resets at YYYY-MM-DD HH:MM UTC" appears
+  - `retry_after_seconds` from "retry-after: 90" /
+    "try again in 2h 30m" / "in 5 minutes"
+  9/9 parser cases pass.
+- **`mark_limited(reset_at|retry_after_seconds|None)`** — when no
+  exact reset is known, exponential backoff
+  `30 → 60 → 120 → 240 min` (cap 4h) per `probe_count`.
+- **`mark_auth_required` / `mark_error` / `mark_available`** — each
+  records `last_probe_at`, `last_success_at`, `last_limited_at`,
+  `last_error_summary`. `last_notified_key` dedupes admin notifications.
+- **`format_claude_status_vi()`** — Vietnamese status panel with
+  model / status / probe times / reset_at / autorun / queue size.
+- **Bridge integration** (`coding_worker_bridge.run_once`):
+  - Pre-run quota gate: if `status="limited"` or `auth_required`,
+    task is **kept queued** (not failed) and a Vietnamese reply
+    surfaces the retry schedule.
+  - Post-run failure parser: if `claude` exited non-zero AND the log
+    matches a limit/auth pattern, task is re-queued via
+    `update_task(status='queued')` and quota state updated.
+- **Scheduler** (`_on_due` in `claude_quota.py`): when `reset_at`
+  arrives, **probe first**, then run `bridge.run_batch(max_tasks)`
+  only if available. If still limited, schedule next backoff.
+- **Telegram**:
+  - `/claude_status` now uses the rich VN formatter.
+  - `/claude_probe` forces a fresh probe.
+  - NL: "kiểm tra quota claude" / "probe claude" / "claude còn
+    available không" → `quota_status` (auto-probes if cache stale).
+
+### Honest limitation
+
+The Claude Code CLI does **not** expose remaining-quota %. The brain
+tracks availability, parses errors, schedules retries, and pauses
+tasks — it cannot show "X% remaining" because the upstream doesn't.
+
 ## Vietnamese Natural Language v1 changes
 
 - **`bot/agent/nl_router.classify(text)`** — deterministic Vietnamese
