@@ -2175,7 +2175,8 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
                 preferred_message_id=msg_id,
             )
             return
-        # Any other confirm:<id> → treat as pending-action confirm.
+        # Any other confirm:<id> → treat as pending-action confirm
+        # AND execute the stored after_confirm payload.
         from bot.agent.permissions import confirm_pending, get_pending
         action_id = val
         rec = get_pending(action_id)
@@ -2186,15 +2187,26 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
                 "hoặc đã hết hạn.",
             )
             return
+        if rec.get("status") != "pending":
+            await send_chat_reply(
+                chat_id,
+                f"⚠️ Hành động <code>{action_id}</code> đã ở trạng thái "
+                f"<b>{rec.get('status')}</b>, không thể duyệt lại.",
+            )
+            return
         confirm_pending(action_id)
         log_action(user="tg_admin", action="nl_confirm_action",
                    risk_level="high", status="confirmed",
                    result_summary=f"action_id={action_id}")
-        await send_chat_reply(
-            chat_id,
-            f"✅ Đã duyệt <code>{action_id}</code> "
-            f"({rec.get('action','?')}). Sẽ thực thi nếu đủ điều kiện.",
-        )
+        try:
+            msg = await _execute_after_confirm(rec, chat_id)
+        except Exception as e:
+            import traceback as _tb
+            log(f"error handler=execute_after_confirm pid={action_id} "
+                f"message={e}\n{_tb.format_exc()[:300]}")
+            msg = (f"❌ Đã duyệt <code>{action_id}</code> nhưng thực thi "
+                   f"lỗi: <code>{_esc(str(e))[:200]}</code>")
+        await send_chat_reply(chat_id, msg)
         return
 
     if kind == "cancel":
@@ -2551,12 +2563,22 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     if name == "create_code_task":
         desc = (intent.args.get("description") or raw_text)[:1000]
         if intent.requires_confirm:
+            # High-risk → ask confirm. Carry the full execution payload so
+            # _execute_after_confirm can enqueue the task once approved.
             return await _ask_confirm_action(
                 chat_id,
                 action="create_code_task_high_risk",
                 goal=desc,
-                pretty=(f"Tạo task code có yếu tố rủi ro cao "
-                        f"(.env / storage / public). Cho phép?"),
+                pretty=("Task có yếu tố rủi ro cao "
+                        "(.env / storage_state / public action). "
+                        "Cho phép tạo code task không?"),
+                payload={
+                    "create_code_task": True,
+                    "description":      desc,
+                    "risk_level":       intent.risk_level or "high",
+                    "priority":         5,
+                    "auto_run":         False,
+                },
             )
         title = desc.split("\n", 1)[0][:80] or "Coding task"
         tid = code_add_task(title=title, description=desc,
@@ -2710,13 +2732,29 @@ def _vi_format_run_result(r: dict) -> str:
 
 # ── Vietnamese inline-confirm helper ──────────────────────────────────────────
 
+# Sentinel: paths that have already sent the final reply to the user
+# return this string. bot_loop checks for it and skips the duplicate
+# send_chat_reply / "empty reply fallback".
+_REPLY_HANDLED = "\x00__REPLY_HANDLED__\x00"
+
+
 async def _ask_confirm_action(chat_id, *, action: str, goal: str,
-                                pretty: str) -> str:
-    """Create a pending_action and send Yes/No buttons in Vietnamese."""
+                                pretty: str,
+                                payload: Optional[dict] = None) -> str:
+    """Create a pending_action and send Yes/No buttons in Vietnamese.
+
+    `payload` is stored under metadata["after_confirm"] and read back by
+    `_execute_after_confirm` when the admin taps ✅ Đồng ý / sends "đồng ý".
+    Without a payload, confirm only marks the action approved — no side
+    effect.
+    """
     from bot.agent.permissions import create_pending
-    pid = create_pending(action=action, goal=goal[:300],
+    metadata: dict = {"source": "nl_router"}
+    if payload:
+        metadata["after_confirm"] = payload
+    pid = create_pending(action=action, goal=goal[:1000],
                           risk_level="high", user="tg_admin",
-                          metadata={"source": "nl_router"})
+                          metadata=metadata)
     kb = make_keyboard([
         [("✅ Đồng ý", f"confirm:{pid}"),
          ("❌ Hủy",     f"cancel:{pid}")],
@@ -2724,13 +2762,84 @@ async def _ask_confirm_action(chat_id, *, action: str, goal: str,
     text_html = (f"⚠️ <b>Hành động rủi ro cao</b>\n"
                  f"{_esc(pretty)}\n\n"
                  f"id: <code>{pid}</code>")
-    # Use raw send (it's a separate chat message with keyboard)
-    await send(chat_id, text_html, kb)
-    return ""  # already sent — caller's send_chat_reply would duplicate
+    await send_chat_reply(chat_id, text_html, kb)
+    return _REPLY_HANDLED   # signal: do NOT send a duplicate / fallback
+
+
+# ── Execute payload after a pending_action is approved ──────────────────────
+
+async def _execute_after_confirm(rec: dict, chat_id) -> str:
+    """Run the side-effect of an approved pending_action.
+
+    Returns a Vietnamese reply describing what happened. Always returns
+    a non-empty message — never silently empty.
+    """
+    action  = rec.get("action", "")
+    payload = (rec.get("metadata") or {}).get("after_confirm") or {}
+
+    # ── create_code_task_high_risk → enqueue the actual code_task ────────
+    if action == "create_code_task_high_risk" or payload.get("create_code_task"):
+        desc      = payload.get("description") or rec.get("goal") or ""
+        if not desc:
+            return ("✅ Đã duyệt nhưng pending_action không có description "
+                    "để tạo code_task. Hãy gửi lại task.")
+        risk      = payload.get("risk_level") or rec.get("risk_level") or "high"
+        priority  = int(payload.get("priority") or 5)
+        title     = (desc.split("\n", 1)[0] or "Coding task")[:80]
+        try:
+            tid = code_add_task(
+                title=title, description=desc,
+                risk_level=risk, priority=priority,
+                created_by="tg_admin_confirmed",
+            )
+        except Exception as e:
+            return (f"❌ Đã duyệt <code>{rec['action_id']}</code> nhưng "
+                    f"tạo code_task lỗi: <code>{_esc(str(e))[:200]}</code>")
+        # Build prompt best-effort
+        try:
+            from bot.agent.prompt_builder import (build_coding_prompt,
+                                                    save_prompt_for_task)
+            t = code_get_task(tid)
+            if t:
+                save_prompt_for_task(tid, build_coding_prompt(t))
+        except Exception as e:
+            log(f"after_confirm prompt build warning: {e}")
+        log_action(user="tg_admin",
+                   action="confirm_create_code_task_high_risk",
+                   risk_level="high", status="ok",
+                   result_summary=f"task={tid} risk={risk}")
+        msg = (f"✅ Đã duyệt <code>{rec['action_id']}</code>.\n"
+               f"📦 Đã tạo code task <code>{tid}</code> "
+               f"(risk={risk}, priority={priority}).\n"
+               f"<b>{_esc(title)}</b>\n\n"
+               f"Gõ <i>“làm tiếp task code tiếp theo”</i> để chạy worker, "
+               f"hoặc <code>/code_worker_run_once</code>.")
+        if payload.get("auto_run"):
+            msg += ("\n\n<i>auto_run đã bật, nhưng task high-risk vẫn cần "
+                    "xác nhận thêm trước khi worker chạy.</i>")
+        return msg
+
+    # ── grant_permission with payload ────────────────────────────────────
+    if action == "grant_permission" and payload.get("scope"):
+        try:
+            from bot.agent.sessions import grant_session
+            mins = int(payload.get("minutes") or 30)
+            grant_session(payload["scope"], mins, user="tg_admin")
+            return (f"✅ Đã duyệt <code>{rec['action_id']}</code>.\n"
+                    f"Cấp quyền <b>{_esc(payload['scope'])}</b> trong "
+                    f"<b>{mins}</b> phút.")
+        except Exception as e:
+            return (f"❌ Đã duyệt nhưng cấp session lỗi: "
+                    f"<code>{_esc(str(e))[:200]}</code>")
+
+    # ── Generic / no payload: just acknowledge ───────────────────────────
+    return (f"✅ Đã duyệt <code>{rec['action_id']}</code> "
+            f"({_esc(action)}). "
+            f"<i>Không có payload tự động — thực thi thủ công nếu cần.</i>")
 
 
 async def _confirm_latest_pending(chat_id) -> str:
-    from bot.agent.permissions import list_pending, confirm_pending
+    from bot.agent.permissions import list_pending, confirm_pending, get_pending
     items = list_pending(only_pending=True)
     if not items:
         return "(Không có hành động nào đang chờ xác nhận.)"
@@ -2739,12 +2848,14 @@ async def _confirm_latest_pending(chat_id) -> str:
         return ("Có nhiều hành động đang chờ:\n" + ids +
                 "\nGõ <code>/confirm_action &lt;id&gt;</code> cho từng cái.")
     p = items[0]
+    # Read fresh record (with metadata.after_confirm) before flipping state
+    rec = get_pending(p["action_id"]) or p
     confirm_pending(p["action_id"])
     log_action(user="tg_admin", action="nl_confirm_action",
                risk_level="high", status="confirmed",
                result_summary=f"action_id={p['action_id']}")
-    return (f"✅ Đã duyệt hành động <code>{p['action_id']}</code> "
-            f"({p['action']}). Tự động thực thi nếu đủ điều kiện.")
+    # Execute the stored payload (e.g. enqueue the code_task)
+    return await _execute_after_confirm(rec, chat_id)
 
 
 async def _cancel_latest_pending(chat_id) -> str:
@@ -2945,7 +3056,12 @@ async def bot_loop() -> None:
                 # Plain text + most command results → NEW chat message.
                 # Menu commands (/menu /start /help /cancel) handle their
                 # own panel rendering inside dispatch and return "".
-                if reply:
+                # Confirm/cancel button paths return _REPLY_HANDLED — the
+                # handler already sent the final message; do not duplicate
+                # or fall back.
+                if reply == _REPLY_HANDLED:
+                    log(f"reply=handled (no extra send) chat_id={chat_id}")
+                elif reply:
                     await send_chat_reply(chat_id, reply)
                     log_action(
                         user="tg_admin",
