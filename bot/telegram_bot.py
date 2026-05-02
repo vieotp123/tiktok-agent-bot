@@ -1555,34 +1555,104 @@ def handle_code_task_add(spec: str) -> str:
             f"<i>Worker picks up next pass; high-risk waits for confirm.</i>")
 
 
-async def handle_code_run_once() -> str:
+async def _bridge_run_in_background(chat_id: str | int, n: int = 1,
+                                       formatter=None) -> None:
+    """Run bridge.run_once / run_batch as an asyncio background task and
+    send the result to the admin via send_chat_reply when done. The
+    polling loop keeps running while this task is in progress, so the
+    admin can keep chatting and the bot replies immediately to new
+    messages instead of going silent for 1-3 minutes per Claude run.
+    """
+    try:
+        if n <= 1:
+            res = await _cwb.run_once(user="tg_admin")
+            text = (formatter or _cwb.format_run_result)(res)
+            await send_chat_reply(chat_id, text)
+        else:
+            results = await _cwb.run_batch(n, user="tg_admin")
+            if not results:
+                await send_chat_reply(chat_id, "💤 No tasks to run.")
+                return
+            parts = [f"<b>🛠 Batch result ({len(results)})</b>"]
+            for r in results:
+                parts.append((formatter or _cwb.format_run_result)(r))
+                parts.append("---")
+            await send_chat_reply(
+                chat_id,
+                "\n\n".join(parts).rstrip("---\n").rstrip(),
+            )
+    except Exception as e:
+        import traceback as _tb
+        log(f"bridge bg error: {e}\n{_tb.format_exc()[:300]}")
+        try:
+            await send_chat_reply(
+                chat_id,
+                f"⚠️ Agent lỗi khi chạy bridge: <code>{_esc(str(e))[:200]}</code>",
+            )
+        except Exception:
+            pass
+
+
+async def handle_code_run_once(chat_id: str | int = None) -> str:
     """Drive ONE queued code_task end-to-end through the bridge.
 
-    The bridge picks up the next queued task, runs Claude/Codex
-    non-interactively if available, runs smoke + evals, commits and
-    pushes ONLY on green tests. If the local CLI is missing or
-    interactive-only, the bridge returns a clear setup message and
-    leaves the task untouched.
+    Non-blocking: sends an immediate ack, spawns the bridge run as a
+    background asyncio task, and returns _REPLY_HANDLED so the polling
+    loop can keep processing new messages during the (often 1-3 min)
+    Claude/Codex run.
     """
-    result = await _cwb.run_once(user="tg_admin")
-    return _cwb.format_run_result(result)
+    if chat_id is None:
+        # Backward compat — sync path. Kept for callers that still want
+        # the blocking semantics; the long-running case below is the
+        # default for Telegram dispatch.
+        result = await _cwb.run_once(user="tg_admin")
+        return _cwb.format_run_result(result)
+
+    # Pre-check: surface what's about to run so admin sees an immediate
+    # acknowledgment before Claude starts grinding.
+    try:
+        nx = code_next_task()
+        if nx:
+            preview = (f"🛠 Bridge bắt đầu chạy task "
+                       f"<code>{_esc(str(nx['id']))}</code>:\n"
+                       f"<i>{_esc((nx.get('title') or '')[:80])}</i>\n\n"
+                       f"Em sẽ báo khi xong (1-3 phút). Trong lúc đó "
+                       f"bro vẫn chat được — bot không bị block nữa.")
+        else:
+            preview = ("💤 Không có task nào queued. Tạo task trước "
+                       "(<i>“tạo task code …”</i>) rồi chạy lại.")
+    except Exception:
+        preview = ("🛠 Bridge bắt đầu… em báo khi xong.")
+    await send_chat_reply(chat_id, preview)
+    asyncio.create_task(_bridge_run_in_background(chat_id, n=1))
+    return _REPLY_HANDLED
 
 
-async def handle_code_run_batch(arg: str) -> str:
-    """/code_worker_run_batch <n>  (n=1..3)"""
+async def handle_code_run_batch(arg: str, chat_id: str | int = None) -> str:
+    """/code_worker_run_batch <n>  (n=1..3) — non-blocking variant."""
     arg = (arg or "").strip()
     try:
         n = int(arg) if arg else 1
     except ValueError:
         return "Usage: /code_worker_run_batch &lt;n&gt;  (1..3)"
-    results = await _cwb.run_batch(n, user="tg_admin")
-    if not results:
-        return "💤 No tasks to run."
-    parts = [f"<b>🛠 Batch result ({len(results)})</b>"]
-    for r in results:
-        parts.append(_cwb.format_run_result(r))
-        parts.append("---")
-    return "\n\n".join(parts).rstrip("---\n").rstrip()
+    n = max(1, min(n, 3))
+    if chat_id is None:
+        # Backward-compat sync path
+        results = await _cwb.run_batch(n, user="tg_admin")
+        if not results:
+            return "💤 No tasks to run."
+        parts = [f"<b>🛠 Batch result ({len(results)})</b>"]
+        for r in results:
+            parts.append(_cwb.format_run_result(r))
+            parts.append("---")
+        return "\n\n".join(parts).rstrip("---\n").rstrip()
+
+    await send_chat_reply(
+        chat_id,
+        f"🛠 Bridge bắt đầu batch <b>{n}</b> task. Em báo khi xong.",
+    )
+    asyncio.create_task(_bridge_run_in_background(chat_id, n=n))
+    return _REPLY_HANDLED
 
 
 def handle_code_worker_status() -> str:
@@ -3581,8 +3651,8 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
         return f"🚫 Code task <code>{arg.strip()}</code> cancelled." if ok \
                else f"❌ Code task <code>{arg.strip()}</code> not found."
     if cmd == "/code_status":      return code_format_status()
-    if cmd == "/code_worker_run_once": return await handle_code_run_once()
-    if cmd == "/code_worker_run_batch": return await handle_code_run_batch(arg)
+    if cmd == "/code_worker_run_once": return await handle_code_run_once(chat_id)
+    if cmd == "/code_worker_run_batch": return await handle_code_run_batch(arg, chat_id)
     if cmd == "/code_worker_status":   return handle_code_worker_status()
     if cmd == "/code_worker_pause":
         code_pause(); _cwb.pause()
@@ -3712,30 +3782,42 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     """
     name = intent.name
 
-    # ── Run / batch via the bridge ────────────────────────────────────────
+    # ── Run / batch via the bridge — NON-BLOCKING ─────────────────────────
+    # Bridge runs (Claude CLI 1-3 min) used to block the dispatch loop and
+    # silence the bot. Now we ack immediately and run in background so
+    # the polling loop continues to handle new admin messages.
     if name == "run_next_code_task":
-        # Surface immediate ack, let bridge do the heavy work.
-        await send_chat_reply(
-            chat_id,
-            "🛠 Đã nhận lệnh. Đang gọi bridge để chạy task code tiếp theo…",
+        try:
+            nx = code_next_task()
+            if nx:
+                ack = (f"🛠 Đã nhận lệnh. Bridge bắt đầu chạy task "
+                       f"<code>{_esc(str(nx['id']))}</code>:\n"
+                       f"<i>{_esc((nx.get('title') or '')[:80])}</i>\n\n"
+                       f"Em báo khi xong. Trong lúc đó bro cứ chat — "
+                       f"bot không bị block.")
+            else:
+                ack = "💤 Không có task nào queued."
+        except Exception:
+            ack = "🛠 Bridge bắt đầu… em báo khi xong."
+        await send_chat_reply(chat_id, ack)
+        asyncio.create_task(
+            _bridge_run_in_background(chat_id, n=1,
+                                       formatter=_vi_format_run_result),
         )
-        result = await _cwb.run_once(user="tg_admin")
-        return _vi_format_run_result(result)
+        return _REPLY_HANDLED
 
     if name == "run_code_batch":
         n = int(intent.args.get("n") or 1)
         await send_chat_reply(
             chat_id,
-            f"🛠 Bắt đầu batch {n} task code…",
+            f"🛠 Bridge bắt đầu batch <b>{n}</b> task code. "
+            f"Em báo khi xong.",
         )
-        results = await _cwb.run_batch(n, user="tg_admin")
-        if not results:
-            return "💤 Không có task nào để chạy."
-        parts = [f"<b>Kết quả batch ({len(results)})</b>"]
-        for r in results:
-            parts.append(_vi_format_run_result(r))
-            parts.append("———")
-        return "\n\n".join(parts).rstrip("———\n").rstrip()
+        asyncio.create_task(
+            _bridge_run_in_background(chat_id, n=n,
+                                       formatter=_vi_format_run_result),
+        )
+        return _REPLY_HANDLED
 
     # ── Create code task from a Vietnamese description ────────────────────
     if name == "create_code_task":
