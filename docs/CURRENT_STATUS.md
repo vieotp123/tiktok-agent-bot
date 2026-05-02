@@ -8,6 +8,86 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 > `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
 > contract this task exercised.
 
+## Owner Tooling Doctrine + Remote Workers v1
+
+### Doctrine — never refuse a request generically
+
+When the admin asks for a capability, the agent does NOT respond with
+"không có quyền". Instead:
+
+1. **Tool already exists** → use it safely (low/medium auto-runs;
+   high-risk asks ✅ Đồng ý / ❌ Hủy).
+2. **Tool missing** → queue a `code_task` to build it. Reply in
+   Vietnamese: *"🛠 Tool này chưa có, em sẽ tạo task để tích hợp."*
+3. **Hard safety violation** → explain the exact rule (e.g. "lệnh
+   này nằm trong BLOCKED list, không có confirm nào bypass được") +
+   offer a safe alternative.
+
+NL intents: `build_missing_tool`, `remote_worker_list`,
+`remote_worker_health`, `ssh_exec`. Implemented in
+`bot/agent/nl_router.classify` (deterministic, no LLM).
+
+### `bot/remote_workers.py` (new) — remote worker foundation
+
+- **Storage**: `data/remote_workers.json` (gitignored).
+  `keys/` directory (gitignored) for SSH private keys.
+- **Schema**: id / host / port / username / auth_type=key /
+  key_path / tags / enabled / created_at / notes. **Password auth is
+  not supported.**
+- **add_worker** validates worker_id charset, host, port, username, AND
+  key path (must live under `/opt/tiktok-bot/keys`, must be `chmod 600`).
+- **SSH executor** uses the system `ssh` binary with strict flags:
+  `BatchMode=yes`, `PasswordAuthentication=no`,
+  `StrictHostKeyChecking=accept-new`, custom `known_hosts` under
+  `keys/`, ConnectTimeout=30s.
+- **Output redaction** scrubs `GITHUB_TOKEN` / `Bearer` / `ghp_*` /
+  `sk-*` / `BEGIN OPENSSH PRIVATE KEY` / `password=` lines BEFORE
+  saving or sending. Hard 64 KB output cap.
+
+### SSH command risk classifier
+
+| Risk     | Examples                                                              | Behaviour                                |
+|----------|------------------------------------------------------------------------|------------------------------------------|
+| 🛑 blocked  | `mkfs`, `dd if=`, `curl … \| bash`, `cat .env`, `cat ~/.ssh/*key`, `ufw disable`, `iptables -F`, `scp`/`rsync` exfil | Refused even with admin confirm. |
+| 🔴 high     | `apt install/remove`, `pip install`, `reboot`, `shutdown`, `useradd`, `passwd`, `visudo`, `firewalld`, `rm -rf`, `chmod 777`, `chown` to `/`, redirect to `/etc/`, `drop table`, unknown command | Inline ✅ Đồng ý / ❌ Hủy mandatory.   |
+| 🟡 medium   | `systemctl restart/start/stop`, `docker restart`, `git pull/fetch`, `mkdir`, `apt update`, `tail -f` | Session grant or per-command confirm.  |
+| 🟢 low      | `uptime`, `whoami`, `df -h`, `free -m`, `ls`, `journalctl`, `docker ps`, `git status` | Auto-runs with audit log.               |
+
+29/29 risk-classifier cases pass.
+
+### Telegram commands
+
+| Command                                                    | Purpose                              |
+|------------------------------------------------------------|--------------------------------------|
+| `/workers_remote`                                           | List registered workers              |
+| `/worker_add <id> <host> <user> <key_path> [port] [tags]`  | Register a new worker                |
+| `/worker_info <id>`                                         | Show worker config                   |
+| `/worker_test <id>` (alias `/worker_health`)                | Run `uptime` over SSH                |
+| `/ssh_exec <id> <cmd>`                                     | Run any command (risk-gated)         |
+
+NL examples (all classify correctly):
+- "thêm tool ssh vào backend" → tool exists, points at `/workers_remote`.
+- "thêm tool OCR vào agent" → builds a code_task.
+- "vậy m cài tool kết nối đi" → builds a code_task.
+- "kiểm tra worker2" / "vps3 sao rồi" → `/worker_test`.
+- "ssh worker2 uptime" / "xem dung lượng vps2" → `/ssh_exec`.
+
+### What info you'll need to add the first VPS worker
+
+```
+/worker_add <worker_id> <host> <username> <key_path> [port] [tags]
+```
+
+- **worker_id**: `worker2` / `vps_ocr_1` etc. (alphanumeric, _, -)
+- **host**: IP or DNS (no spaces, ≤253 chars)
+- **username**: SSH user (e.g. `ubuntu`, `root`)
+- **key_path**: absolute path under `/opt/tiktok-bot/keys/` —
+  copy/move the private key there first, then `chmod 600`
+- **port**: optional, default 22
+- **tags**: optional comma-separated list (e.g. `ocr,vision`)
+
+The bot ALWAYS uses key auth; never asks for / stores a password.
+
 ## Brain Evolution Loop v1
 
 - **`bot/agent/brain_evolve.py`** — controlled continuous self-improve.

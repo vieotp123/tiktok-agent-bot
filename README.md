@@ -154,6 +154,16 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 /code_task_from_file <id> <description>
 /run_task_with_file <id> <goal>
 
+# Remote workers (SSH)
+/workers_remote                                    # list registered workers
+/worker_add <id> <host> <user> <key_path> [port]   # register worker (key-only)
+/worker_info <id>
+/worker_test <id>                                  # uptime probe
+/ssh_exec <id> <command>                           # risk-gated; high → confirm
+#   NL: "kiểm tra worker2", "vps3 sao rồi",
+#       "ssh worker2 uptime", "xem dung lượng vps2",
+#       "thêm tool ssh vào backend", "cài tool kết nối đi"
+
 # Brain Evolution Loop
 /brain_evolve_start [n]   # n in 1..3 — continuous self-improve
 /brain_evolve_stop        # stop loop

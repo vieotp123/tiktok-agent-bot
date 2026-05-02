@@ -373,6 +373,43 @@ _PATTERNS_SHOW_FILES = (
     _RE(r"\bfile\s+(gần\s*đây|recent|mới\s+nhất)\b", re.I),
 )
 
+# Owner-tooling doctrine: when admin asks for a capability we don't
+# have, classify as build_missing_tool → create a code_task to build it
+# instead of refusing. Patterns favour explicit "build a tool" phrasing.
+_PATTERNS_BUILD_TOOL = (
+    _RE(r"\b(thêm|tạo|cài|build|add|integrate)\s+(tool|công\s*cụ)\b", re.I),
+    _RE(r"\b(thêm|tạo|cài|add|build)\s+(tool\s+)?(ssh|ocr|browser|"
+        r"playwright|seo|scraper|crawler|vision|image[\s_]gen)\b", re.I),
+    _RE(r"\b(tích\s*hợp|integrate)\s+(tool|công\s*cụ|module|skill)\b", re.I),
+    _RE(r"\bvậy\s+m\s+cài\s+tool\b", re.I),
+    _RE(r"\bm\s+cài\s+tool\b", re.I),
+    _RE(r"\btạo\s+task\s+làm\s+tool\b", re.I),
+    _RE(r"\bcài\s+tool\s+kết\s+nối\b", re.I),
+    # "cho agent kết nối VPS khác" / "kết nối worker mới"
+    _RE(r"\bkết\s+nối\s+(vps|worker|server|máy)\s+(khác|mới|thêm)", re.I),
+    _RE(r"\b(thêm|onboard|add)\s+(vps|worker|server|máy)\s+(mới|thêm)", re.I),
+)
+
+# Remote-worker / SSH control intents.
+_PATTERNS_REMOTE_WORKER_LIST = (
+    _RE(r"\bxem\s+(remote\s+)?worker", re.I),
+    _RE(r"\b(liệt\s*kê|list)\s+(remote\s+)?worker", re.I),
+    _RE(r"\b/?workers_remote\b", re.I),
+)
+_PATTERNS_REMOTE_WORKER_HEALTH = (
+    _RE(r"\b(kiểm\s*tra|check|test|health)\s+(remote\s+)?(vps|worker|server)\s*(\w+)?", re.I),
+    _RE(r"\b(vps|worker|server)\s*(\w+)?\s+(còn\s+sống\s+không|alive|"
+        r"đang\s+sống\s+không|sao\s*rồi)", re.I),
+    _RE(r"\b/?worker_(test|health)\b", re.I),
+)
+_PATTERNS_SSH_EXEC = (
+    _RE(r"\bssh\s+(\w+)\s+(.+)$", re.I),
+    _RE(r"\bchạy\s+lệnh\s+trên\s+(vps|worker)\s*(\w+)?\s*[:\-]?\s*(.+)$", re.I),
+    _RE(r"\b/?ssh_exec\b", re.I),
+    _RE(r"\bxem\s+(dung\s*lượng|disk|df)\s+(?:trên|của)?\s*(vps|worker)\s*(\w+)", re.I),
+    _RE(r"\b(restart|khởi\s*động\s*lại)\s+(bot|service)\s+(?:trên|bên)?\s*(vps|worker)\s*(\w+)", re.I),
+)
+
 _PATTERNS_HIGH_RISK = (
     _RE(r"(?:^|\s|/)\.env\b"),       # match `.env` even after whitespace
     _RE(r"\bstorage[_\s]?state\b", re.I),
@@ -474,6 +511,66 @@ def classify(text: str) -> Intent:
                       "Tạo task code mới và queue cho worker.",
                       {"description": t}, risk,
                       requires_confirm=high_risk)
+
+    # ── Owner-tooling doctrine (BEFORE ssh_exec; "thêm tool ssh" must
+    #    create a build task, not be parsed as `ssh <something>`) ───────
+    if _has_any(t, _PATTERNS_BUILD_TOOL):
+        return Intent("build_missing_tool", 0.9,
+                      "Tạo code_task để build tool còn thiếu.",
+                      {"description": t}, "medium", False)
+
+    # ── Remote-worker control ──────────────────────────────────────────
+    # "ssh worker2 uptime" / "kiểm tra worker2" / "worker2 còn sống không"
+    if _has_any(t, _PATTERNS_REMOTE_WORKER_HEALTH):
+        m = re.search(
+            r"\b(?:vps|worker|server)\s*(\w+)?\s+"
+            r"(?:còn\s+sống|alive|sao\s*rồi)", t, re.I)
+        wid = m.group(1) if m else ""
+        if not wid:
+            m2 = re.search(r"\b(?:vps|worker|server)\s*(\w+)", t, re.I)
+            wid = m2.group(1) if m2 else ""
+        return Intent("remote_worker_health", 0.9,
+                      f"Health-check remote worker {wid or '?'}.",
+                      {"worker_id": wid}, "low", False)
+
+    if _has_any(t, _PATTERNS_REMOTE_WORKER_LIST):
+        return Intent("remote_worker_list", 0.9,
+                      "Liệt kê remote workers đã đăng ký.",
+                      {}, "low", False)
+
+    # ssh_exec / "chạy lệnh trên worker" / "xem dung lượng worker2" /
+    # "restart bot trên vps2"
+    for p in _PATTERNS_SSH_EXEC:
+        m = p.search(t)
+        if m:
+            wid = ""
+            cmd = ""
+            # Pattern 1: "ssh <id> <cmd>"
+            if p.pattern.startswith(r"\bssh\s+"):
+                wid, cmd = m.group(1), m.group(2)
+            else:
+                # Heuristic: last group is command-shaped, group containing
+                # \w+ near "worker" is the id
+                groups = [g for g in m.groups() if g]
+                if groups:
+                    # try to match a worker id and a command separately
+                    wmatch = re.search(r"(?:vps|worker|server)\s*(\w+)",
+                                       t, re.I)
+                    wid = wmatch.group(1) if wmatch else ""
+                    # Predefined verbs:
+                    if "dung lượng" in t.lower() or "disk" in t.lower():
+                        cmd = "df -h"
+                    elif "restart" in t.lower() or "khởi động lại" in t.lower():
+                        cmd = "systemctl status tiktok-bot"  # safe default;
+                        # actual restart will need confirm via the high-risk
+                        # path inside SSH classifier
+                    else:
+                        cmd = groups[-1]
+            risk = "high" if _has_any(t, _PATTERNS_HIGH_RISK) else "medium"
+            return Intent("ssh_exec", 0.85,
+                          f"Chạy lệnh trên worker {wid or '?'}.",
+                          {"worker_id": wid, "command": cmd},
+                          risk, requires_confirm=(risk == "high"))
 
     # Brain-evolve START matches BEFORE self_improve so "tự cải thiện brain"
     # without a stop word goes to the loop, not the one-shot.

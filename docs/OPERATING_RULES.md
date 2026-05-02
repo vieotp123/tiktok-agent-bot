@@ -123,7 +123,47 @@ summary.
 - `data/telegram/` is gitignored — uploads and the JSONL index are
   never committed.
 
-## 10. Failure handling
+## 10. Owner tooling doctrine
+
+The admin is the platform owner. **Never** respond to an owner request
+with a generic "không có quyền". The doctrine is:
+
+1. **Tool exists, action low/medium-risk and within session grant**
+   → execute immediately, audit-log entry.
+2. **Tool exists, action high-risk** → send the inline ✅ Đồng ý /
+   ❌ Hủy keyboard. The action only fires when admin taps ✅.
+3. **Tool missing** → queue a code_task that BUILDS the tool. Reply
+   in Vietnamese: *"🛠 Tool này chưa có, em sẽ tạo task để tích hợp."*
+   Then the Claude Opus 4.7 worker can pick it up.
+4. **Hard safety violation** (BLOCKED bucket below) → explain the exact
+   rule and offer a safe alternative. Do not execute even with confirm.
+
+## 11. Remote-worker SSH safety
+
+`bot/remote_workers.py` enforces:
+
+- Key auth ONLY. `BatchMode=yes`, `PasswordAuthentication=no`.
+- Keys must live under `/opt/tiktok-bot/keys/` and be `chmod 600`.
+- Hosts must be explicitly registered via `/worker_add`.
+- `data/remote_workers.json` and `keys/` are gitignored — never
+  committed.
+- Output line-scrubbed for `GITHUB_TOKEN` / `Bearer` / `ghp_*` /
+  `sk-*` / `BEGIN OPENSSH PRIVATE KEY` / `password=` BEFORE leaving
+  the executor.
+- Hard 64 KB output cap, 30 s default timeout.
+
+### SSH command risk classifier
+
+| Risk      | Behaviour                                                 |
+|-----------|-----------------------------------------------------------|
+| 🛑 blocked | Never run, even with admin confirm. Includes `mkfs`, `dd if=`, `curl/wget … \| bash`, `cat .env / ssh keys / cookies / storage_state`, `ufw disable`, `iptables -F`, `scp`/`rsync` to remote |
+| 🔴 high    | Inline ✅ Đồng ý / ❌ Hủy required. Includes `apt install/remove`, `pip install`, `reboot`, `useradd`, `passwd`, `visudo`, `firewalld`, `rm -rf`, `chmod 777`, redirect to `/etc/`, `drop table`, unknown command |
+| 🟡 medium  | Session grant or per-command confirm. Includes `systemctl restart/start/stop`, `docker restart`, `git pull`, `mkdir`, `apt update` |
+| 🟢 low     | Auto-runs with audit log. Includes `uptime`, `whoami`, `df -h`, `ls`, `journalctl`, `docker ps`, `git status` |
+
+Unknown commands default to **high** — admin must confirm.
+
+## 12. Failure handling
 
 - If a phase or test fails twice, stop and report the root cause.
   Don't loop indefinitely.

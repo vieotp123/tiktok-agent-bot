@@ -1673,6 +1673,181 @@ def handle_brain_evolve_status() -> str:
     return _be.status_panel_vi()
 
 
+# ── Remote workers / SSH ──────────────────────────────────────────────────────
+
+def handle_workers_remote() -> str:
+    from bot.remote_workers import format_workers_list_vi
+    return format_workers_list_vi()
+
+
+def handle_worker_info(arg: str) -> str:
+    from bot.remote_workers import format_worker_info_vi
+    arg = arg.strip()
+    if not arg:
+        return "Usage: /worker_info &lt;worker_id&gt;"
+    return format_worker_info_vi(arg)
+
+
+def handle_worker_add(spec: str) -> str:
+    """/worker_add <id> <host> <user> <key_path> [port] [tags=a,b]"""
+    parts = spec.strip().split()
+    if len(parts) < 4:
+        return ("Usage: /worker_add &lt;id&gt; &lt;host&gt; &lt;user&gt; "
+                "&lt;key_path&gt; [port] [tag1,tag2]\n"
+                "Key file phải nằm trong "
+                "<code>/opt/tiktok-bot/keys/</code> và chmod 600.\n"
+                "Ví dụ: <code>/worker_add worker2 1.2.3.4 ubuntu "
+                "/opt/tiktok-bot/keys/worker2_id_ed25519 22 ocr</code>")
+    wid, host, user, key_path = parts[:4]
+    port = 22
+    tags: list[str] = []
+    for extra in parts[4:]:
+        if extra.isdigit():
+            port = int(extra)
+        else:
+            tags = [t.strip() for t in extra.split(",") if t.strip()]
+    from bot.remote_workers import add_worker
+    ok, why = add_worker(worker_id=wid, host=host, username=user,
+                          key_path=key_path, port=port, tags=tags)
+    if not ok:
+        return f"❌ Không thêm được worker: {_esc(why)}"
+    log_action(user="tg_admin", action="worker_add", risk_level="medium",
+               status="ok", result_summary=f"id={wid} host={host}")
+    return (f"✅ Đã thêm worker <code>{wid}</code> "
+            f"({user}@{host}:{port}). Test: "
+            f"<code>/worker_test {wid}</code>")
+
+
+async def handle_worker_test(arg: str) -> str:
+    from bot.remote_workers import ssh_exec, get_worker, format_ssh_result_vi
+    arg = arg.strip()
+    if not arg:
+        return "Usage: /worker_test &lt;worker_id&gt;"
+    wid = arg.split()[0]
+    if not get_worker(wid):
+        return (f"❓ Worker <code>{_esc(wid)}</code> chưa đăng ký. "
+                f"Gõ <code>/workers_remote</code> để xem danh sách hoặc "
+                f"<code>/worker_add</code> để thêm.")
+    # Run a fixed low-risk probe — bypass classifier debate by using
+    # `uptime` which is in the LOW pattern set.
+    r = ssh_exec(wid, "uptime", user="tg_admin")
+    return format_ssh_result_vi(wid, "uptime", r)
+
+
+async def handle_ssh_exec(spec: str) -> str:
+    """/ssh_exec <worker_id> <command>"""
+    parts = spec.strip().split(None, 1)
+    if len(parts) < 2:
+        return ("Usage: /ssh_exec &lt;worker_id&gt; &lt;command&gt;\n"
+                "Lệnh low-risk chạy ngay; medium/high cần xác nhận.")
+    wid, cmd = parts[0], parts[1]
+    from bot.remote_workers import (ssh_exec, get_worker, classify_ssh_command,
+                                       format_ssh_result_vi)
+    if not get_worker(wid):
+        return f"❓ Worker <code>{_esc(wid)}</code> chưa đăng ký."
+    risk, reason = classify_ssh_command(cmd)
+    # If high → ask confirm via inline buttons (payload carries cmd).
+    if risk == "high":
+        return await _ask_confirm_action(
+            chat_id=int(TG_ADMIN),
+            action="ssh_exec_high_risk",
+            goal=f"ssh {wid} {cmd[:200]}",
+            pretty=(f"Chạy SSH high-risk trên <code>{wid}</code>:\n"
+                    f"<code>{_esc(cmd[:160])}</code>\n"
+                    f"<i>Lý do: {_esc(reason[:120])}</i>"),
+            payload={"ssh_exec": True,
+                     "worker_id": wid,
+                     "command": cmd,
+                     "risk_override": "high"},
+        )
+    if risk == "blocked":
+        return (f"🛑 Lệnh bị chặn cứng (không cho confirm bypass).\n"
+                f"<i>{_esc(reason)}</i>")
+    # low/medium → run with audit
+    r = ssh_exec(wid, cmd, user="tg_admin")
+    return format_ssh_result_vi(wid, cmd, r)
+
+
+# ── Owner-tooling doctrine: "build a tool" intent ────────────────────────────
+
+def _ensure_remote_workers_tool_present() -> bool:
+    """True if the remote-worker tool is already in the repo."""
+    return Path("/opt/tiktok-bot/bot/remote_workers.py").exists()
+
+
+def _existing_tools_inventory() -> dict[str, bool]:
+    """Lightweight check of which capability tools are present."""
+    return {
+        "remote_workers (SSH)":   _ensure_remote_workers_tool_present(),
+        "claude_quota":           Path("/opt/tiktok-bot/bot/claude_quota.py").exists(),
+        "coding_worker_bridge":   Path("/opt/tiktok-bot/bot/coding_worker_bridge.py").exists(),
+        "brain_evolve":           Path("/opt/tiktok-bot/bot/agent/brain_evolve.py").exists(),
+        "memory_store":           Path("/opt/tiktok-bot/bot/memory_store.py").exists(),
+        "telegram_files (file hub)": Path("/opt/tiktok-bot/bot/telegram_files.py").exists(),
+    }
+
+
+def handle_build_missing_tool(description: str) -> str:
+    """Owner-tooling doctrine: when admin asks for a capability:
+       1. If the tool already exists, point them at it.
+       2. Else, queue a code_task to build it. Never refuse generically.
+    """
+    desc = description.strip()
+    # Heuristic: if user mentioned 'ssh' / 'remote worker' / 'vps', the tool
+    # already exists (we just shipped it).
+    inv = _existing_tools_inventory()
+    low = desc.lower()
+    matches: list[str] = []
+    if any(k in low for k in ("ssh", "remote worker", "vps", "kết nối vps")):
+        if inv["remote_workers (SSH)"]:
+            matches.append("remote_workers (SSH)")
+    if any(k in low for k in ("ocr", "vision")):
+        # OCR doesn't exist yet
+        pass
+    if matches:
+        return (f"✅ Tool đã có trong repo: <b>{', '.join(matches)}</b>.\n\n"
+                f"Dùng ngay:\n"
+                f"• <code>/workers_remote</code> — xem worker đã đăng ký\n"
+                f"• <code>/worker_add &lt;id&gt; &lt;host&gt; &lt;user&gt; "
+                f"&lt;key_path&gt;</code> — thêm worker mới\n"
+                f"• <code>/worker_test &lt;id&gt;</code> — kiểm tra "
+                f"liveness (uptime)\n"
+                f"• <code>/ssh_exec &lt;id&gt; &lt;cmd&gt;</code> — chạy "
+                f"lệnh (low-risk auto, high-risk hỏi)")
+
+    # Otherwise queue a build task
+    title = (f"Build tool: {desc[:60]}").strip()
+    description_full = (
+        f"Owner yêu cầu thêm tool / capability mới:\n\n"
+        f"{desc}\n\n"
+        f"Spec gợi ý:\n"
+        f"- Đặt module trong bot/ hoặc bot/tools/.\n"
+        f"- Tích hợp NL intent vào bot/agent/nl_router.py.\n"
+        f"- Thêm Telegram command + handler trong bot/telegram_bot.py.\n"
+        f"- Risk policy + audit log + redaction.\n"
+        f"- Eval mới trong bot/agent/evals.py.\n"
+        f"- Không touch .env/storage_state/main branch.\n"
+        f"- Chạy scripts/smoke_test.sh trước commit."
+    )
+    tid = code_add_task(title=title, description=description_full,
+                        risk_level="medium", priority=6,
+                        created_by="tg_admin_doctrine")
+    # Build prompt eagerly
+    try:
+        from bot.agent.prompt_builder import (build_coding_prompt,
+                                                save_prompt_for_task)
+        t = code_get_task(tid)
+        if t:
+            save_prompt_for_task(tid, build_coding_prompt(t))
+    except Exception:
+        pass
+    return (f"🛠 <b>Tool này chưa có, em sẽ tạo task để tích hợp.</b>\n"
+            f"Đã queue code task <code>{tid}</code>.\n"
+            f"<i>{_esc(desc[:120])}</i>\n\n"
+            f"Gõ <i>“làm tiếp task code tiếp theo”</i> để bridge chạy "
+            f"(Claude Opus 4.7), hoặc <code>/code_worker_run_once</code>.")
+
+
 async def handle_claude_probe() -> str:
     """Force a fresh Claude probe and return the rich Vietnamese status."""
     try:
@@ -2517,6 +2692,13 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/brain_evolve_start":   return await handle_brain_evolve_start(arg)
     if cmd == "/brain_evolve_stop":    return handle_brain_evolve_stop()
     if cmd == "/brain_evolve_status":  return handle_brain_evolve_status()
+    # ── Remote workers ───────────────────────────────────────────────────
+    if cmd == "/workers_remote":   return handle_workers_remote()
+    if cmd == "/worker_add":       return handle_worker_add(arg)
+    if cmd == "/worker_info":      return handle_worker_info(arg)
+    if cmd == "/worker_test":      return await handle_worker_test(arg)
+    if cmd == "/worker_health":    return await handle_worker_test(arg)  # alias
+    if cmd == "/ssh_exec":         return await handle_ssh_exec(arg)
     if cmd == "/claude_quota_reset":   return handle_claude_quota_reset(arg)
     if cmd == "/claude_quota_in":      return handle_claude_quota_in(arg)
     if cmd == "/claude_limited":       _cq.set_limited(True);  return _cq.status_summary()
@@ -2677,6 +2859,26 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
                 f"Bridge sẽ chạy khi mình ra lệnh "
                 f"<i>“làm tiếp task code tiếp theo”</i>, hoặc gõ "
                 f"<code>/code_worker_run_once</code>.")
+
+    # ── Remote workers / SSH ─────────────────────────────────────────────
+    if name == "remote_worker_list":
+        return handle_workers_remote()
+    if name == "remote_worker_health":
+        wid = (intent.args.get("worker_id") or "").strip()
+        if not wid:
+            return ("Cú pháp: nói rõ id worker. Ví dụ: "
+                    "<i>“worker2 còn sống không”</i>.")
+        return await handle_worker_test(wid)
+    if name == "ssh_exec":
+        wid = (intent.args.get("worker_id") or "").strip()
+        cmd = (intent.args.get("command")   or "").strip()
+        if not wid or not cmd:
+            return "Cú pháp: <i>“ssh worker2 uptime”</i>"
+        return await handle_ssh_exec(f"{wid} {cmd}")
+    if name == "build_missing_tool":
+        return handle_build_missing_tool(
+            intent.args.get("description") or raw_text,
+        )
 
     # ── Brain Evolution Loop ─────────────────────────────────────────────
     if name == "brain_evolve_start":
@@ -2926,6 +3128,19 @@ async def _execute_after_confirm(rec: dict, chat_id) -> str:
             msg += ("\n\n<i>auto_run đã bật, nhưng task high-risk vẫn cần "
                     "xác nhận thêm trước khi worker chạy.</i>")
         return msg
+
+    # ── ssh_exec_high_risk → execute the approved SSH command ────────────
+    if action == "ssh_exec_high_risk" or payload.get("ssh_exec"):
+        wid = payload.get("worker_id", "")
+        cmd = payload.get("command", "")
+        if not wid or not cmd:
+            return ("✅ Đã duyệt nhưng payload thiếu worker_id/command. "
+                    "Hãy thử lại với <code>/ssh_exec</code>.")
+        from bot.remote_workers import (ssh_exec, format_ssh_result_vi)
+        # Pass risk_override=high so the executor doesn't gate again.
+        r = ssh_exec(wid, cmd, user="tg_admin", risk_override="high")
+        return ("✅ Đã duyệt — đã chạy:\n\n" +
+                format_ssh_result_vi(wid, cmd, r))
 
     # ── grant_permission with payload ────────────────────────────────────
     if action == "grant_permission" and payload.get("scope"):
