@@ -230,12 +230,26 @@ register(Skill(
 ))
 
 register(Skill(
+    name="ocr_image",
+    description="Trích text từ ảnh đã upload qua Telegram (vision LLM, "
+                "audit-logged, redaction trước khi reply).",
+    risk_level="low",
+    enabled=True,
+    handler="handle_ocr",
+    examples=[
+        "/ocr <file_id>",
+        "đọc text trong ảnh <file_id>",
+        "phân tích ảnh <file_id>",
+    ],
+))
+
+register(Skill(
     name="ocr_remote",
-    description="[FUTURE] Trích xuất text từ ảnh/screenshot.",
+    description="[FUTURE] OCR remote screenshot (browser worker).",
     risk_level="medium",
     enabled=False,
-    handler="ocr_handler",
-    examples=["đọc text trong ảnh này"],
+    handler="ocr_remote_handler",
+    examples=["đọc text trong screenshot remote"],
 ))
 
 register(Skill(

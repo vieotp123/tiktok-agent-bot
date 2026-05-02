@@ -753,6 +753,89 @@ def eval_prompt_builder(rep: EvalReport) -> None:
                 got == "high", f"got={got}")
 
 
+def eval_ocr(rep: EvalReport) -> None:
+    """OCR tool — module hygiene, redaction, intent routing, skill enabled."""
+    from bot.ocr import (
+        is_ocr_safe_path, redact_secrets, is_ocr_intent,
+        OCR_ALLOWED_EXTS, OCR_MAX_BYTES,
+    )
+    from bot.agent.nl_router import classify
+    from bot.agent.skill_registry import get_skill
+
+    # Redaction MUST scrub plausible secrets before they hit audit/reply.
+    samples = [
+        ("token: ghp_abcdef0123456789xyz live",     "ghp_abcdef0123456789xyz"),
+        ("Authorization: Bearer abcdefghij1234567890", "abcdefghij1234567890"),
+        ("api_key=sk-test1234567890ABCDEFGH ok",     "sk-test1234567890ABCDEFGH"),
+        ("password = SuperSecret!23 done",           "SuperSecret!23"),
+    ]
+    for raw, leaked in samples:
+        redacted, n = redact_secrets(raw)
+        rep.add(f"ocr_redact[{leaked[:18]!r}]", "ocr",
+                n >= 1 and leaked not in redacted,
+                f"n={n} redacted={redacted[:60]!r}")
+
+    # Empty / falsy input is a no-op (no crash, no false positive count).
+    redacted, n = redact_secrets("")
+    rep.add("ocr_redact_empty_safe", "ocr",
+            redacted == "" and n == 0, f"n={n}")
+
+    # Path safety mirrors is_safe_send_path + extension allow-list + size cap.
+    block_cases = [
+        "/opt/tiktok-bot/.env",
+        "/opt/tiktok-bot/tiktok_storage_state.json",
+        "/etc/passwd",
+        "/opt/tiktok-bot/docs/CURRENT_STATUS.md",  # wrong extension
+        "/opt/tiktok-bot/data/code_prompts/foo.txt",
+    ]
+    for path in block_cases:
+        ok, _ = is_ocr_safe_path(path)
+        rep.add(f"ocr_blocks[{path[-30:]!r}]", "ocr",
+                not ok, "blocked" if not ok else "ALLOWED!")
+
+    # Hard caps are sane (no accidental loosening).
+    rep.add("ocr_extension_allowlist", "ocr",
+            OCR_ALLOWED_EXTS == frozenset({".png", ".jpg", ".jpeg",
+                                            ".webp", ".gif"}),
+            f"allow={sorted(OCR_ALLOWED_EXTS)}")
+    rep.add("ocr_size_cap_8mb", "ocr",
+            OCR_MAX_BYTES == 8 * 1024 * 1024,
+            f"cap={OCR_MAX_BYTES}")
+
+    # NL intent: explicit OCR phrasings classify to ocr_image, not chat.
+    nl_cases = [
+        ("/ocr abcdef12",                           "ocr_image"),
+        ("ocr abcdef12",                            "ocr_image"),
+        ("đọc text trong ảnh abcdef12",             "ocr_image"),
+        ("phân tích ảnh abcdef12",                  "ocr_image"),
+        ("extract text from image foo.png",         "ocr_image"),
+        # build-tool path must still beat ocr_image when phrased as
+        # "thêm tool ocr ..." — protects the owner-tooling doctrine.
+        ("thêm tool ocr vào agent",                 "build_missing_tool"),
+        ("hello bro",                               "chat"),
+    ]
+    for text, want in nl_cases:
+        got = classify(text)
+        rep.add(f"ocr_nl[{text[:28]!r}]", "ocr",
+                got.name == want, f"got={got.name} want={want}")
+
+    # is_ocr_intent (caption-fallback helper) is consistent with the
+    # NL classifier on the "yes" cases.
+    rep.add("ocr_intent_helper_yes", "ocr",
+            is_ocr_intent("đọc text trong ảnh") and is_ocr_intent("ocr now"),
+            "")
+    rep.add("ocr_intent_helper_no", "ocr",
+            not is_ocr_intent("hello bro"), "")
+
+    # Skill is registered, enabled, and risk=low.
+    skill = get_skill("ocr_image")
+    rep.add("ocr_skill_registered", "ocr",
+            skill is not None and skill.enabled
+            and skill.risk_level == "low"
+            and skill.handler == "handle_ocr",
+            f"skill={skill}")
+
+
 # ── Driver ────────────────────────────────────────────────────────────────────
 
 async def run_all_evals(category: str | None = None) -> EvalReport:
@@ -788,6 +871,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_brain_evolve(rep)
     if category in (None, "nl_router_v2"):
         eval_nl_router_v2(rep)
+    if category in (None, "ocr"):
+        eval_ocr(rep)
 
     rep.finished_at = time.time()
     return rep

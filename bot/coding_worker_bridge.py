@@ -612,7 +612,10 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         try:
             from bot import claude_quota as _cq
             if _cq.should_probe_now():
-                _cq.probe_claude_available(force=False)
+                # The probe spawns the Claude CLI synchronously (up to
+                # 60s). Run it in a worker thread so the asyncio event
+                # loop — and Telegram polling — stays responsive.
+                await asyncio.to_thread(_cq.probe_claude_available, False)
             qstate = _cq.get_quota_state()
         except Exception as e:
             qstate = {"status": "unknown",
@@ -817,9 +820,13 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         code_fail(nx["id"], test_summary=out["summary"][:300])
         return out
 
-    smoke = subprocess.run(["bash", "scripts/smoke_test.sh"],
-                           cwd=str(REPO), capture_output=True, text=True,
-                           timeout=120)
+    # smoke + evals are sync subprocess calls (10-30s each). Run them
+    # in a worker thread so Telegram polling stays responsive.
+    def _run_blocking_check(argv: list[str], timeout_sec: int = 120):
+        return subprocess.run(argv, cwd=str(REPO), capture_output=True,
+                               text=True, timeout=timeout_sec)
+    smoke = await asyncio.to_thread(_run_blocking_check,
+                                      ["bash", "scripts/smoke_test.sh"], 120)
     smoke_pass = "SMOKE TEST PASSED" in smoke.stdout
     if not smoke_pass:
         out["status"]  = "smoke_failed"
@@ -828,10 +835,9 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         code_fail(nx["id"], test_summary=out["summary"][:300])
         return out
 
-    evals = subprocess.run([str(REPO / "venv" / "bin" / "python3"),
-                             "-m", "bot.agent.evals"],
-                            cwd=str(REPO), capture_output=True, text=True,
-                            timeout=120)
+    evals = await asyncio.to_thread(_run_blocking_check,
+                                      [str(REPO / "venv" / "bin" / "python3"),
+                                       "-m", "bot.agent.evals"], 120)
     evals_ok = "passed" in evals.stdout and "0 eval(s) failed" not in evals.stdout
     # Stricter check: count "passed" line
     m = re.search(r"Agent Evals — (\d+)/(\d+) passed", evals.stdout)
@@ -898,9 +904,13 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
 
     push_url = (f"https://x-access-token:{token}"
                 f"@github.com/vieotp123/tiktok-agent-bot.git")
-    push = subprocess.run(["git", "-C", str(REPO), "push",
-                           push_url, "dev-agent"],
-                          capture_output=True, text=True, timeout=60)
+    # git push talks to the network — run in worker thread so the
+    # asyncio event loop (Telegram polling) stays responsive.
+    push = await asyncio.to_thread(
+        subprocess.run,
+        ["git", "-C", str(REPO), "push", push_url, "dev-agent"],
+        capture_output=True, text=True, timeout=60,
+    )
     # Always reset remote URL to the clean form, regardless of push outcome
     subprocess.run(["git", "-C", str(REPO), "remote", "set-url", "origin",
                     "https://github.com/vieotp123/tiktok-agent-bot.git"],

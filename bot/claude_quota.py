@@ -240,8 +240,10 @@ PROBE_TIMEOUT_SEC        = 60
 PROBE_PROMPT             = "Reply only: CLAUDE_PROBE_OK"
 PROBE_OK_MARKER          = "CLAUDE_PROBE_OK"
 
-# Backoff schedule for "limited but no exact reset time"
-_BACKOFF_SCHEDULE_MIN    = (30, 60, 120, 240)  # cap 4h
+# Backoff schedule for "limited but no exact reset time".
+# Owner policy (2026-05): default to 60 min — "hết quota thì ngưng 1
+# tiếng sau thử lại". Subsequent retries grow but cap at 4h.
+_BACKOFF_SCHEDULE_MIN    = (60, 60, 120, 240)  # cap 4h
 
 
 # ── Public state writers ──────────────────────────────────────────────────────

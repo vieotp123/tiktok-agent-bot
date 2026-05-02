@@ -310,6 +310,15 @@ _PATTERNS_STATUS = (
     _RE(r"\b/?agent_(status|health|metrics|autonomy_status)\b", re.I),
 )
 
+# Diag-style intents — "agent đang kẹt ở đâu" / "diag"
+_PATTERNS_DIAG = (
+    _RE(r"\bagent\s+(đang\s+)?(kẹt|stuck|stall|treo|đứng)", re.I),
+    _RE(r"\bxem\s+(diag|agent\s+diag)\b", re.I),
+    _RE(r"\b/?agent_diag\b", re.I),
+    _RE(r"\bbot\s+(đang\s+)?(kẹt|stuck|treo|đứng)", re.I),
+    _RE(r"\bdiag\b", re.I),
+)
+
 _PATTERNS_LIST_TASKS = (
     _RE(r"\bcòn\s+(task|code)\s+(gì|nào)", re.I),
     _RE(r"\b(liệt\s*kê|xem|list)\s+(task|code)", re.I),
@@ -371,6 +380,27 @@ _PATTERNS_MEMORY_FORGET = (
 _PATTERNS_SHOW_FILES = (
     _RE(r"\b(liệt\s*kê|xem|show|list)\s+(file|files)", re.I),
     _RE(r"\bfile\s+(gần\s*đây|recent|mới\s+nhất)\b", re.I),
+)
+
+# OCR run intents — admin asks to extract text from a saved image.
+# Scoped so they DO NOT collide with `build_missing_tool` (which matches
+# "thêm/tạo/cài tool ocr"). Build-tool patterns require a verb prefix;
+# the patterns here trigger only on action-on-image phrasing or the
+# explicit /ocr command.
+_PATTERNS_OCR_RUN = (
+    _RE(r"^/ocr\b", re.I),
+    _RE(r"\bocr\s+(?:file\s+|image\s+|ảnh\s+)?[A-Za-z0-9_./\-]+", re.I),
+    _RE(r"\b(đ|d)(ọ|o)c\s+(text|chữ|chu)\s+(?:trong\s+|từ\s+|tu\s+)?ảnh",
+        re.I),
+    _RE(r"\b(đ|d)(ọ|o)c\s+(text|chữ|chu)\s+(?:trong\s+|từ\s+|tu\s+)?anh",
+        re.I),
+    _RE(r"\bextract\s+text\s+(?:from\s+)?(?:image|photo|ảnh|anh)", re.I),
+    _RE(r"\b(trích|trich)\s+(text|chữ|chu)\s+(?:trong\s+|từ\s+)?(ảnh|anh)",
+        re.I),
+    _RE(r"\bphân\s*tích\s+ảnh\s+\S+", re.I),
+    _RE(r"\bphan\s*tich\s+anh\s+\S+", re.I),
+    _RE(r"\bxem\s+(text|chữ|chu)\s+(?:trong\s+)?(ảnh|anh)\b", re.I),
+    _RE(r"\bread\s+image\s+\S+", re.I),
 )
 
 # Owner-tooling doctrine: when admin asks for a capability we don't
@@ -519,6 +549,18 @@ def classify(text: str) -> Intent:
                       "Tạo code_task để build tool còn thiếu.",
                       {"description": t}, "medium", False)
 
+    # ── OCR run (after build_missing_tool so "thêm tool ocr" still
+    #    routes to build, not run) ─────────────────────────────────────
+    if _has_any(t, _PATTERNS_OCR_RUN):
+        # Best-effort: pull a file_id-shaped token or an image path. The
+        # handler will resolve it against the inbox or allow-list.
+        m = re.search(r"\b(?:/ocr|ocr|read\s+image)\s+"
+                      r"([A-Za-z0-9_./\-]+)", t, re.I)
+        target = m.group(1).strip() if m else ""
+        return Intent("ocr_image", 0.9,
+                      "Trích text từ ảnh đã upload.",
+                      {"target": target, "raw": t}, "low", False)
+
     # ── Remote-worker control ──────────────────────────────────────────
     # "ssh worker2 uptime" / "kiểm tra worker2" / "worker2 còn sống không"
     if _has_any(t, _PATTERNS_REMOTE_WORKER_HEALTH):
@@ -643,6 +685,11 @@ def classify(text: str) -> Intent:
                       "Thu hồi quyền session.", {}, "low", False)
 
     # 6. Status / list / search
+    if _has_any(t, _PATTERNS_DIAG):
+        return Intent("agent_diag", 0.95,
+                      "Hiển thị bảng diag: queue, worker, claude, "
+                      "pending, dirty tree.", {}, "low", False)
+
     if _has_any(t, _PATTERNS_STATUS):
         return Intent("status", 0.9,
                       "Xem dashboard sức khỏe agent.", {}, "low", False)

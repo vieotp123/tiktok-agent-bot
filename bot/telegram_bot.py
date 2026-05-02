@@ -1052,6 +1052,44 @@ async def handle_send_photo(arg: str, chat_id: str | int) -> str:
             else f"❌ Failed to send photo: <code>{label}</code>")
 
 
+async def handle_ocr(arg: str, chat_id: str | int) -> str:
+    """Trích text từ ảnh đã upload (file_id) hoặc đường dẫn ảnh
+    nằm trong allow-list. Audit-logged + redaction trước khi reply.
+    """
+    from bot.ocr import ocr_image, OCR_ALLOWED_EXTS
+    arg = (arg or "").strip()
+    if not arg:
+        return ("Usage: <code>/ocr &lt;file_id|path&gt; [prompt]</code>\n"
+                "file_id lấy từ <code>/files</code>, hoặc đường dẫn ảnh "
+                "nằm trong allow-list. "
+                f"Định dạng hỗ trợ: {', '.join(sorted(OCR_ALLOWED_EXTS))}.")
+
+    parts = arg.split(None, 1)
+    target = parts[0]
+    prompt = parts[1].strip() if len(parts) > 1 else None
+
+    path, label = _resolve_file_arg(target)
+    res = await ocr_image(path, prompt=prompt, user="tg_admin")
+    if not res.get("ok"):
+        return (f"❌ OCR <code>{_esc(label)}</code> lỗi.\n"
+                f"<i>{_esc(res.get('error', ''))[:300]}</i>")
+
+    text = (res.get("text") or "").strip() or "(không phát hiện text)"
+    redactions = int(res.get("redactions") or 0)
+    chars = int(res.get("chars") or 0)
+    model = res.get("model") or ""
+
+    # Telegram message cap (~3500 chars for body); truncate gracefully.
+    body = text if len(text) <= 3200 else (text[:3200] + "\n…[truncated]")
+    redaction_note = (f"\n🛡 redactions: <b>{redactions}</b>"
+                      if redactions else "")
+    return (
+        f"🔎 <b>OCR</b> <code>{_esc(label)}</code> "
+        f"(<i>{chars} chars, {model}</i>){redaction_note}\n\n"
+        f"<pre>{_esc(body)}</pre>"
+    )
+
+
 def handle_upload_guide() -> str:
     return (
         "<b>📤 File Upload Guide</b>\n\n"
@@ -1673,6 +1711,127 @@ def handle_brain_evolve_status() -> str:
     return _be.status_panel_vi()
 
 
+# ── /agent_diag — single-screen diagnostic ───────────────────────────────────
+
+async def handle_agent_diag() -> str:
+    """Vietnamese single-screen diagnostic. Always returns a non-empty
+    answer even if some subsystem is broken.  No await on the long
+    Claude probe — we only read cached state to avoid blocking."""
+    lines = ["<b>🩺 Agent Diag</b>"]
+    lines.append("Telegram bot: <b>alive</b>")
+
+    try:
+        all_q = code_list_tasks(limit=200)
+        by_status: dict[str, int] = {}
+        for t in all_q:
+            by_status[t["status"]] = by_status.get(t["status"], 0) + 1
+        nx = code_next_task()
+        lines.append("<b>Code queue:</b> " + " · ".join(
+            f"{k}={v}" for k, v in sorted(by_status.items())))
+        if nx:
+            lines.append(f"  Next queued: <code>{nx['id']}</code> — "
+                         f"{_esc((nx.get('title') or '')[:50])}")
+    except Exception as e:
+        lines.append(f"<b>Code queue:</b> ❌ {_esc(str(e))[:120]}")
+
+    try:
+        from bot.coding_worker_bridge import (is_paused as _bridge_paused,
+                                                recent_logs as _recent_logs)
+        bp = _bridge_paused()
+        cp = code_is_paused()
+        lines.append(f"<b>Worker:</b> bridge="
+                     f"{'⏸ paused' if bp else '▶ active'} · "
+                     f"queue={'⏸ paused' if cp else '▶ active'}")
+        logs = _recent_logs(2)
+        if logs:
+            lines.append("  Recent logs: " +
+                          ", ".join(f"<code>{p.name}</code>" for p in logs))
+    except Exception as e:
+        lines.append(f"<b>Worker:</b> ❌ {_esc(str(e))[:120]}")
+
+    try:
+        from bot.agent import brain_evolve as _be
+        s = _be.state()
+        lines.append(f"<b>Brain evolve:</b> "
+                     f"{'🟢 enabled' if s.get('enabled') else '⚪ stopped'} "
+                     f"· run_count={s.get('run_count', 0)} "
+                     f"· consec_failures={s.get('consecutive_failures', 0)}")
+        if s.get("last_status"):
+            lines.append(f"  last_status: "
+                         f"<i>{_esc(str(s['last_status']))[:80]}</i>")
+    except Exception as e:
+        lines.append(f"<b>Brain evolve:</b> ❌ {_esc(str(e))[:120]}")
+
+    # Claude — read cache only; don't fire a fresh probe (avoid blocking)
+    try:
+        cqs = _cq.get_quota_state()
+        lines.append(f"<b>Claude:</b> status="
+                     f"<b>{cqs.get('status', 'unknown')}</b>")
+        if cqs.get("reset_at"):
+            lines.append(f"  reset_at: <code>{cqs['reset_at']}</code>")
+        if cqs.get("next_probe_at"):
+            lines.append(f"  next_probe: <code>{cqs['next_probe_at']}</code>")
+        if cqs.get("autorun"):
+            lines.append(f"  autorun: <b>on</b> "
+                         f"(max={cqs.get('max_tasks', 1)})")
+        if cqs.get("last_error_summary"):
+            lines.append(f"  <i>{_esc(cqs['last_error_summary'][:140])}</i>")
+    except Exception as e:
+        lines.append(f"<b>Claude:</b> ❌ {_esc(str(e))[:120]}")
+
+    try:
+        from bot.agent.permissions import list_pending
+        pa = list_pending(only_pending=True)
+        lines.append(f"<b>Pending actions:</b> {len(pa)}")
+        for p in pa[:3]:
+            lines.append(f"  • <code>{p['action_id']}</code> "
+                         f"{_esc(p.get('action',''))[:40]}")
+    except Exception as e:
+        lines.append(f"<b>Pending actions:</b> ❌ {_esc(str(e))[:120]}")
+
+    try:
+        import subprocess as _sp
+        r = _sp.run(["git", "-C", "/opt/tiktok-bot", "status", "--short"],
+                    capture_output=True, text=True, timeout=5)
+        dirty = bool(r.stdout.strip())
+        lines.append(f"<b>Dirty tree:</b> "
+                     f"{'⚠ yes' if dirty else '✅ no'}")
+        if dirty:
+            for ln in r.stdout.strip().splitlines()[:3]:
+                lines.append(f"  <code>{_esc(ln[:80])}</code>")
+    except Exception as e:
+        lines.append(f"<b>Dirty tree:</b> ❌ {_esc(str(e))[:80]}")
+
+    try:
+        from bot.remote_workers import list_workers
+        rws = list_workers()
+        lines.append(f"<b>Remote workers:</b> {len(rws)} đăng ký")
+        for w in rws[:3]:
+            lines.append(f"  • <code>{w['id']}</code> "
+                         f"{_esc(w.get('username',''))}@"
+                         f"{_esc(w.get('host',''))}")
+    except Exception as e:
+        lines.append(f"<b>Remote workers:</b> ❌ {_esc(str(e))[:120]}")
+
+    try:
+        from bot.agent.audit_log import tail_audit
+        recent = tail_audit(3)
+        if recent:
+            lines.append("<b>Audit gần nhất:</b>")
+            for r in recent:
+                lines.append(f"  <code>{_esc(r.get('action',''))[:30]}</code> "
+                             f"{_esc(r.get('result_summary',''))[:80]}")
+    except Exception:
+        pass
+
+    lines.append("")
+    lines.append("<b>Gợi ý lệnh:</b>")
+    lines.append("  /code_status · /claude_status · /pending_actions "
+                 "· /code_worker_resume · /claude_probe "
+                 "· /code_worker_run_once")
+    return "\n".join(lines)
+
+
 # ── Remote workers / SSH ──────────────────────────────────────────────────────
 
 def handle_workers_remote() -> str:
@@ -1728,9 +1887,9 @@ async def handle_worker_test(arg: str) -> str:
         return (f"❓ Worker <code>{_esc(wid)}</code> chưa đăng ký. "
                 f"Gõ <code>/workers_remote</code> để xem danh sách hoặc "
                 f"<code>/worker_add</code> để thêm.")
-    # Run a fixed low-risk probe — bypass classifier debate by using
-    # `uptime` which is in the LOW pattern set.
-    r = ssh_exec(wid, "uptime", user="tg_admin")
+    # ssh_exec uses subprocess.run with up to 30s timeout. Run in
+    # a worker thread so Telegram polling stays responsive.
+    r = await asyncio.to_thread(ssh_exec, wid, "uptime", user="tg_admin")
     return format_ssh_result_vi(wid, "uptime", r)
 
 
@@ -1815,6 +1974,22 @@ def handle_build_missing_tool(description: str) -> str:
                 f"• <code>/ssh_exec &lt;id&gt; &lt;cmd&gt;</code> — chạy "
                 f"lệnh (low-risk auto, high-risk hỏi)")
 
+    # Dedup: if a recent queued/running task has nearly the same title,
+    # don't create another one — point at the existing task.
+    try:
+        existing_q = code_list_tasks(status="queued", limit=20)
+        existing_r = code_list_tasks(status="running", limit=5)
+        for t in existing_q + existing_r:
+            tt = (t.get("title") or "").lower()
+            if tt and (desc[:30].lower() in tt or tt[:30] in desc.lower()):
+                return (f"📋 Task tương tự đã có trong queue: "
+                        f"<code>{t['id']}</code> — "
+                        f"{_esc((t.get('title') or '')[:60])}\n"
+                        f"<i>Trạng thái: {t.get('status','?')}</i>\n\n"
+                        f"Gõ <i>“làm tiếp task code tiếp theo”</i> để chạy.")
+    except Exception:
+        pass
+
     # Otherwise queue a build task
     title = (f"Build tool: {desc[:60]}").strip()
     description_full = (
@@ -1832,7 +2007,7 @@ def handle_build_missing_tool(description: str) -> str:
     tid = code_add_task(title=title, description=description_full,
                         risk_level="medium", priority=6,
                         created_by="tg_admin_doctrine")
-    # Build prompt eagerly
+    # Build prompt eagerly so the worker has it ready
     try:
         from bot.agent.prompt_builder import (build_coding_prompt,
                                                 save_prompt_for_task)
@@ -1841,17 +2016,55 @@ def handle_build_missing_tool(description: str) -> str:
             save_prompt_for_task(tid, build_coding_prompt(t))
     except Exception:
         pass
+
+    # Tell admin exactly why the worker won't auto-run yet
+    reasons: list[str] = []
+    try:
+        from bot.coding_worker_bridge import is_paused as _bp, get_preferred_coding_tool
+        if _bp():
+            reasons.append("bridge đang pause — gõ "
+                           "<code>/code_worker_resume</code> để bật lại")
+        if code_is_paused():
+            reasons.append("queue đang pause")
+        tool = get_preferred_coding_tool()
+        if not tool:
+            reasons.append("Claude/Codex CLI chưa có trên PATH")
+    except Exception:
+        pass
+    try:
+        cqs = _cq.get_quota_state()
+        if cqs.get("status") == "limited":
+            reasons.append(f"Claude limited — sẽ thử lại lúc "
+                           f"{cqs.get('reset_at') or cqs.get('next_probe_at') or '?'}")
+        elif cqs.get("status") == "auth_required":
+            reasons.append("Claude cần <code>claude login</code> lại")
+    except Exception:
+        pass
+
+    autorun_hint = ""
+    if reasons:
+        autorun_hint = ("\n\n⚠ Worker chưa tự chạy được vì:\n• "
+                        + "\n• ".join(reasons))
+    else:
+        autorun_hint = ("\n\n✅ Worker sẵn sàng — gõ "
+                        "<i>“làm tiếp task code tiếp theo”</i> hoặc "
+                        "<code>/code_worker_run_once</code>.")
+
     return (f"🛠 <b>Tool này chưa có, em sẽ tạo task để tích hợp.</b>\n"
-            f"Đã queue code task <code>{tid}</code>.\n"
-            f"<i>{_esc(desc[:120])}</i>\n\n"
-            f"Gõ <i>“làm tiếp task code tiếp theo”</i> để bridge chạy "
-            f"(Claude Opus 4.7), hoặc <code>/code_worker_run_once</code>.")
+            f"Đã queue code task <code>{tid}</code>. Trạng thái: queued.\n"
+            f"<i>{_esc(desc[:120])}</i>"
+            + autorun_hint)
 
 
 async def handle_claude_probe() -> str:
-    """Force a fresh Claude probe and return the rich Vietnamese status."""
+    """Force a fresh Claude probe and return the rich Vietnamese status.
+
+    The probe spawns the Claude CLI synchronously (up to 60s). We run
+    it in a thread so the asyncio event loop / Telegram polling stays
+    responsive while the probe is in flight.
+    """
     try:
-        _cq.probe_claude_available(force=True)
+        await asyncio.to_thread(_cq.probe_claude_available, True)
     except Exception as e:
         return f"❌ Probe lỗi: <code>{_esc(str(e))[:200]}</code>"
     return _cq.format_claude_status_vi()
@@ -2300,7 +2513,25 @@ async def handle_file_message(msg: dict, chat_id: str | int) -> str:
         else:
             reply += f"\n\n{content}"
     elif any(kw in cap_low for kw in _OCR_KW):
-        reply += "\n\n⚠️ OCR/vision not yet supported. File saved."
+        if ftype == "photo" or Path(record["local_path"]).suffix.lower() in (
+                ".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            from bot.ocr import ocr_image as _ocr_run
+            res = await _ocr_run(record["local_path"], user="tg_admin")
+            if res.get("ok"):
+                txt = (res.get("text") or "").strip() or "(không phát hiện text)"
+                snippet = txt[:1800] + ("\n…[truncated]" if len(txt) > 1800 else "")
+                rd = int(res.get("redactions") or 0)
+                rd_note = f" 🛡 {rd}" if rd else ""
+                reply += (f"\n\n<b>OCR result</b>"
+                          f" (<i>{res.get('chars', 0)} chars, "
+                          f"{res.get('model', '')}</i>){rd_note}\n"
+                          f"<pre>{_esc(snippet)}</pre>")
+                create_task("ocr_image", f"OCR ảnh {filename}",
+                            status="done", input_files=[record["local_path"]])
+            else:
+                reply += f"\n\n❌ OCR lỗi: {_esc(res.get('error', ''))[:200]}"
+        else:
+            reply += "\n\n⚠️ OCR chỉ chạy trên ảnh (png/jpg/webp/gif)."
     return reply
 
 
@@ -2647,6 +2878,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/file":         return handle_file_detail(arg)
     if cmd == "/send_file":    return await handle_send_file(arg, chat_id)
     if cmd == "/send_photo":   return await handle_send_photo(arg, chat_id)
+    if cmd == "/ocr":          return await handle_ocr(arg, chat_id)
     if cmd == "/logs":         return await handle_logs()
     if cmd == "/tiktok_chat_info": return handle_tiktok_chat_info()
     if cmd == "/agent_blueprint":  return handle_agent_blueprint()
@@ -2692,6 +2924,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/brain_evolve_start":   return await handle_brain_evolve_start(arg)
     if cmd == "/brain_evolve_stop":    return handle_brain_evolve_stop()
     if cmd == "/brain_evolve_status":  return handle_brain_evolve_status()
+    if cmd == "/agent_diag":           return await handle_agent_diag()
     # ── Remote workers ───────────────────────────────────────────────────
     if cmd == "/workers_remote":   return handle_workers_remote()
     if cmd == "/worker_add":       return handle_worker_add(arg)
@@ -2880,6 +3113,15 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
             intent.args.get("description") or raw_text,
         )
 
+    # ── OCR ──────────────────────────────────────────────────────────────
+    if name == "ocr_image":
+        target = (intent.args.get("target") or "").strip()
+        if not target:
+            return ("Cú pháp: <code>/ocr &lt;file_id|path&gt;</code> hoặc "
+                    "<i>“ocr &lt;file_id&gt;”</i>. Lấy file_id từ "
+                    "<code>/files</code>.")
+        return await handle_ocr(target, chat_id)
+
     # ── Brain Evolution Loop ─────────────────────────────────────────────
     if name == "brain_evolve_start":
         n = int(intent.args.get("max_tasks") or 1)
@@ -2943,10 +3185,11 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         return "\n".join(replies)
 
     if name == "quota_status":
-        # Force a fresh probe so the answer reflects reality, not stale state.
+        # Force a fresh probe so the answer reflects reality. Run the
+        # blocking subprocess in a thread to keep Telegram responsive.
         try:
             if _cq.should_probe_now():
-                _cq.probe_claude_available(force=False)
+                await asyncio.to_thread(_cq.probe_claude_available, False)
         except Exception:
             pass
         return _cq.format_claude_status_vi()
@@ -2967,6 +3210,8 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         return await _cancel_latest_pending(chat_id)
 
     # ── Status / list / search / receive_file_context ────────────────────
+    if name == "agent_diag":
+        return await handle_agent_diag()
     if name == "status":
         return await handle_agent_status()
     if name == "list_tasks":
