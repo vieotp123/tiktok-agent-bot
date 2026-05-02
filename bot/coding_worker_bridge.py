@@ -838,13 +838,24 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         code_fail(nx["id"], test_summary=out["summary"][:300])
         return out
 
-    # smoke + evals are sync subprocess calls (10-30s each). Run them
-    # in a worker thread so Telegram polling stays responsive.
+    # smoke + evals are sync subprocess calls (10-30s each). Owner asked
+    # for "fix cho nó làm việc nhanh hơn, vì model 4.7 mạnh lắm" — speed
+    # up the post-run gate by running smoke + evals CONCURRENTLY in
+    # worker threads. Total wall time = max(smoke, evals) instead of
+    # smoke + evals. Typical saving 8-15s per task.
     def _run_blocking_check(argv: list[str], timeout_sec: int = 120):
         return subprocess.run(argv, cwd=str(REPO), capture_output=True,
                                text=True, timeout=timeout_sec)
-    smoke = await asyncio.to_thread(_run_blocking_check,
-                                      ["bash", "scripts/smoke_test.sh"], 120)
+    smoke_task = asyncio.to_thread(
+        _run_blocking_check, ["bash", "scripts/smoke_test.sh"], 120,
+    )
+    evals_task = asyncio.to_thread(
+        _run_blocking_check,
+        [str(REPO / "venv" / "bin" / "python3"), "-m", "bot.agent.evals"],
+        120,
+    )
+    smoke, evals = await asyncio.gather(smoke_task, evals_task)
+
     smoke_pass = "SMOKE TEST PASSED" in smoke.stdout
     if not smoke_pass:
         out["status"]  = "smoke_failed"
@@ -853,9 +864,6 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         code_fail(nx["id"], test_summary=out["summary"][:300])
         return out
 
-    evals = await asyncio.to_thread(_run_blocking_check,
-                                      [str(REPO / "venv" / "bin" / "python3"),
-                                       "-m", "bot.agent.evals"], 120)
     evals_ok = "passed" in evals.stdout and "0 eval(s) failed" not in evals.stdout
     # Stricter check: count "passed" line
     m = re.search(r"Agent Evals — (\d+)/(\d+) passed", evals.stdout)

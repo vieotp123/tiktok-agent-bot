@@ -1918,7 +1918,11 @@ async def handle_agent_autorun_start(arg: str = "",
     asyncio.create_task(
         _aa.pump_loop(user="tg_admin",
                        report_callback=_autorun_report,
-                       poll_interval_sec=8.0),
+                       # Was 8s — owner asked for faster cycles since
+                       # Claude Opus 4.7 is fast. 2s gives Telegram
+                       # polling enough time to process admin messages
+                       # between cycles without burning CPU.
+                       poll_interval_sec=2.0),
     )
 
     # Surface the control panel as inline buttons so admin can pause /
