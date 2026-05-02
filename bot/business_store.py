@@ -255,8 +255,18 @@ def upsert_lead(
     lead_score: int | None = None,
     status: str | None = None,
 ) -> str:
-    """Insert or update a lead by (platform, sender_key). Returns lead id."""
+    """Insert or update a lead by (platform, sender_key). Returns lead id.
+
+    Status / score are merged with monotonic guarantees:
+      - status only upgrades (new < needs_followup < interested < converted).
+        'lost' / 'converted' are sticky and not auto-overwritten by a lower tier.
+      - lead_score only goes UP via auto-update; admin can reset via direct SQL.
+    """
     now = _now()
+    _STATUS_RANK = {
+        "new": 0, "needs_followup": 1, "interested": 2,
+        "consulting": 1, "converted": 3, "lost": 3,
+    }
     with _conn() as conn:
         existing = conn.execute(
             "SELECT id, lead_score, status FROM leads WHERE platform=? AND sender_key=?",
@@ -274,12 +284,19 @@ def upsert_lead(
                 if v:
                     sets.append(f"{k}=?")
                     params.append(v[:300])
+            # Score: only raise, never lower
             if lead_score is not None:
-                sets.append("lead_score=?")
-                params.append(int(lead_score))
+                new_score = max(int(existing["lead_score"] or 0), int(lead_score))
+                sets.append("lead_score=?"); params.append(new_score)
+            # Status: only upgrade; never overwrite converted/lost from auto path
             if status is not None:
-                sets.append("status=?")
-                params.append(status)
+                cur_rank = _STATUS_RANK.get(existing["status"] or "new", 0)
+                new_rank = _STATUS_RANK.get(status, 0)
+                if existing["status"] in ("converted", "lost"):
+                    # Sticky terminal states — leave alone
+                    pass
+                elif new_rank > cur_rank:
+                    sets.append("status=?"); params.append(status)
             params.append(lid)
             conn.execute(f"UPDATE leads SET {', '.join(sets)} WHERE id=?", params)
             return lid

@@ -1,6 +1,23 @@
 # Current Status — Business Agent Platform
 
-_Last updated: 2026-05-02 (dev-agent branch — Business Agent v1)._
+_Last updated: 2026-05-02 (dev-agent branch — Business Agent v1.5)._
+
+## v1.5 changes
+
+- Telegram persistent menu UX hardened:
+  - `do:*` actions now ALWAYS edit the menu in place (≤ 3500 chars) or
+    send a separate result message + park the menu with "Result sent above"
+    (> 3500 chars). The menu never spawns a fresh copy on action results.
+  - New public helpers per spec:
+    `get_menu_state`, `save_menu_state`, `send_or_edit_menu`,
+    `show_action_result`, `result_keyboard`.
+  - `/menu`, `/start`, `/help`, `/cancel` reuse the existing menu message.
+  - Pending-input completion + file-upload reply also go through the
+    menu-edit path.
+- Sales/CRM submenu adds two buttons: **Verify Product** and
+  **Disable Product** (input flows already wired).
+- Lead status no longer downgrades (`new < needs_followup < interested
+  < converted/lost`). Lead score only rises on auto-update.
 
 ## Stable foundations
 

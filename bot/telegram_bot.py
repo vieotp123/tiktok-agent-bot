@@ -69,7 +69,7 @@ SESSION_FILE     = Path("/opt/tiktok-bot/data/telegram/session_state.json")
 MENU_STATE_FILE  = Path("/opt/tiktok-bot/data/telegram/menu_state.json")
 SESSION_TTL      = 600   # 10 minutes
 MENU_EDIT_TTL    = 86400 # 24h — older menu messages can no longer be edited reliably
-SHORT_RESULT_MAX = 1500  # chars — under this, edit menu in place; above, send + refresh menu
+SHORT_RESULT_MAX = 3500  # chars — under this, edit menu in place; above, send + park menu
 
 # Task intent patterns for smart routing
 _TASK_PATTERNS = [
@@ -276,77 +276,139 @@ def make_keyboard(rows: list[list[tuple[str, str]]]) -> dict:
     }
 
 
-BACK_ROW = [("◀ Back", "menu:main")]
-RESULT_KB = make_keyboard([[("◀ Back to Menu", "menu:main")]])
+BACK_ROW   = [("◀ Back", "menu:main")]
+RESULT_KB  = make_keyboard([[("◀ Back to Menu", "menu:main")]])
+
+
+# ── Public menu-state helpers (per spec) ──────────────────────────────────────
+
+def get_menu_state(chat_id: str | int) -> Optional[dict]:
+    """Return {message_id, view, ts} for the active menu message, or None."""
+    return _menu_state_get(chat_id)
+
+
+def save_menu_state(chat_id: str | int, message_id: int,
+                    last_menu: str = "main") -> None:
+    """Persist the active menu message_id + last menu view."""
+    _menu_state_save(chat_id, message_id, view=last_menu)
+
+
+def result_keyboard(back_to: str = "main") -> dict:
+    """Return a single-row [Back to Menu] inline keyboard."""
+    target = "menu:main" if back_to == "main" else f"nav:{back_to}"
+    return make_keyboard([[("◀ Back to Menu", target)]])
 
 
 # ── High-level menu rendering (edit-in-place; resend only when needed) ────────
 
-async def show_menu(chat_id: str | int, text: str, kb: dict, *,
-                    msg_id: Optional[int] = None, view: str = "") -> int:
+async def send_or_edit_menu(chat_id: str | int, text: str, keyboard: dict,
+                            menu_name: str = "main",
+                            preferred_message_id: Optional[int] = None) -> int:
     """
-    Render a menu in place if possible, otherwise send a fresh menu.
-    Updates the persisted active-menu-message-id state.
+    Render a menu, preferring to edit an existing menu message in place.
 
-    msg_id: if provided (e.g. from a callback), edit that message first.
-            Otherwise read the persisted active menu id and edit that.
-            On any edit failure, send a new message and update state.
+    Tries (in order):
+      1. preferred_message_id (e.g. message_id from a callback)
+      2. saved active menu_message_id from menu_state.json
+
+    On edit failure (message gone, too old, etc.), sends a fresh message
+    and updates state. Always logs mode=edit or mode=send.
     """
-    target_id = msg_id or (_menu_state_get(chat_id) or {}).get("message_id")
+    target_id = preferred_message_id or (
+        (get_menu_state(chat_id) or {}).get("message_id")
+    )
     if target_id:
-        ok = await edit_msg(chat_id, int(target_id), text, kb)
+        ok = await edit_msg(chat_id, int(target_id), text, keyboard)
         if ok:
-            log(f"menu mode=edit message_id={target_id} view={view!r}")
-            _menu_state_save(chat_id, int(target_id), view=view or "menu")
+            log(f"menu mode=edit message_id={target_id} view={menu_name!r}")
+            save_menu_state(chat_id, int(target_id), last_menu=menu_name)
             return int(target_id)
-        # edit failed (message gone, too old, etc.) — fall through to send
+        # fall through to send
 
-    new_id = await send(chat_id, text, kb)
+    new_id = await send(chat_id, text, keyboard)
     if new_id:
-        log(f"menu mode=send message_id={new_id} view={view!r}")
-        _menu_state_save(chat_id, int(new_id), view=view or "menu")
+        log(f"menu mode=send message_id={new_id} view={menu_name!r}")
+        save_menu_state(chat_id, int(new_id), last_menu=menu_name)
         return int(new_id)
     return 0
+
+
+async def show_action_result(chat_id: str | int, result: str, *,
+                              back_to: str = "main",
+                              preferred_message_id: Optional[int] = None,
+                              view: str = "result") -> None:
+    """
+    Render a command/action result via the menu message.
+
+    SHORT (≤ SHORT_RESULT_MAX = 3500): edit the active menu message in
+    place with the result + Back-to-Menu keyboard. No new message sent.
+
+    LONG (> SHORT_RESULT_MAX): send the long result as one separate
+    message, then EDIT the menu message to "Result sent above" + Back/Main
+    keyboard. The menu message stays as the navigation anchor at its
+    original position; we never spawn a fresh menu just because the result
+    was long.
+    """
+    if not result:
+        result = "(no result)"
+    text = result.strip()
+    back_kb = result_keyboard(back_to=back_to)
+
+    target_id = preferred_message_id or (
+        (get_menu_state(chat_id) or {}).get("message_id")
+    )
+
+    # ── Short path: edit menu with the result itself ──────────────────────
+    if len(text) <= SHORT_RESULT_MAX:
+        if target_id:
+            ok = await edit_msg(chat_id, int(target_id), text, back_kb)
+            if ok:
+                log(f"menu mode=edit message_id={target_id} view={view!r} (result short)")
+                save_menu_state(chat_id, int(target_id), last_menu=view)
+                return
+        # No menu to edit → result becomes the new menu anchor
+        new_id = await send(chat_id, text, back_kb)
+        if new_id:
+            log(f"menu mode=send message_id={new_id} view={view!r} (result short)")
+            save_menu_state(chat_id, int(new_id), last_menu=view)
+        return
+
+    # ── Long path: send result as a separate message, park the menu ───────
+    await send(chat_id, text)
+    log(f"result long len={len(text)} view={view!r} — sent separate + parking menu")
+    parked_text = (
+        "📨 <b>Result sent above</b> ⬆\n"
+        f"<i>(view: {view})</i>"
+    )
+    if target_id:
+        ok = await edit_msg(chat_id, int(target_id), parked_text, back_kb)
+        if ok:
+            log(f"menu mode=edit message_id={target_id} view={view!r} (parked)")
+            save_menu_state(chat_id, int(target_id), last_menu=view)
+            return
+    # No menu → leave a small pointer with the back button
+    new_id = await send(chat_id, parked_text, back_kb)
+    if new_id:
+        log(f"menu mode=send message_id={new_id} view={view!r} (parked)")
+        save_menu_state(chat_id, int(new_id), last_menu=view)
+
+
+# ── Backward-compatible wrappers (kept so older call sites still work) ───────
+
+async def show_menu(chat_id: str | int, text: str, kb: dict, *,
+                    msg_id: Optional[int] = None, view: str = "") -> int:
+    return await send_or_edit_menu(chat_id, text, kb,
+                                   menu_name=view or "menu",
+                                   preferred_message_id=msg_id)
 
 
 async def show_result(chat_id: str | int, result: str, *,
                       msg_id: Optional[int] = None,
                       back_kb: dict = RESULT_KB,
                       view: str = "result") -> None:
-    """
-    Render a command/action result.
-
-    Short results (≤ SHORT_RESULT_MAX) → edit the active menu in place with
-    the result + Back-to-Menu keyboard. No new message is sent.
-
-    Long results → send the result as a separate message (no buttons), then
-    re-render the active menu (edit if possible) so navigation stays at the
-    bottom of the chat.
-    """
-    if not result:
-        result = "(no result)"
-    text = result.strip()
-
-    if len(text) <= SHORT_RESULT_MAX:
-        target_id = msg_id or (_menu_state_get(chat_id) or {}).get("message_id")
-        if target_id:
-            ok = await edit_msg(chat_id, int(target_id), text, back_kb)
-            if ok:
-                log(f"menu mode=edit message_id={target_id} view={view!r} (result)")
-                _menu_state_save(chat_id, int(target_id), view=view)
-                return
-        # No menu to edit or edit failed → send result as a fresh menu-style msg
-        new_id = await send(chat_id, text, back_kb)
-        if new_id:
-            log(f"menu mode=send message_id={new_id} view={view!r} (result)")
-            _menu_state_save(chat_id, int(new_id), view=view)
-        return
-
-    # Long result: send as a plain message, then refresh the menu underneath.
-    await send(chat_id, text)
-    log(f"result long len={len(text)} view={view!r} — sent + refreshing menu")
-    text_m, kb = menu_main()
-    await show_menu(chat_id, text_m, kb, view="main")
+    # back_kb is ignored; show_action_result builds its own
+    await show_action_result(chat_id, result,
+                             preferred_message_id=msg_id, view=view)
 
 
 def menu_main() -> tuple[str, dict]:
@@ -438,11 +500,15 @@ def menu_sales() -> tuple[str, dict]:
         [("📦 All Products",  "do:products"),
          ("✅ Active",         "do:products_active")],
         [("⚠ Needs Update",   "do:products_needs_update"),
-         ("💬 Consult",        "input:consult")],
-        [("👥 Leads",          "do:leads"),
-         ("⏰ Followups",      "do:followups")],
+         ("🚫 Disabled",       "do:products_disabled")],
         [("➕ Add Product",    "input:product_add"),
          ("✏ Update Product", "input:product_update")],
+        [("✅ Verify Product", "input:product_verify"),
+         ("🚫 Disable Product","input:product_disable")],
+        [("💬 Consult",        "input:consult"),
+         ("👥 Leads",          "do:leads")],
+        [("⏰ Followups",      "do:followups"),
+         ("➕ Add Lead",       "input:lead_add")],
         BACK_ROW,
     ])
     return text, kb
@@ -1341,21 +1407,31 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             text, kb = menu_fn()
         else:
             text, kb = menu_main()
-        await show_menu(chat_id, text, kb, msg_id=msg_id, view=val or "main")
+        await send_or_edit_menu(chat_id, text, kb,
+                                menu_name=val or "main",
+                                preferred_message_id=msg_id)
         return
 
     if kind == "menu" and val == "main":
         text, kb = menu_main()
-        await show_menu(chat_id, text, kb, msg_id=msg_id, view="main")
+        await send_or_edit_menu(chat_id, text, kb,
+                                menu_name="main",
+                                preferred_message_id=msg_id)
         return
 
-    # ── Immediate action ──────────────────────────────────────────────────────
+    # ── Immediate action: edit menu with result (or park if long) ─────────────
     if kind == "do":
         try:
             result = await _execute_action(val, chat_id)
         except Exception as e:
             result = f"❌ Action error: {e}"
-        await show_result(chat_id, result, msg_id=msg_id, view=f"do:{val}")
+        # back_to: stay in the parent menu where the action was triggered.
+        # We don't know the parent reliably from `do:` data, so default "main".
+        # Telegram users who want to keep navigating tap Back-to-Menu.
+        await show_action_result(chat_id, result,
+                                 preferred_message_id=msg_id,
+                                 view=f"do:{val}",
+                                 back_to="main")
         return
 
     # ── Input required: edit menu with prompt + Cancel button ─────────────────
@@ -1382,9 +1458,13 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
         _session_save(val, prompt)
         log(f"pending_input={val} chat_id={chat_id}")
         cancel_kb = make_keyboard([[("❌ Cancel", "menu:main")]])
-        await show_menu(chat_id,
-                        f"{prompt}\n\n<i>Send /cancel to abort.</i>",
-                        cancel_kb, msg_id=msg_id, view=f"input:{val}")
+        await send_or_edit_menu(
+            chat_id,
+            f"{prompt}\n\n<i>Send /cancel to abort.</i>",
+            cancel_kb,
+            menu_name=f"input:{val}",
+            preferred_message_id=msg_id,
+        )
         return
 
     # ── Confirm dangerous actions ─────────────────────────────────────────────
@@ -1394,10 +1474,14 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
                 [("✅ Yes, restart", "do:restart_bot"),
                  ("❌ Cancel",       "menu:main")],
             ])
-            await show_menu(chat_id,
-                            "⚠️ <b>Restart tiktok-bot?</b>\n"
-                            "This will briefly drop the TikTok session.",
-                            confirm_kb, msg_id=msg_id, view="confirm:restart_bot")
+            await send_or_edit_menu(
+                chat_id,
+                "⚠️ <b>Restart tiktok-bot?</b>\n"
+                "This will briefly drop the TikTok session.",
+                confirm_kb,
+                menu_name="confirm:restart_bot",
+                preferred_message_id=msg_id,
+            )
         return
 
 
@@ -1509,16 +1593,16 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
 
     if cmd in ("/start", "/help"):
         text_m, kb = menu_main()
-        await show_menu(chat_id, text_m, kb, view="main")
+        await send_or_edit_menu(chat_id, text_m, kb, menu_name="main")
         return ""
     if cmd == "/menu":
         text_m, kb = menu_main()
-        await show_menu(chat_id, text_m, kb, view="main")
+        await send_or_edit_menu(chat_id, text_m, kb, menu_name="main")
         return ""
     if cmd == "/cancel":
         _session_clear()
         text_m, kb = menu_main()
-        await show_menu(chat_id, text_m, kb, view="main")
+        await send_or_edit_menu(chat_id, text_m, kb, menu_name="main")
         log("cancel: pending input cleared, menu refreshed")
         return ""
 
@@ -1681,13 +1765,14 @@ async def bot_loop() -> None:
                 log(f"file_recv chat_id={chat_id}")
                 try:
                     reply = await handle_file_message(msg, chat_id)
-                    await send(chat_id, reply)
+                    await show_action_result(chat_id, reply, view="file_upload")
                     log_action(user="tg_admin", action="file_upload", channel="telegram",
                                risk_level="low", status="ok", result_summary=reply[:100])
                 except Exception as e:
                     log(f"file error: {e}")
                     try:
-                        await send(chat_id, f"❌ File error: {e}")
+                        await show_action_result(chat_id, f"❌ File error: {e}",
+                                                  view="file_error")
                     except Exception:
                         pass
                 continue
@@ -1702,26 +1787,30 @@ async def bot_loop() -> None:
                 log(f"pending_input action={pending_action} text={text[:40]!r}")
                 try:
                     reply = await handle_pending_input(pending_action, text, chat_id)
-                    # Show result via menu (edit if short, send + refresh if long)
-                    await show_result(chat_id, reply, view=f"input_done:{pending_action}")
+                    # Show result via menu (edit if ≤3500, send + park if long)
+                    await show_action_result(chat_id, reply,
+                                             view=f"input_done:{pending_action}")
                     log_action(user="tg_admin", action=f"input:{pending_action}",
                                channel="telegram", risk_level="low",
                                status="ok", result_summary=reply[:100])
                 except Exception as e:
                     log(f"pending_input error action={pending_action} err={e}")
-                    await show_result(chat_id, f"❌ Error: {e}",
-                                       view=f"input_error:{pending_action}")
+                    await show_action_result(chat_id, f"❌ Error: {e}",
+                                              view=f"input_error:{pending_action}")
                 continue
 
             # Normal dispatch
             try:
                 reply = await dispatch(text, chat_id)
                 if reply:
-                    # Commands that return content go through show_result (edit menu in place)
-                    await show_result(chat_id, reply,
-                                      view=f"cmd:{text.split()[0]}" if text.startswith("/") else "chat")
+                    # Commands that return content go through show_action_result.
+                    # Short → edits the menu in place. Long → sends one extra
+                    # message and parks the menu with "Result sent above".
+                    await show_action_result(chat_id, reply,
+                                              view=f"cmd:{text.split()[0]}"
+                                              if text.startswith("/") else "chat")
                     if text.startswith("/"):
-                        log(f"cmd_reply cmd={text.split()[0]} via show_result")
+                        log(f"cmd_reply cmd={text.split()[0]} via show_action_result")
                     log_action(
                         user="tg_admin",
                         action=text.split()[0][:30] if text.startswith("/") else "chat",
@@ -1736,7 +1825,7 @@ async def bot_loop() -> None:
             except Exception as e:
                 log(f"dispatch error cmd={text[:30]!r} err={e}")
                 try:
-                    await show_result(chat_id, f"❌ Error: {e}", view="error")
+                    await show_action_result(chat_id, f"❌ Error: {e}", view="error")
                 except Exception:
                     pass
 
