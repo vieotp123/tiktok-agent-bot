@@ -24,6 +24,7 @@ data/coding_bridge.paused
 data/claude_quota.json
 data/pending_actions.json
 data/chat_info.json
+data/workers.json
 data/audit/
 data/telegram/
 *.log

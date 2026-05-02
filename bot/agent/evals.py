@@ -213,6 +213,64 @@ def eval_memory(rep: EvalReport) -> None:
             len(ctx2) < 4000, f"len={len(ctx2)}")
 
 
+def eval_bridge(rep: EvalReport) -> None:
+    """Coding-worker bridge dirty-tree gate.
+
+    Uses an isolated tmp git repo to verify:
+      1. snapshot returns dirty=False on a clean tree.
+      2. snapshot returns dirty=True after a tracked-file edit and lists
+         that file.
+      3. _files_changed_since() reports only paths newly dirty after
+         the snapshot — pre-existing dirty files are excluded.
+    """
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path as _Path
+
+    from bot import coding_worker_bridge as _cwb
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = _Path(td)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "eval",
+               "GIT_AUTHOR_EMAIL": "eval@local",
+               "GIT_COMMITTER_NAME": "eval",
+               "GIT_COMMITTER_EMAIL": "eval@local"}
+        run = lambda *a: subprocess.run(a, cwd=tdp, env=env,
+                                         capture_output=True, text=True,
+                                         timeout=10)
+        run("git", "init", "-q", "-b", "main")
+        (tdp / "a.txt").write_text("one\n")
+        run("git", "add", "a.txt")
+        run("git", "commit", "-q", "-m", "init")
+
+        # Patch REPO so the bridge helpers query our tmp repo
+        original = _cwb.REPO
+        _cwb.REPO = tdp
+        try:
+            snap_clean = _cwb.dirty_tree_snapshot()
+            rep.add("bridge_dirty_clean_tree", "bridge",
+                    snap_clean["dirty"] is False and snap_clean["files"] == [],
+                    f"dirty={snap_clean['dirty']} files={snap_clean['files']}")
+
+            # Introduce one pre-existing dirty file (simulates an
+            # unrelated in-flight edit before the worker starts).
+            (tdp / "a.txt").write_text("two\n")
+            snap_pre = _cwb.dirty_tree_snapshot()
+            rep.add("bridge_dirty_detects_modified", "bridge",
+                    snap_pre["dirty"] is True and "a.txt" in snap_pre["files"],
+                    f"dirty={snap_pre['dirty']} files={snap_pre['files']}")
+
+            # Now simulate the worker ALSO touching a different file.
+            (tdp / "b.txt").write_text("worker output\n")
+            delta = _cwb._files_changed_since(snap_pre)
+            rep.add("bridge_delta_excludes_pre_dirty", "bridge",
+                    delta == ["b.txt"],
+                    f"delta={delta} (must not include a.txt)")
+        finally:
+            _cwb.REPO = original
+
+
 def eval_files_safety(rep: EvalReport) -> None:
     """is_safe_send_path must reject .env / storage_state."""
     from bot.telegram_files import is_safe_send_path
@@ -557,6 +615,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_memory(rep)
     if category in (None, "files"):
         eval_files_safety(rep)
+    if category in (None, "bridge"):
+        eval_bridge(rep)
     if category in (None, "tasks"):
         eval_code_tasks(rep)
     if category in (None, "prompt"):

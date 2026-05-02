@@ -334,6 +334,15 @@ def coding_tool_status() -> str:
         lines.append(f"  fallback_model=<code>{CLAUDE_FALLBACK_MODEL}</code>")
         lines.append(f"  auth_test=<code>{probe['auth']}</code>")
         lines.append(f"  non_interactive=<code>{nonint}</code>")
+        snap = dirty_tree_snapshot()
+        lines.append(f"  dirty_tree=<code>{'true' if snap['dirty'] else 'false'}</code>")
+        lines.append(f"  dirty_files=<code>{len(snap['files'])}</code>")
+        if snap["dirty"]:
+            sample = ", ".join(snap["files"][:3])
+            more   = max(0, len(snap["files"]) - 3)
+            extra  = f" (+{more} more)" if more else ""
+            lines.append(f"  ⚠ <i>worker will refuse run_once unless "
+                         f"allow_dirty=True. Sample: {sample}{extra}</i>")
     return "\n".join(lines)
 
 
@@ -447,6 +456,53 @@ def _scrub_env() -> dict[str, str]:
     return env
 
 
+# ── Dirty-tree snapshot + delta ───────────────────────────────────────────────
+
+def _working_tree_state() -> set[str]:
+    """Return the set of file paths that differ from HEAD right now.
+
+    Includes both tracked-modified (`git diff --name-only HEAD`) and
+    untracked-but-not-gitignored files (`git ls-files -o --exclude-standard`).
+    Pure-ignored noise like `data/` is intentionally excluded so that
+    runtime state never trips the dirty-tree gate.
+    """
+    paths: set[str] = set()
+    a = subprocess.run(["git", "-C", str(REPO), "diff", "--name-only", "HEAD"],
+                       capture_output=True, text=True, timeout=10)
+    for ln in a.stdout.splitlines():
+        ln = ln.strip()
+        if ln:
+            paths.add(ln)
+    b = subprocess.run(["git", "-C", str(REPO), "ls-files",
+                        "-o", "--exclude-standard"],
+                       capture_output=True, text=True, timeout=10)
+    for ln in b.stdout.splitlines():
+        ln = ln.strip()
+        if ln:
+            paths.add(ln)
+    return paths
+
+
+def dirty_tree_snapshot() -> dict:
+    """Capture working-tree state for use as a pre-run baseline.
+
+    Returns {"dirty": bool, "files": list[str], "head": str}.
+    """
+    files = sorted(_working_tree_state())
+    head  = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=5
+                           ).stdout.strip()
+    return {"dirty": bool(files), "files": files, "head": head}
+
+
+def _files_changed_since(snapshot: dict) -> list[str]:
+    """Files that differ from HEAD now but did NOT differ in `snapshot`.
+    These are exactly the paths the worker is responsible for."""
+    before = set(snapshot.get("files") or [])
+    after  = _working_tree_state()
+    return sorted(after - before)
+
+
 # ── Forbidden-path enforcement before commit ──────────────────────────────────
 
 def _staged_paths() -> list[str]:
@@ -471,11 +527,18 @@ def _filter_forbidden_staged() -> list[str]:
 
 # ── Main: run_once ────────────────────────────────────────────────────────────
 
-async def run_once(*, dry_run: bool = False, user: str = "tg_admin"
-                   ) -> dict:
+async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
+                   allow_dirty: bool = False) -> dict:
     """Pick next queued code_task, execute it via the preferred CLI, run
     tests, commit/push on green, mark task accordingly. Returns a summary
-    dict suitable for `format_run_result()`."""
+    dict suitable for `format_run_result()`.
+
+    When the working tree already has uncommitted edits, run is refused
+    with status=dirty_tree unless `allow_dirty=True`. The task remains
+    queued so the admin can stash/commit and retry without losing it.
+    Only files the worker actually changed are staged at commit time —
+    pre-existing dirty files never get swept into the worker commit.
+    """
     from bot.code_tasks import (next_queued_task, get_task,
                                  update_task as code_update,
                                  finish_task as code_finish,
@@ -540,6 +603,30 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin"
         out["summary"] = (f"{tool.name} is installed but interactive-only "
                           f"({why}). Open a terminal and run the worker "
                           f"manually with the saved prompt.")
+        return out
+
+    # ── 2.5 Dirty-tree gate ──────────────────────────────────────────────
+    # If the working tree is already dirty, refuse to run by default.
+    # Otherwise the bridge would sweep unrelated in-flight edits into
+    # the worker's commit (root cause of the bb48c37/55e9579 incidents).
+    pre_snapshot = dirty_tree_snapshot()
+    out["dirty_tree_before"] = pre_snapshot["dirty"]
+    out["dirty_files_before"] = list(pre_snapshot["files"])
+    if pre_snapshot["dirty"] and not allow_dirty:
+        # Leave the task queued so admin can stash/commit and retry.
+        # Don't mark it failed.
+        sample = pre_snapshot["files"][:5]
+        more   = max(0, len(pre_snapshot["files"]) - 5)
+        out["status"]  = "dirty_tree"
+        out["summary"] = (
+            f"refused: working tree has {len(pre_snapshot['files'])} "
+            f"uncommitted file(s). "
+            f"Sample: {sample}{f' (+{more} more)' if more else ''}. "
+            f"Commit/stash them or call run_once(allow_dirty=True)."
+        )
+        log_action(user=user, action="code_worker_dirty_tree_refused",
+                   risk_level="low", status="ok",
+                   result_summary=f"task={nx['id']} dirty={len(pre_snapshot['files'])}")
         return out
 
     # ── 3. Ensure prompt exists ──────────────────────────────────────────
@@ -670,19 +757,22 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin"
         return out
 
     # ── 7. Commit + push ─────────────────────────────────────────────────
-    diff = subprocess.run(["git", "-C", str(REPO), "status", "--short"],
-                          capture_output=True, text=True, timeout=10)
-    if not diff.stdout.strip():
+    # Stage only the paths the worker itself changed (delta vs the
+    # pre-run snapshot). When allow_dirty=True the snapshot may have
+    # contained unrelated dirty files; those are still excluded so the
+    # commit stays scoped to this task.
+    worker_changed = _files_changed_since(pre_snapshot)
+    out["worker_changed"] = list(worker_changed)
+    if not worker_changed:
         out["status"]  = "no_changes"
         out["summary"] = (f"worker exited cleanly but produced NO file "
-                          f"changes. Log: {log_path.name}")
+                          f"changes vs pre-run snapshot. "
+                          f"Log: {log_path.name}")
         code_finish(nx["id"], commit_hash="",
                     test_summary="no-op worker run; smoke+evals OK")
         return out
 
-    subprocess.run(["git", "-C", str(REPO), "add",
-                    "bot", "docs", "scripts", "research", "README.md",
-                    ".gitignore"],
+    subprocess.run(["git", "-C", str(REPO), "add", "--"] + worker_changed,
                    capture_output=True, text=True, timeout=10)
     bad = _filter_forbidden_staged()
     if bad:
@@ -788,7 +878,8 @@ def format_run_result(r: dict) -> str:
             "evals_failed": "🚫", "no_changes": "💤", "noop": "💤",
             "exec_error": "💥", "commit_failed": "💥",
             "push_failed": "💥", "no_push_token": "🔒",
-            "blocked_staged": "🚫", "dry_run": "🔍"}.get(r.get("status",""), "•")
+            "blocked_staged": "🚫", "dry_run": "🔍",
+            "dirty_tree": "🧹"}.get(r.get("status",""), "•")
     parts = [f"{icon} <b>code_worker_run_once</b> — "
              f"<i>{r.get('status','?')}</i>"]
     if r.get("task_id"):
