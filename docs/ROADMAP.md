@@ -18,6 +18,13 @@ Tracked sequentially. The agent's `/agent_next` command surfaces the
 - [x] Code task queue (`bot/code_tasks.py`)
 - [x] Planner / executor / risk / self_check / worker_roles modules
 - [x] Backup + smoke + deploy + rollback scripts
+- [x] Task lifecycle state machine (`bot/agent/task_lifecycle.py`)
+- [x] Structured planner v2 with per-step risk/test/expected_output
+- [x] Prompt builder for Claude/Codex coding sessions
+- [x] Eval harness (72 evals across 9 categories) wired to `/agent_evals`
+- [x] `/agent_status` + `/agent_metrics` observability dashboards
+- [x] Permission session grants (`/grant_session` / `/revoke_session`)
+- [x] Self-improve run-once loop (`/self_improve_once`)
 
 ## Now
 

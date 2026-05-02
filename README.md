@@ -136,9 +136,18 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 /code_status /code_worker_run_once /code_worker_pause /code_worker_resume
 
 # Self-operating agent
-/agent_plan <goal>     # planner only, no execution
-/agent_run <goal>      # low-risk auto-runs; medium/high → pending_action
-/agent_health /agent_policy /agent_workers /agent_next
+/agent_plan <goal>          # planner only (text), no execution
+/agent_plan_json <goal>     # structured plan v2 (plan_id, steps, tests)
+/agent_run <goal>           # low-risk auto-runs; medium/high → pending_action
+/agent_health /agent_status /agent_metrics
+/agent_policy /agent_workers /agent_next /agent_evals
+/make_prompt <description>  # draft a Claude prompt for a code task
+/self_improve_once          # run-once: queue next roadmap item / surface queue
+
+# Permission sessions
+/permissions
+/grant_session <scope> <minutes>     # low_only|low_medium|code_low_medium|admin_readonly
+/revoke_session
 
 # Audit / agent
 /audit_recent /agent_blueprint /workers

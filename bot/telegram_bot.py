@@ -1520,18 +1520,127 @@ def handle_agent_workers() -> str:
 
 
 def handle_agent_next() -> str:
-    """Suggest the next mission based on roadmap."""
+    """Suggest the next 3 missions based on the roadmap."""
     p = Path("/opt/tiktok-bot/docs/ROADMAP.md")
     if not p.exists():
         return ("<b>➡ Next mission</b>\n"
                 "Roadmap not available. See docs/CURRENT_STATUS.md.")
     txt = p.read_text(encoding="utf-8")
-    # Find first un-checked item
     import re
-    m = re.search(r"^- \[ \] (.+)$", txt, re.MULTILINE)
-    if not m:
+    items = re.findall(r"^- \[ \] (.+)$", txt, re.MULTILINE)
+    if not items:
         return "<b>➡ Next mission</b>\nNo unchecked items in ROADMAP.md."
-    return f"<b>➡ Next mission</b>\n• {_esc(m.group(1))}"
+    lines = ["<b>➡ Next missions</b>"]
+    for i, it in enumerate(items[:3], 1):
+        lines.append(f"{i}. {_esc(it)}")
+    return "\n".join(lines)
+
+
+async def handle_agent_plan_json(goal: str) -> str:
+    """Return the structured plan as readable JSON + summary."""
+    goal = goal.strip()
+    if not goal:
+        return "Usage: /agent_plan_json &lt;goal&gt;"
+    from bot.agent.planner import plan_goal
+    plan = plan_goal(goal)
+    # Compact summary up top, then JSON in <pre>
+    import json as _json
+    head = (f"<b>🧭 Plan</b> <code>{plan['plan_id']}</code> · "
+            f"risk=<b>{plan['risk_level']}</b> · "
+            f"role=<code>{plan['model_role']}</code> · "
+            f"steps={len(plan['steps'])}\n"
+            f"<i>{_esc(plan.get('rationale','')[:160])}</i>")
+    body = _json.dumps(plan, ensure_ascii=False, indent=2)
+    return f"{head}\n<pre>{_esc(body)[:3000]}</pre>"
+
+
+async def handle_agent_status() -> str:
+    from bot.agent.self_check import run_agent_status
+    return await run_agent_status()
+
+
+async def handle_agent_metrics() -> str:
+    from bot.agent.self_check import run_agent_metrics
+    return await run_agent_metrics()
+
+
+async def handle_agent_evals() -> str:
+    from bot.agent.evals import run_all_evals, format_report
+    rep = await run_all_evals()
+    return format_report(rep, html=True)
+
+
+async def handle_make_prompt(spec: str) -> str:
+    """/make_prompt <description> — generate a Claude prompt for a
+    candidate code task and save it under data/code_prompts/.
+    Does NOT enqueue the task automatically."""
+    spec = spec.strip()
+    if not spec:
+        return "Usage: /make_prompt &lt;description&gt;"
+    from bot.agent.prompt_builder import (build_coding_prompt,
+                                            save_prompt_for_task,
+                                            estimate_code_task_risk,
+                                            classify_coding_task)
+    import uuid as _uuid
+    pseudo_id = f"draft_{_uuid.uuid4().hex[:8]}"
+    risk = estimate_code_task_risk(spec)
+    cls  = classify_coding_task(spec)
+    task = {"id": pseudo_id, "title": spec[:100], "description": spec,
+            "risk_level": risk, "branch": "dev-agent"}
+    prompt = build_coding_prompt(task)
+    path = save_prompt_for_task(pseudo_id, prompt)
+    log_action(user="tg_admin", action="make_prompt", risk_level="low",
+               status="ok", result_summary=f"id={pseudo_id} risk={risk}")
+    return (f"📝 <b>Prompt drafted</b> <code>{pseudo_id}</code>\n"
+            f"Class: {cls} · Risk: <b>{risk}</b>\n"
+            f"File: <code>{path}</code> ({len(prompt)} chars)\n\n"
+            "Use /code_task to actually queue the task; the worker will "
+            "regenerate the prompt with the real task_id.")
+
+
+async def handle_self_improve_once() -> str:
+    from bot.agent.self_improve import (self_improve_once,
+                                          format_self_improve_report)
+    result = self_improve_once(user="tg_admin")
+    log_action(user="tg_admin", action="self_improve_once",
+               risk_level="low", status="ok",
+               result_summary=f"status={result.get('status','?')}")
+    return format_self_improve_report(result)
+
+
+# ── Permission sessions ───────────────────────────────────────────────────────
+
+def handle_permissions_view() -> str:
+    from bot.agent.sessions import format_session_panel
+    return format_session_panel()
+
+
+def handle_grant_session(spec: str) -> str:
+    """/grant_session <scope> <minutes>"""
+    parts = spec.strip().split()
+    if len(parts) != 2:
+        from bot.agent.sessions import VALID_SCOPES
+        return ("Usage: /grant_session &lt;scope&gt; &lt;minutes&gt;\n"
+                f"Scopes: {', '.join(VALID_SCOPES)}")
+    scope, mins = parts[0], parts[1]
+    try:
+        minutes = int(mins)
+    except ValueError:
+        return "❌ minutes must be an integer."
+    from bot.agent.sessions import grant_session, VALID_SCOPES
+    if scope not in VALID_SCOPES:
+        return f"❌ invalid scope. Valid: {', '.join(VALID_SCOPES)}"
+    rec = grant_session(scope, minutes, user="tg_admin")
+    return (f"✅ Session granted: <b>{rec['scope']}</b> for "
+            f"<b>{minutes}</b> min.\n"
+            "<i>High-risk public actions still require /confirm_action.</i>")
+
+
+def handle_revoke_session() -> str:
+    from bot.agent.sessions import revoke_session
+    if revoke_session(user="tg_admin"):
+        return "🚫 Session revoked. Default scope <b>low_only</b> restored."
+    return "(no active session to revoke)"
 
 
 async def handle_run_task(goal: str) -> str:
@@ -2004,12 +2113,22 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/code_worker_resume":
         code_resume(); return "▶ Code worker resumed."
     # ── Self-operating agent ──────────────────────────────────────────────
-    if cmd == "/agent_plan":   return await handle_agent_plan(arg)
-    if cmd == "/agent_run":    return await handle_agent_run(arg)
-    if cmd == "/agent_health": return await handle_agent_health()
-    if cmd == "/agent_policy": return handle_agent_policy()
-    if cmd == "/agent_workers":return handle_agent_workers()
-    if cmd == "/agent_next":   return handle_agent_next()
+    if cmd == "/agent_plan":      return await handle_agent_plan(arg)
+    if cmd == "/agent_plan_json": return await handle_agent_plan_json(arg)
+    if cmd == "/agent_run":       return await handle_agent_run(arg)
+    if cmd == "/agent_health":    return await handle_agent_health()
+    if cmd == "/agent_status":    return await handle_agent_status()
+    if cmd == "/agent_metrics":   return await handle_agent_metrics()
+    if cmd == "/agent_policy":    return handle_agent_policy()
+    if cmd == "/agent_workers":   return handle_agent_workers()
+    if cmd == "/agent_next":      return handle_agent_next()
+    if cmd == "/agent_evals":     return await handle_agent_evals()
+    if cmd == "/make_prompt":     return await handle_make_prompt(arg)
+    if cmd == "/self_improve_once": return await handle_self_improve_once()
+    # ── Permission sessions ───────────────────────────────────────────────
+    if cmd == "/permissions":     return handle_permissions_view()
+    if cmd == "/grant_session":   return handle_grant_session(arg)
+    if cmd == "/revoke_session":  return handle_revoke_session()
     if cmd == "/memory_search":    return await handle_memory_search(arg)
     if cmd == "/memory_add":       return await handle_memory_add(arg)
     if cmd == "/memory_forget":    return handle_memory_forget(arg)

@@ -18,6 +18,7 @@ data/business.db
 data/memory_store.db
 data/code_tasks.db
 data/code_tasks.paused
+data/code_prompts/
 data/pending_actions.json
 data/chat_info.json
 data/audit/

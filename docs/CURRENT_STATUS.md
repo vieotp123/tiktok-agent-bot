@@ -1,6 +1,40 @@
 # Current Status — Business Agent Platform
 
-_Last updated: 2026-05-02 (dev-agent branch — Business Agent v1.5)._
+_Last updated: 2026-05-02 (dev-agent branch — Self-Improving Agent v1)._
+
+## Self-Improving Agent v1 changes
+
+- **Task lifecycle state machine** at `bot/agent/task_lifecycle.py`.
+  Ten states with a table-driven transition validator and per-attempt
+  audit-log entries. `validate_transition`, `transition_task`,
+  `can_auto_execute`, `task_state_summary`, `transition_table`.
+- **Structured planner v2** at `bot/agent/planner.py`. Each plan now
+  carries `plan_id`, `risk_level`, `model_role`, `rationale`,
+  `success_criteria`, `stop_conditions`, and per-step
+  `id` / `title` / `skill` / `args` / `risk_level` / `requires_confirm` /
+  `expected_output` / `test`. Plan-level risk is the max of step risks.
+- **Prompt builder** at `bot/agent/prompt_builder.py`. Generates a
+  10-section markdown Claude/Codex prompt + test plan + final-report
+  template for any coding-task description. Saves long prompts to
+  `data/code_prompts/<id>.md` (gitignored).
+- **Eval harness** at `bot/agent/evals.py`. Nine categories cover
+  router/risk/planner/lifecycle/menu/memory/files/tasks/prompt. **72/72
+  evals pass in <7s**. Wired to `/agent_evals`.
+- **Observability**: `/agent_status` (full dashboard) and
+  `/agent_metrics` (compact one-liner). Both query pending counts,
+  memory counts, last audit lines, last deploy.
+- **Permission sessions** at `bot/agent/sessions.py`. Time-boxed
+  scopes (`low_only`, `low_medium`, `code_low_medium`,
+  `admin_readonly`) with hard-rule kill-list (always-confirm patterns
+  override any granted scope). Commands: `/permissions`,
+  `/grant_session <scope> <minutes>`, `/revoke_session`.
+- **Self-improve loop v1** at `bot/agent/self_improve.py`. Run-once
+  (`/self_improve_once`): reads ROADMAP, checks queue, queues
+  low/medium coding tasks for the Claude/Codex worker, creates
+  pending_action for high-risk roadmap items. **Never edits source
+  from runtime chat model.**
+- **Framework study** updated with full gap analysis and stolen-vs-not
+  patterns from OpenClaw / LangGraph / OpenHands / CrewAI.
 
 ## v1.5 changes
 

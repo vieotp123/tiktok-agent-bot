@@ -155,7 +155,63 @@ use. Chat models never run coding workloads.
 Probes: systemd services, backend `/health` and `/router_status`,
 active model roles, git state, process count, state-file existence.
 
-## 11. Failure handling
+## 11. Eval harness
+
+`bot/agent/evals.py` runs in <10 s and locks invariants across:
+
+- **router** — chat = `cx/gpt-5.5`, coding = Claude.
+- **risk**   — 13 representative goals classified correctly.
+- **planner** — 6 plans each return correct plan-level risk and step IDs.
+- **lifecycle** — valid + invalid transitions match the table.
+- **menu** — every menu builder returns valid keyboard.
+- **memory** — `build_memory_context` respects 6000-char cap and never
+  leaks `payload_json`.
+- **files** — `is_safe_send_path` blocks `.env` / `storage_state` /
+  path traversal.
+- **tasks** — code_task lifecycle on the live DB.
+- **prompt** — prompt_builder produces a complete 10-section markdown.
+
+Wired to `/agent_evals`. Currently **72/72 pass in ~5s**.
+
+## 12. Permission sessions
+
+`bot/agent/sessions.py` lets the admin grant a time-boxed wider scope
+without touching individual `/confirm_action`s. Scopes:
+
+| Scope             | Auto-approves                                   |
+|-------------------|-------------------------------------------------|
+| `low_only`        | low (default)                                   |
+| `low_medium`      | low + medium                                    |
+| `code_low_medium` | low + medium specifically for code_task work    |
+| `admin_readonly`  | low read-only (no writes)                       |
+
+A hard kill-list (`ALWAYS_CONFIRM_HINTS`) overrides any granted scope:
+`post`, `dm khách`, `.env`, `storage_state`, `tiktok_bot.py`, `git push
+to main`, `merge main`, `restart`, `systemctl`, `deploy`, `rollback`,
+`drop table`, `delete from`, `rm -rf`. These ALWAYS require explicit
+`/confirm_action`.
+
+Cap: 240 minutes per grant; default scope is restored on revoke or
+expiry.
+
+## 13. Self-improvement loop v1
+
+`bot/agent/self_improve.py::self_improve_once()` — **run-once**, NOT a
+daemon:
+
+1. Read `docs/CURRENT_STATUS.md` + `docs/ROADMAP.md`.
+2. If a queued low/medium-risk code_task already exists, surface it
+   (and ensure its prompt is saved to `data/code_prompts/<id>.md`).
+3. Else, take the first unchecked roadmap item:
+   - high-risk → create `pending_action` (admin must `/confirm_action`).
+   - low/medium → queue a code_task and generate the prompt.
+4. Send a Telegram report.
+
+This function NEVER edits source code. Coding work is performed by a
+separate Claude/Codex CLI session that picks up queued code_tasks and
+follows `docs/CLAUDE_CODE_WORKER.md`.
+
+## 14. Failure handling
 
 If a phase or test fails twice in a row, **stop that phase** and:
 1. Preserve the current stable state (no partial deploy).
