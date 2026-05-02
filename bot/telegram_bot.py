@@ -16,32 +16,26 @@ from pathlib import Path
 from typing import Optional
 
 # Owner timezone for friendly display in Telegram panels.
-# muaesim.vn / Chatgibiti is a Japan-eSIM business → default JST.
-# Override via env: OWNER_TIMEZONE=Asia/Ho_Chi_Minh / Asia/Tokyo / etc.
+# Owner's clock shows JST (5:29 AM = UTC 20:29 + 9). They asked to
+# "dừng JST" — meaning drop the literal "JST" label, just render
+# the local clock as plain "5:29 AM". So we keep JST as the default
+# but format without any TZ label. Override via OWNER_TIMEZONE env.
 try:
     from zoneinfo import ZoneInfo
     _OWNER_TZ_NAME = os.getenv("OWNER_TIMEZONE", "Asia/Tokyo")
     _OWNER_TZ = ZoneInfo(_OWNER_TZ_NAME)
-    _OWNER_TZ_LABEL = {
-        "Asia/Tokyo":         "JST",
-        "Asia/Ho_Chi_Minh":   "ICT",
-        "Asia/Bangkok":       "ICT",
-        "Asia/Seoul":         "KST",
-        "Asia/Shanghai":      "CST",
-        "Asia/Singapore":     "SGT",
-    }.get(_OWNER_TZ_NAME, _OWNER_TZ_NAME.split("/")[-1])
 except Exception:
     _OWNER_TZ = timezone.utc
-    _OWNER_TZ_LABEL = "UTC"
+    _OWNER_TZ_NAME = "UTC"
 
 
 def _fmt_iso_local(iso_str: str | None) -> str:
-    """Convert a UTC ISO string into "HH:MM:SS LOCAL (UTC YYYY-MM-DD HH:MM)".
+    """Convert a UTC ISO string into 12-hour AM/PM local time.
 
-    Returns the original string on parse failure so we never crash a
-    panel just because of a bad timestamp. Empty/None input → "".
-    Owner's complaint: "giờ trên noti telegram đó ko chuẩn với giờ
-    thực tế" — UTC strings looked alien at 5 AM JST.
+    Owner request: "chỉ cần ghi AM PM là được". Format:
+        "5:29:17 AM" (no extra labels — owner's clock is local)
+    Returns the original string on parse failure so we never crash
+    a panel just because of a bad timestamp. Empty/None → "".
     """
     if not iso_str:
         return ""
@@ -53,10 +47,41 @@ def _fmt_iso_local(iso_str: str | None) -> str:
         if dt_utc.tzinfo is None:
             dt_utc = dt_utc.replace(tzinfo=timezone.utc)
         dt_local = dt_utc.astimezone(_OWNER_TZ)
-        return (f"{dt_local.strftime('%H:%M:%S')} {_OWNER_TZ_LABEL} "
-                f"<i>({dt_utc.strftime('%m-%d %H:%M')} UTC)</i>")
+        # 12-hour AM/PM, drop leading zero on hour (e.g. "5:29:17 AM")
+        h12 = int(dt_local.strftime("%I"))
+        ampm = dt_local.strftime("%p")
+        return f"{h12}:{dt_local.strftime('%M:%S')} {ampm}"
     except Exception:
         return iso_str
+
+
+def _humanize_age(iso_str: str | None) -> str:
+    """Return "Ns ago" / "Nm ago" / "Nh ago" relative to now (UTC).
+
+    Used to show "log gần nhất X giây trước" so admin can tell at a
+    glance if the worker is actually progressing.
+    """
+    if not iso_str:
+        return ""
+    try:
+        s = iso_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt_utc = datetime.fromisoformat(s)
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt_utc
+        secs = int(delta.total_seconds())
+        if secs < 0:
+            secs = 0
+        if secs < 60:
+            return f"{secs}s trước"
+        if secs < 3600:
+            return f"{secs // 60}m {secs % 60}s trước"
+        h, rem = divmod(secs, 3600)
+        return f"{h}h {rem // 60}m trước"
+    except Exception:
+        return ""
 
 import httpx
 from dotenv import load_dotenv
@@ -2132,7 +2157,77 @@ async def handle_agent_progress() -> str:
     except Exception as e:
         lines.append(f"⚠ queue: {_esc(str(e))[:80]}")
 
-    # 5. Last audit lines
+    # 5. "Last activity" — answers owner's question: "có đang làm ko?"
+    # Compute the freshest timestamp across:
+    #   (a) most recent audit log entry
+    #   (b) most recent code worker log file mtime (Claude is writing)
+    #   (c) most recent task updated_at
+    # Surface as "X giây/phút trước" so admin sees at a glance
+    # whether anything moved in the last minute.
+    try:
+        latest_iso: str | None = None
+        latest_label: str = ""
+
+        def _maybe_update(iso: str | None, label: str) -> None:
+            nonlocal latest_iso, latest_label
+            if not iso:
+                return
+            if (latest_iso is None) or (iso > latest_iso):
+                latest_iso = iso
+                latest_label = label
+
+        # (a) audit log — tail_audit returns newest LAST
+        try:
+            from bot.agent.audit_log import tail_audit
+            audit_recent = tail_audit(3)
+            if audit_recent:
+                latest_audit = audit_recent[-1]
+                _maybe_update(latest_audit.get("timestamp"),
+                                f"audit: "
+                                f"{latest_audit.get('action','?')[:30]}")
+        except Exception:
+            pass
+
+        # (b) most recent code worker log file mtime
+        try:
+            from pathlib import Path as _P
+            log_dir = _P("/opt/tiktok-bot/data/code_worker_logs")
+            if log_dir.exists():
+                files = sorted(log_dir.glob("*.log"),
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True)
+                if files:
+                    mtime = datetime.fromtimestamp(
+                        files[0].stat().st_mtime, tz=timezone.utc)
+                    _maybe_update(
+                        mtime.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        f"worker log: {files[0].name[:30]}")
+        except Exception:
+            pass
+
+        # (c) most recent code_task updated_at
+        try:
+            tasks = code_list_tasks(limit=20)
+            for t in tasks:
+                u = t.get("updated_at") or t.get("created_at")
+                if u:
+                    _maybe_update(u,
+                                    f"task {t.get('id','?')}: "
+                                    f"{t.get('status','?')}")
+                    break
+        except Exception:
+            pass
+
+        if latest_iso:
+            lines.append("")
+            lines.append(
+                f"<b>⏱ Hoạt động gần nhất:</b> "
+                f"{_humanize_age(latest_iso)} "
+                f"(<i>{_esc(latest_label[:60])}</i>)")
+    except Exception:
+        pass
+
+    # 6. Last audit lines (history)
     try:
         from bot.agent.audit_log import tail_audit
         recent = tail_audit(3)
