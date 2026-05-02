@@ -1816,6 +1816,24 @@ async def handle_agent_autorun_start(arg: str = "",
                   auto_self_improve=auto_self_improve)
     mode_label = ("self-improve (auto-populate từ roadmap)"
                    if auto_self_improve else "owner-directed")
+
+    # Spawn the actual pump loop in background. Without this, start()
+    # only sets state and nothing drives advance_one — the loop only
+    # wakes up when claude_quota._on_due fires (i.e. on quota reset),
+    # which means autorun starts in name only and never makes progress
+    # while Claude is available. The pump loop sleeps when paused and
+    # exits cleanly when is_due_to_stop returns True or admin stops.
+    async def _autorun_report(text: str) -> None:
+        try:
+            await send_chat_reply(TG_ADMIN, text)
+        except Exception:
+            pass
+    asyncio.create_task(
+        _aa.pump_loop(user="tg_admin",
+                       report_callback=_autorun_report,
+                       poll_interval_sec=8.0),
+    )
+
     return (f"🟢 <b>Agent Autorun started</b>\n"
             f"Mode: <b>{mode_label}</b>\n"
             f"Thời lượng: <b>{d['hours']}h</b> · "

@@ -380,6 +380,118 @@ def status_panel_vi() -> str:
 
 # ── Scheduler hook ────────────────────────────────────────────────────────────
 
+async def pump_loop(user: str = "tg_admin",
+                     report_callback=None,
+                     poll_interval_sec: float = 5.0) -> None:
+    """Continuously call advance_one() until is_due_to_stop() returns True.
+
+    Designed to be spawned as `asyncio.create_task(pump_loop(...))` from
+    the Telegram handler when admin starts autorun. Sends each task
+    result to report_callback (typically a wrapper around
+    send_chat_reply). Sleeps poll_interval_sec between cycles so we
+    don't hammer the bridge.
+
+    Pause behaviour:
+      - When advance_one returns a paused status (quota_limited /
+        auth_required / no_tool / interactive_only), the autorun state
+        records paused_reason + next_probe_at. The pump loop then
+        sleeps until next_probe_at and retries.
+      - The claude_quota scheduler tick may also pump us in parallel
+        when reset_at arrives — record_outcome is idempotent so the
+        race is safe.
+
+    Stop conditions (mirrors is_due_to_stop):
+      - state.enabled flipped to False (admin /agent_autorun_stop)
+      - stop_at reached (hours budget exhausted)
+      - completed_tasks >= max_tasks
+      - 2 consecutive non-quota failures
+    """
+    import asyncio as _asy
+
+    while True:
+        # Check stop conditions
+        should_stop, reason = is_due_to_stop()
+        if should_stop:
+            stop(user="autorun_pump", reason=reason)
+            if report_callback:
+                try:
+                    await report_callback(
+                        f"⏹ <b>Agent Autorun stopped</b> — {_esc(reason)}",
+                    )
+                except Exception:
+                    pass
+            return
+
+        # Honor pause window — don't pump if next_probe_at hasn't arrived
+        if not can_probe_now():
+            d = state()
+            nxt = d.get("next_probe_at") or ""
+            if report_callback:
+                try:
+                    await report_callback(
+                        f"⏸ Autorun paused (<i>{_esc(d.get('paused_reason',''))}</i>) "
+                        f"— probe lại lúc <code>{nxt}</code>",
+                    )
+                except Exception:
+                    pass
+            # Sleep in 30s chunks so admin stop is detected promptly
+            await _asy.sleep(30)
+            continue
+
+        # Run one bridge cycle
+        try:
+            result = await advance_one(user=user)
+        except Exception as e:
+            # Defensive — never let one bridge error kill the loop.
+            try:
+                from bot.agent.audit_log import log_action
+                log_action(user=user, action="agent_autorun_advance_error",
+                           risk_level="medium", status="ok",
+                           result_summary=f"err={str(e)[:140]}")
+            except Exception:
+                pass
+            if report_callback:
+                try:
+                    await report_callback(
+                        f"⚠ Autorun cycle error: <code>{_esc(str(e))[:160]}</code>"
+                        f"\nĐang sleep 30s rồi thử lại.",
+                    )
+                except Exception:
+                    pass
+            await _asy.sleep(30)
+            continue
+
+        # Report result to admin
+        if report_callback:
+            try:
+                rstatus = (result or {}).get("status", "?")
+                tid     = (result or {}).get("task_id", "")
+                summ    = ((result or {}).get("summary") or "")[:200]
+                d = state()
+                done   = d.get("completed_tasks", 0)
+                cap    = d.get("max_tasks", 0)
+                hdr_icon = {
+                    "done":           "✅",
+                    "no_changes":     "💤",
+                    "noop":           "💤",
+                    "quota_limited":  "🚫",
+                    "auth_required":  "🔒",
+                    "no_tool":        "❌",
+                    "pending_action": "⏸",
+                }.get(rstatus, "•")
+                msg = (f"{hdr_icon} <b>Autorun cycle</b> — task "
+                       f"<code>{_esc(str(tid))}</code> → <i>{_esc(rstatus)}</i>"
+                       f"\n  ✓ {done}/{cap}"
+                       + (f"\n  <i>{_esc(summ)}</i>" if summ else ""))
+                await report_callback(msg)
+            except Exception:
+                pass
+
+        # If paused, the next iteration will catch it via can_probe_now().
+        # Otherwise short sleep to avoid runaway loop on fast no-changes.
+        await _asy.sleep(poll_interval_sec)
+
+
 async def advance_one(user: str = "tg_admin") -> dict:
     """Run exactly one bridge.run_once cycle and update autorun state.
 

@@ -561,6 +561,9 @@ _PATTERNS_AGENT_PROGRESS = (
     _RE(r"\b(đang\s+)?làm\s+(tới|đến)\s+đâu(\s+(rồi|chưa))?\b", re.I),
     _RE(r"\bsao\s+im\s+(vậy|thế)\b", re.I),
     _RE(r"\bxem\s+tiến\s*độ\b", re.I),
+    # "tiến độ sao rồi" / "tiến độ thế nào" / "tiến độ ra sao"
+    _RE(r"\btiến\s*độ\s+(sao|thế\s*nào|ra\s*sao|đâu|tới\s+đâu|đến\s+đâu)",
+        re.I),
     _RE(r"\b(kẹt|stuck)\s+(ở\s+)?đâu", re.I),
     _RE(r"\bagent\s+đang\s+lỗi\s+gì\b", re.I),
     _RE(r"\bbáo\s+tiến\s*độ\b", re.I),
