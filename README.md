@@ -133,7 +133,25 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 # Code Worker (Claude/Codex CLI sessions)
 /code_task <title> | [description] | [low|medium|high] | [priority]
 /code_tasks /code_task_info <id> /code_cancel <id>
-/code_status /code_worker_run_once /code_worker_pause /code_worker_resume
+/code_status
+/code_worker_run_once         # bridge: runs next queued task automatically
+/code_worker_run_batch <n>    # 1..3
+/code_worker_status           # CLI detection + queue + recent logs
+/code_worker_pause /code_worker_resume
+
+# Claude quota scheduler
+/claude_status
+/claude_quota_reset <YYYY-MM-DD HH:MM>     # UTC
+/claude_quota_in <30m|2h30m>
+/claude_limited /claude_available
+/claude_autorun_on [max_tasks]
+/claude_autorun_off
+/agent_autonomy_status
+
+# File Hub 2-way
+/files /file <id> /send_file <id_or_path> /send_photo <id_or_path>
+/code_task_from_file <id> <description>
+/run_task_with_file <id> <goal>
 
 # Self-operating agent
 /agent_plan <goal>          # planner only (text), no execution

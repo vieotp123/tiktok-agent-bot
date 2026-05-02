@@ -5,6 +5,25 @@ picks up coding tasks queued by the Telegram admin via `/code_task`.
 
 **You MUST read this entire file before editing any code.**
 
+## Two ways the worker runs
+
+1. **Manual** — admin runs `claude` / `codex` in a terminal at
+   `/opt/tiktok-bot`, pastes the saved prompt from
+   `data/code_prompts/<task_id>.md`, lets the CLI work, then completes
+   the loop with `python -m bot.code_tasks finish <id> --commit <h>`.
+   This was validated by commit `c5b0e2b`.
+2. **Automated via the bridge** — admin sends `/code_worker_run_once`
+   (or `/code_worker_run_batch <n>`) in Telegram. The bridge
+   (`bot/coding_worker_bridge.py`) detects the CLI, runs it
+   non-interactively with the saved prompt as stdin, captures a
+   sanitised log to `data/code_worker_logs/`, runs smoke + evals,
+   commits + pushes only on green tests, and marks the task done. If
+   the CLI is missing or interactive-only, the bridge returns the
+   manual setup instructions and leaves the task untouched.
+
+The contract below applies in BOTH modes — the bridge enforces the
+hard rules in §3 by unstaging any forbidden path before commit.
+
 ## 0. Where you are
 
 - Branch: `dev-agent` (always — never push to `main`).

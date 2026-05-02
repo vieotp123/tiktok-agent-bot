@@ -54,6 +54,14 @@ try:
 except Exception as _e:
     print(f"[tg] code_tasks init warning: {_e}", flush=True)
 
+# Coding worker bridge + Claude quota scheduler
+from bot import coding_worker_bridge as _cwb
+from bot import claude_quota         as _cq
+try:
+    _cq.start_scheduler_thread()
+except Exception as _e:
+    print(f"[tg] claude_quota scheduler warning: {_e}", flush=True)
+
 from bot.business_store import (
     init_business_db, seed_products_if_empty,
     list_products, add_product, update_product, get_product,
@@ -1472,20 +1480,180 @@ def handle_code_task_add(spec: str) -> str:
 
 
 async def handle_code_run_once() -> str:
-    """Surface the next queued task for the worker. The actual coding work
-    is performed by a separate Claude/Codex CLI session — see
-    docs/CLAUDE_CODE_WORKER.md. This command shows what the worker would
-    pick up next, without running the model in the Telegram process."""
-    if code_is_paused():
-        return "⏸ Code worker is paused. /code_worker_resume to enable."
-    nxt = code_next_task()
-    if not nxt:
-        return "📭 No queued code tasks."
-    return ("<b>🛠 Next code task</b>\n"
-            f"<code>{nxt['id']}</code> — {_esc(nxt['title'])}\n"
-            f"risk={nxt['risk_level']} priority={nxt['priority']}\n\n"
-            "<i>To run: open a Claude/Codex CLI session in /opt/tiktok-bot\n"
-            "and read docs/CLAUDE_CODE_WORKER.md.</i>")
+    """Drive ONE queued code_task end-to-end through the bridge.
+
+    The bridge picks up the next queued task, runs Claude/Codex
+    non-interactively if available, runs smoke + evals, commits and
+    pushes ONLY on green tests. If the local CLI is missing or
+    interactive-only, the bridge returns a clear setup message and
+    leaves the task untouched.
+    """
+    result = await _cwb.run_once(user="tg_admin")
+    return _cwb.format_run_result(result)
+
+
+async def handle_code_run_batch(arg: str) -> str:
+    """/code_worker_run_batch <n>  (n=1..3)"""
+    arg = (arg or "").strip()
+    try:
+        n = int(arg) if arg else 1
+    except ValueError:
+        return "Usage: /code_worker_run_batch &lt;n&gt;  (1..3)"
+    results = await _cwb.run_batch(n, user="tg_admin")
+    if not results:
+        return "💤 No tasks to run."
+    parts = [f"<b>🛠 Batch result ({len(results)})</b>"]
+    for r in results:
+        parts.append(_cwb.format_run_result(r))
+        parts.append("---")
+    return "\n\n".join(parts).rstrip("---\n").rstrip()
+
+
+def handle_code_worker_status() -> str:
+    """Coding-tool detection + bridge state."""
+    parts = [_cwb.coding_tool_status()]
+    parts.append("")
+    parts.append(f"Bridge paused: <b>{'yes' if _cwb.is_paused() else 'no'}</b>")
+    parts.append(code_format_status())
+    logs = _cwb.recent_logs(3)
+    if logs:
+        parts.append("")
+        parts.append("<b>Recent worker logs:</b>")
+        for p in logs:
+            parts.append(f"  <code>{p.name}</code> ({p.stat().st_size//1024}KB)")
+    return "\n".join(parts)
+
+
+async def handle_agent_autonomy_status() -> str:
+    """High-level autonomy dashboard: bridge + sessions + quota +
+    pending actions + worker queue."""
+    from bot.agent.sessions import current_session, current_scope, \
+        remaining_minutes
+    from bot.agent.permissions import list_pending
+
+    parts = ["<b>🤖 Agent Autonomy</b>"]
+    # Coding tool
+    pref = _cwb.get_preferred_coding_tool()
+    if pref:
+        parts.append(f"Coding tool: <code>{pref.name}</code> "
+                     f"({'non-interactive' if pref.noninteractive_ok else 'interactive-only'})")
+    else:
+        parts.append("Coding tool: <b>not installed</b> (manual setup required)")
+    parts.append(f"Bridge paused: <b>{'yes' if _cwb.is_paused() else 'no'}</b>")
+
+    # Session grant
+    s = current_session()
+    if s:
+        parts.append(f"Session: <b>{current_scope()}</b> "
+                     f"({remaining_minutes()} min left)")
+    else:
+        parts.append(f"Session: <b>{current_scope()}</b> (default)")
+
+    # Quota
+    parts.append("")
+    parts.append(_cq.status_summary())
+
+    # Worker queue + pending
+    parts.append("")
+    parts.append(code_format_status())
+    pa = list_pending(only_pending=True)
+    parts.append(f"\nPending actions: <b>{len(pa)}</b>")
+    for p in pa[:3]:
+        parts.append(f"  • <code>{p['action_id']}</code> {p['action']}")
+
+    # Git remote sanity
+    import subprocess
+    try:
+        r = subprocess.check_output(
+            ["git", "-C", "/opt/tiktok-bot", "remote", "-v"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5)
+        clean = "x-access-token" not in r and "ghp_" not in r
+        parts.append(f"\nGit remote clean: <b>{'yes' if clean else 'NO'}</b>")
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
+def handle_claude_quota_reset(arg: str) -> str:
+    if not arg.strip():
+        return ("Usage: /claude_quota_reset &lt;YYYY-MM-DD HH:MM&gt; "
+                "(UTC)\nExample: <code>/claude_quota_reset 2026-05-02 14:30</code>")
+    try:
+        d = _cq.set_reset_at(arg.strip())
+    except Exception as e:
+        return f"❌ {e}"
+    return _cq.status_summary()
+
+
+def handle_claude_quota_in(arg: str) -> str:
+    if not arg.strip():
+        return ("Usage: /claude_quota_in &lt;30m|2h|3h30m&gt;\n"
+                "Example: <code>/claude_quota_in 2h30m</code>")
+    try:
+        d = _cq.set_reset_in(arg.strip())
+    except Exception as e:
+        return f"❌ {e}"
+    return _cq.status_summary()
+
+
+def handle_claude_autorun_on(arg: str) -> str:
+    arg = arg.strip()
+    try:
+        n = int(arg) if arg else 1
+    except ValueError:
+        n = 1
+    _cq.set_autorun(True, max_tasks=n)
+    return _cq.status_summary()
+
+
+def handle_code_task_from_file(spec: str) -> str:
+    """/code_task_from_file <file_id> <description>"""
+    parts = spec.strip().split(None, 1)
+    if len(parts) < 2:
+        return ("Usage: /code_task_from_file &lt;file_id&gt; &lt;description&gt;")
+    fid, desc = parts[0], parts[1]
+    rec = get_file_record(fid)
+    if not rec:
+        return f"❌ File <code>{_esc(fid)}</code> not found."
+    excerpt = ""
+    try:
+        from pathlib import Path as _P
+        p = _P(rec["local_path"])
+        if p.exists() and p.stat().st_size <= 50_000:
+            ok, content = read_text_file(rec["local_path"])
+            if ok:
+                excerpt = content[:8000]
+    except Exception:
+        pass
+    description = (
+        f"User attached file <{rec['filename']}> "
+        f"(file_id={fid}, path={rec['local_path']}).\n\n"
+        f"Task: {desc}\n\n"
+    )
+    if excerpt:
+        description += "File excerpt (first 8KB):\n```\n" + excerpt + "\n```"
+    else:
+        description += (f"File too large or non-text — inspect path "
+                        f"{rec['local_path']} during the task.")
+    tid = code_add_task(title=f"[file] {desc[:80]}",
+                        description=description, risk_level="medium",
+                        priority=5, created_by="tg_admin")
+    return (f"✅ Code task <code>{tid}</code> queued from file "
+            f"<code>{fid}</code>.")
+
+
+async def handle_run_task_with_file(spec: str) -> str:
+    """/run_task_with_file <file_id> <goal>  — run goal as a /run_task,
+    passing the file path to the runner via the goal text."""
+    parts = spec.strip().split(None, 1)
+    if len(parts) < 2:
+        return "Usage: /run_task_with_file &lt;file_id&gt; &lt;goal&gt;"
+    fid, goal = parts[0], parts[1]
+    rec = get_file_record(fid)
+    if not rec:
+        return f"❌ File <code>{_esc(fid)}</code> not found."
+    augmented = f"{goal}\n\n[attached file: {rec['local_path']}]"
+    return await handle_run_task(augmented)
 
 
 # ── Self-operating agent handlers ─────────────────────────────────────────────
@@ -2170,10 +2338,26 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
                else f"❌ Code task <code>{arg.strip()}</code> not found."
     if cmd == "/code_status":      return code_format_status()
     if cmd == "/code_worker_run_once": return await handle_code_run_once()
+    if cmd == "/code_worker_run_batch": return await handle_code_run_batch(arg)
+    if cmd == "/code_worker_status":   return handle_code_worker_status()
     if cmd == "/code_worker_pause":
-        code_pause(); return "⏸ Code worker paused."
+        code_pause(); _cwb.pause()
+        return "⏸ Code worker + bridge paused."
     if cmd == "/code_worker_resume":
-        code_resume(); return "▶ Code worker resumed."
+        code_resume(); _cwb.resume()
+        return "▶ Code worker + bridge resumed."
+    # ── Claude quota scheduler ────────────────────────────────────────────
+    if cmd == "/claude_status":        return _cq.status_summary()
+    if cmd == "/claude_quota_reset":   return handle_claude_quota_reset(arg)
+    if cmd == "/claude_quota_in":      return handle_claude_quota_in(arg)
+    if cmd == "/claude_limited":       _cq.set_limited(True);  return _cq.status_summary()
+    if cmd == "/claude_available":     _cq.set_limited(False); return _cq.status_summary()
+    if cmd == "/claude_autorun_on":    return handle_claude_autorun_on(arg)
+    if cmd == "/claude_autorun_off":   _cq.set_autorun(False); return _cq.status_summary()
+    # ── Autonomy + file-hub additions ─────────────────────────────────────
+    if cmd == "/agent_autonomy_status": return await handle_agent_autonomy_status()
+    if cmd == "/code_task_from_file":   return handle_code_task_from_file(arg)
+    if cmd == "/run_task_with_file":    return await handle_run_task_with_file(arg)
     # ── Self-operating agent ──────────────────────────────────────────────
     if cmd == "/agent_plan":      return await handle_agent_plan(arg)
     if cmd == "/agent_plan_json": return await handle_agent_plan_json(arg)

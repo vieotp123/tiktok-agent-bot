@@ -28,15 +28,21 @@ FILES_JSONL   = TELEGRAM_DATA / "files.jsonl"
 
 # Absolute path roots that /send_file is permitted to read from
 ALLOWED_SEND_ROOTS = (
-    "/opt/tiktok-bot/data",
+    "/opt/tiktok-bot/data/telegram/inbox",
+    "/opt/tiktok-bot/data/code_prompts",      # admin can pull a prompt
+    "/opt/tiktok-bot/data/code_worker_logs",  # admin can pull a worker log
     "/opt/tiktok-bot/reports",
     "/opt/tiktok-bot/screenshots",
+    "/opt/tiktok-bot/generated",
+    "/opt/tiktok-bot/docs",
+    "/opt/tiktok-bot/research",
 )
 
 # Substring patterns in *filenames* that block sending
 BLOCKED_PATTERNS = (
     ".env", "storage_state", "tiktok_storage_state",
     "cookies", "private_key", "secret", "token", ".log",
+    "id_rsa", ".pem", ".key", ".p12", "auth.json", "credential",
 )
 
 # Extensions readable for auto-summarisation
@@ -132,11 +138,22 @@ async def download_telegram_file(
         tg_path    = d["result"]["file_path"]
         real_size  = d["result"].get("file_size", size)
 
-        # Step 2: build local path
-        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Hard cap: refuse files > 50 MB to protect the VPS disk and
+        # avoid surprise downloads. Caller will see a clear error.
+        if real_size and real_size > 50 * 1024 * 1024:
+            return {"error": "file_too_large", "size": real_size,
+                    "max": 50 * 1024 * 1024}
+
+        # Step 2: build local path under YYYY/MM/DD partition for tidy
+        # archiving. Filenames stay timestamped + sanitised.
+        now        = datetime.now()
+        ts         = now.strftime("%Y%m%d_%H%M%S")
+        ymd_dir    = INBOX_DIR / now.strftime("%Y") / now.strftime("%m") \
+                     / now.strftime("%d")
+        ymd_dir.mkdir(parents=True, exist_ok=True)
         safe_name  = _safe_filename(filename or f"file_{ts}")
         local_name = f"{ts}_{safe_name}"
-        local_path = INBOX_DIR / local_name
+        local_path = ymd_dir / local_name
 
         # Step 3: download bytes
         async with httpx.AsyncClient(timeout=120) as c:

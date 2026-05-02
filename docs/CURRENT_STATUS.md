@@ -1,12 +1,64 @@
 # Current Status — Business Agent Platform
 
-_Last updated: 2026-05-02 (dev-agent branch — Self-Improving Agent v1)._
+_Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 
 > **Worker validation:** Code worker CLI loop verified end-to-end with
 > task `ctk_a65f61badc` — smoke test, commit, push, finish, and
 > Telegram report all run cleanly via `python -m bot.code_tasks` +
 > `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
 > contract this task exercised.
+
+## Autonomous Control Bridge v1 changes
+
+- **`bot/coding_worker_bridge.py`** — detects `claude` / `codex` CLI on
+  PATH, validates non-interactive support (`claude --print`,
+  `codex exec`), and runs the next queued code_task end-to-end:
+  invoke CLI → capture sanitised log → smoke + evals → unstage any
+  forbidden path (`.env`, `storage_state`, runtime DBs, `.tar.gz`,
+  `.log`, `id_rsa`, `.pem`, cookies) → commit on green → push with
+  inline-token URL → reset remote URL → mark task done.
+- **`bot/claude_quota.py`** — admin-driven quota scheduler at
+  `data/claude_quota.json`. Set reset time via `/claude_quota_reset` or
+  `/claude_quota_in`. Daemon thread (60s tick) sends one notification
+  when due, then optionally fires `run_batch(max_tasks)` if autorun
+  is on AND a non-interactive CLI exists.
+- **File Hub 2-way upgrades** — inbox is now archived under
+  `data/telegram/inbox/YYYY/MM/DD/`. Files >50 MB are refused. Stronger
+  block-pattern list (`id_rsa`, `.pem`, `.key`, `.p12`, `auth.json`,
+  `credential`). New allowed-send roots: `data/code_prompts`,
+  `data/code_worker_logs`, `docs`, `research`, `generated`. New
+  commands: `/code_task_from_file <id> <desc>`, `/run_task_with_file`.
+- **Telegram commands** added:
+  - `/code_worker_run_once`, `/code_worker_run_batch <n>`,
+    `/code_worker_status`, `/code_worker_pause`, `/code_worker_resume`
+  - `/claude_status`, `/claude_quota_reset <YYYY-MM-DD HH:MM>`,
+    `/claude_quota_in <duration>`, `/claude_limited`,
+    `/claude_available`, `/claude_autorun_on [n]`, `/claude_autorun_off`
+  - `/agent_autonomy_status` — coding tool + bridge + sessions +
+    quota + queue + pending + git remote sanity
+  - `/code_task_from_file`, `/run_task_with_file`
+
+### Manual setup still required
+
+The bridge **cannot drive Claude/Codex without the CLI installed and
+authenticated**. Today this VPS has neither binary on PATH, so
+`/code_worker_run_once` correctly returns `no_tool` with the install
+instructions. To enable autonomous coding, install one of:
+
+```
+npm install -g @anthropic-ai/claude-code   # preferred
+claude login                                # interactive once
+```
+
+or
+
+```
+npm install -g @openai/codex
+codex login                                 # interactive once
+```
+
+After that, `/code_worker_status` will show the CLI as detected and
+`/code_worker_run_once` will execute the next queued task end-to-end.
 
 ## Self-Improving Agent v1 changes
 
