@@ -148,6 +148,118 @@ async def upload_image_tiktok(page, filepath: str) -> bool:
         return False
 
 
+async def search_web(query: str, max_results: int = 4) -> list[dict]:
+    """
+    Search web via DuckDuckGo HTML endpoint.
+    Returns list of {title, url, snippet} dicts, or [{title:'error',...}] on failure.
+    Never invents links — all URLs come directly from DDG response.
+    """
+    import re
+    from urllib.parse import unquote
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "vi,en;q=0.9",
+    }
+
+    def strip_tags(s: str) -> str:
+        s = re.sub(r"<[^>]+>", "", s)
+        for ent, ch in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                        ("&#x27;", "'"), ("&quot;", '"'), ("&nbsp;", " ")]:
+            s = s.replace(ent, ch)
+        return s.strip()
+
+    def extract_url(href: str) -> str:
+        """Resolve DDG redirect URL to real URL."""
+        if "uddg=" in href:
+            m = re.search(r"uddg=([^&\"]+)", href)
+            if m:
+                return unquote(m.group(1))
+        if href.startswith("//"):
+            return "https:" + href
+        return href
+
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+            r = await c.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers=headers,
+            )
+        html = r.text
+
+        # Extract all title anchors and snippets in document order
+        anchors = re.findall(
+            r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html, re.S,
+        )
+        snippets_raw = re.findall(
+            r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+            html, re.S,
+        )
+
+        results: list[dict] = []
+        for i, (href, title_html) in enumerate(anchors[:max_results]):
+            url = extract_url(href)
+            title = strip_tags(title_html)
+            snippet = strip_tags(snippets_raw[i]) if i < len(snippets_raw) else ""
+            if title:
+                results.append({"title": title, "url": url, "snippet": snippet})
+
+        return results if results else [
+            {"title": "no_results", "url": "", "snippet": "Không tìm thấy kết quả."}
+        ]
+
+    except Exception as e:
+        return [{"title": "search_error", "url": "", "snippet": f"Lỗi tìm kiếm: {e}"}]
+
+
+def format_search_results(results: list[dict]) -> str:
+    """Format search results as a compact context string for LLM."""
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r['title']}")
+        if r.get("snippet"):
+            lines.append(f"    {r['snippet']}")
+        if r.get("url"):
+            lines.append(f"    {r['url']}")
+    return "\n".join(lines)
+
+
+def is_search_query(text: str) -> bool:
+    """Detect search intent keywords."""
+    keywords = [
+        "tìm kiếm", "tìm thông tin", "tìm hiểu",
+        "search", "mới nhất", "tin mới", "tin tức",
+        "trend", "thông tin về", "cho tao biết về",
+        "tìm về", "news về", "update về",
+    ]
+    t = text.lower()
+    # Also catch short "tìm X" patterns
+    if re.search(r'^tìm\s+\w', t):
+        return True
+    return any(k in t for k in keywords)
+
+
+def extract_search_query(text: str) -> str:
+    """Strip intent keywords to get clean search query."""
+    t = text.strip()
+    prefixes = [
+        "tìm kiếm ", "tìm thông tin về ", "tìm thông tin ",
+        "tìm hiểu về ", "tìm hiểu ", "search ", "tìm về ",
+        "thông tin về ", "cho tao biết về ", "tin mới về ",
+        "tin tức về ", "update về ", "news về ", "tìm ",
+    ]
+    tl = t.lower()
+    for p in prefixes:
+        if tl.startswith(p):
+            return t[len(p):].strip()
+    return t
+
+
+import re  # noqa: E402 — used above, re-imported for module-level use
+
+
 def is_btc_query(text: str) -> bool:
     kw = ["btc", "bitcoin", "giá coin", "giá btc", "bitcoin hôm nay", "coin hôm nay"]
     t = text.lower()

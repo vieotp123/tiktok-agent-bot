@@ -17,7 +17,10 @@ from bot.memory import (
     get_memory_summary, forget_user,
 )
 from bot.reminders import add_reminder, parse_reminder_time, format_reminders_list, now_jst
-from bot.tools import get_btc_price, is_btc_query
+from bot.tools import (
+    get_btc_price, is_btc_query,
+    search_web, format_search_results, is_search_query, extract_search_query,
+)
 
 app = FastAPI(title="TikTok Bot Backend")
 
@@ -229,6 +232,35 @@ async def handle_message(req: MessageRequest):
         add_message(username, "user", content)
         add_message(username, "assistant", btc)
         return MessageResponse(reply=btc, messages=split_bubbles(btc))
+
+    # Web search
+    if is_search_query(content):
+        q = extract_search_query(content)
+        print(f"[backend] search query={q!r}", flush=True)
+        results = await search_web(q, max_results=4)
+        context = format_search_results(results)
+        # Ask LLM to summarize results in bot's voice
+        search_prompt = (
+            f"User hỏi: \"{content}\"\n\n"
+            f"Kết quả tìm web (DuckDuckGo):\n{context}\n\n"
+            "Tóm tắt bằng tiếng Việt, ngắn gọn tự nhiên như bạn thân. "
+            "Đừng bịa thêm, dựa trên kết quả trên. "
+            "Nếu không có kết quả hữu ích thì nói thẳng."
+        )
+        mem = format_memory_for_prompt(username)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT + f"\n\nHôm nay: {_now_str()}"}]
+        if mem:
+            messages.append({"role": "system", "content": f"Memory về user:\n{mem}"})
+        messages.append({"role": "user", "content": search_prompt})
+        result = await complete(messages, role="fast", temperature=0.6)
+        if result.get("error"):
+            reply = f"Tìm được nhưng tóm tắt lỗi. Kết quả thô:\n{context[:500]}"
+        else:
+            reply = _strip_banned((result.get("content") or "").strip())
+        add_message(username, "user", content)
+        add_message(username, "assistant", reply)
+        bubbles = split_bubbles(reply)
+        return MessageResponse(reply=reply, messages=bubbles or [reply])
 
     # Reminder
     if is_reminder(content):
