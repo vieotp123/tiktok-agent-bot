@@ -10,5 +10,7 @@ backups/
 screenshots/
 data/uploads/
 data/cache/
+data/memory.json
+data/reminders.json
 *.log
 .DS_Store
