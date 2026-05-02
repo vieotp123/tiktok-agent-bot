@@ -1109,6 +1109,108 @@ async def eval_seo(rep: EvalReport) -> None:
             f"role={seo_role}")
 
 
+async def eval_content_factory(rep: EvalReport) -> None:
+    """Content factory v0 — module hygiene + skill + worker role."""
+    from bot.content_factory import (
+        CAPTION_MAX_CHARS, _build_caption_prompt, _extract_hashtags,
+        _slug, _strip_trailing_hashtags, format_post_vi,
+        generate_image_brief, write_caption,
+    )
+    from bot.agent.skill_registry import get_skill
+    from bot.agent.worker_roles import list_worker_roles
+
+    # _slug stable + capped + non-empty fallback.
+    rep.add("cf_slug_basic", "content_factory",
+            _slug("eSIM Nhật") == "esim-nhật",
+            f"got={_slug('eSIM Nhật')!r}")
+    rep.add("cf_slug_empty", "content_factory",
+            _slug("") == "post", f"got={_slug('')!r}")
+    rep.add("cf_slug_cap", "content_factory",
+            len(_slug("a" * 200)) <= 40, f"len={len(_slug('a' * 200))}")
+
+    # Caption prompt mentions brief, language, no-invent rule.
+    prompt = _build_caption_prompt(
+        "eSIM Nhật 7 ngày 5GB", lang="vi", audience="customer",
+    )
+    rep.add("cf_prompt_brief_in", "content_factory",
+            "eSIM Nhật 7 ngày 5GB" in prompt, "")
+    rep.add("cf_prompt_no_price_invent", "content_factory",
+            "KHÔNG bịa giá" in prompt, "")
+    rep.add("cf_prompt_caption_cap", "content_factory",
+            str(CAPTION_MAX_CHARS) in prompt,
+            f"cap={CAPTION_MAX_CHARS}")
+
+    # Hashtag extractor: order-preserving, case-insensitive dedup.
+    tags = _extract_hashtags(
+        "Hello #esim #Nhật #eSIM #5g 🚀 #esim",
+    )
+    rep.add("cf_hashtags_extracted", "content_factory",
+            tags == ["#esim", "#Nhật", "#5g"],
+            f"got={tags}")
+    rep.add("cf_hashtags_empty_safe", "content_factory",
+            _extract_hashtags("") == [], "")
+
+    # Trailing-hashtag stripper preserves caption body.
+    body = _strip_trailing_hashtags(
+        "Caption thân thiện. CTA gọn.\n#esim #nhat",
+    )
+    rep.add("cf_strip_trailing_tags", "content_factory",
+            body == "Caption thân thiện. CTA gọn.",
+            f"got={body!r}")
+
+    # Empty brief returns a clean error envelope (no LLM call, no raise).
+    out = await write_caption("", lang="vi")
+    rep.add("cf_empty_brief_envelope", "content_factory",
+            out.get("error") is True
+            and out.get("error_detail") == "empty_brief"
+            and out.get("caption") == ""
+            and out.get("hashtags") == [],
+            f"out keys={sorted(out.keys())}")
+
+    # Image brief is deterministic, vertical, no-text overlay, marked ungenerated.
+    img = generate_image_brief("eSIM Nhật", lang="vi")
+    rep.add("cf_image_brief_shape", "content_factory",
+            img.get("generated") is False
+            and img.get("backend") == "placeholder"
+            and "9:16" in img.get("composition", "")
+            and isinstance(img.get("palette"), list),
+            f"img={sorted(img.keys())}")
+
+    # format_post_vi handles empty + populated cases without raising.
+    rep.add("cf_format_empty_safe", "content_factory",
+            "thiếu brief" in format_post_vi({}),
+            "")
+    sample = {
+        "brief":      "eSIM Nhật 7 ngày",
+        "caption":    "Đi Nhật đừng quên eSIM nhé! #esim #nhat",
+        "hashtags":   ["#esim", "#nhat"],
+        "image_brief": img,
+        "model":      "cx/gpt-5.5",
+    }
+    s_out = format_post_vi(sample)
+    rep.add("cf_format_populated", "content_factory",
+            "Caption draft" in s_out and "#esim" in s_out
+            and "Image brief" in s_out,
+            f"len={len(s_out)}")
+
+    # Skill registered, enabled, medium-risk, correct handler.
+    skill = get_skill("content_factory")
+    rep.add("cf_skill_registered", "content_factory",
+            skill is not None and skill.enabled
+            and skill.risk_level == "medium"
+            and skill.handler == "draft_post",
+            f"skill={skill}")
+
+    # Worker role flipped from placeholder → live, on chat model role.
+    cf_role = next((w for w in list_worker_roles()
+                    if w.name == "content_factory"), None)
+    rep.add("cf_worker_role_live", "content_factory",
+            cf_role is not None and cf_role.status == "live"
+            and cf_role.model_role == "chat"
+            and cf_role.risk_level == "medium",
+            f"role={cf_role}")
+
+
 # ── Driver ────────────────────────────────────────────────────────────────────
 
 async def run_all_evals(category: str | None = None) -> EvalReport:
@@ -1154,6 +1256,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_ocr(rep)
     if category in (None, "seo"):
         await eval_seo(rep)
+    if category in (None, "content_factory"):
+        await eval_content_factory(rep)
 
     rep.finished_at = time.time()
     return rep

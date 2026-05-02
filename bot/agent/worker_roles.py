@@ -47,9 +47,10 @@ _ROLES: tuple[WorkerRole, ...] = (
                                        "Autocomplete + DDG (free, no key). "
                                        "See bot/seo_research.py.",
                "internal", "reasoning",     "low",    "live"),
-    WorkerRole("content_factory",      "Caption / image-gen / TikTok post drafter. "
-                                       "Not yet implemented.",
-               "internal", "coding",        "medium", "placeholder"),
+    WorkerRole("content_factory",      "Caption writer (cx/gpt-5.5) + image-brief "
+                                       "stub. Drafts only — never posts. "
+                                       "See bot/content_factory.py.",
+               "internal", "chat",          "medium", "live"),
     WorkerRole("browser_ocr_worker",   "Playwright research + OCR on screenshots. "
                                        "Not yet implemented.",
                "internal", "vision",        "medium", "placeholder"),

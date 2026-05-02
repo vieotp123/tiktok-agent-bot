@@ -218,11 +218,16 @@ register(Skill(
 
 register(Skill(
     name="content_factory",
-    description="[FUTURE] Tạo nội dung bài đăng / caption.",
+    description="Caption writer (cx/gpt-5.5) + image-brief stub. "
+                "Trả draft TikTok post — không tự đăng. v0 read-only.",
     risk_level="medium",
-    enabled=False,
-    handler="content_factory_handler",
-    examples=["viết caption TikTok cho sản phẩm X"],
+    enabled=True,
+    handler="draft_post",
+    examples=[
+        "viết caption TikTok cho gói eSIM Nhật 7 ngày",
+        "draft caption cho sản phẩm X",
+        "/caption eSIM Nhật 5GB",
+    ],
 ))
 
 register(Skill(
