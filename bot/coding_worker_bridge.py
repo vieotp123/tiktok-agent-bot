@@ -949,9 +949,48 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         return out
 
     sha = _short_sha()
+
+    # ── Auto-deploy: hot-reload services if bot/ source code was edited ──
+    # Owner asked: "ủa hiện tại nó chỉ commit thôi chứ ko tự sửa
+    # production à?" — yes the bot was running stale RAM code while
+    # disk had latest. After every successful commit, if any path under
+    # bot/ (or backend/) was committed, schedule a deferred restart of
+    # the relevant systemd services. Use `nohup … &` so the restart
+    # survives the bot process being killed.
+    deploy_summary = ""
+    needs_telegram_restart = any(
+        f.startswith("bot/") for f in worker_changed
+    )
+    needs_backend_restart = any(
+        f.startswith("backend/") for f in worker_changed
+    )
+    services: list[str] = []
+    if needs_telegram_restart:
+        services.append("tiktok-telegram")
+    if needs_backend_restart:
+        services.append("tiktok-backend")
+    if services:
+        try:
+            # 6-second delay so this Telegram message + the autorun
+            # cycle report can be sent BEFORE we kill the process.
+            # Bot runs as root (systemd User=root) so no sudo needed.
+            cmd = (f"sleep 6 && systemctl restart "
+                   f"{' '.join(services)} >/dev/null 2>&1")
+            subprocess.Popen(["nohup", "bash", "-c", cmd],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+            deploy_summary = (
+                f"auto-deploy scheduled: restart {', '.join(services)} "
+                f"in 6s. boot-resume will pick up next autorun cycle."
+            )
+        except Exception as e:
+            deploy_summary = f"auto-deploy schedule failed: {e}"
+
     code_finish(nx["id"], commit_hash=sha,
                 test_summary=f"smoke+evals ok; pushed {sha}",
-                deploy_summary="")
+                deploy_summary=deploy_summary)
     probe = quick_auth_test(tool) if tool.name == "claude" else {}
     actual_model = probe.get("actual_model", "")
     fallback     = probe.get("fallback_used", False)
@@ -960,12 +999,16 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
     out["fallback_used"]  = fallback
     out["status"]  = "done"
     out["commit"]  = sha
+    out["deploy_summary"] = deploy_summary
     model_part = (f" model={actual_model or CLAUDE_CODE_MODEL}"
                   + (" (fallback)" if fallback else ""))
     out["summary"] = (f"worker done. tool={tool.name}{model_part} "
-                      f"duration={duration}s commit={sha} log={log_path.name}")
+                      f"duration={duration}s commit={sha} log={log_path.name}"
+                      + (f" · {deploy_summary}" if deploy_summary else ""))
     log_action(user=user, action="code_worker_done", risk_level="medium",
-               status="done", result_summary=f"task={nx['id']} commit={sha}")
+               status="done",
+               result_summary=f"task={nx['id']} commit={sha} "
+                              f"deploy={'yes' if services else 'no'}")
     return out
 
 
