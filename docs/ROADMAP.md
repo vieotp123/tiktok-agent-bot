@@ -1,7 +1,9 @@
 # Roadmap
 
 Tracked sequentially. The agent's `/agent_next` command surfaces the
-**first unchecked** item below.
+**first unchecked** item below. Autorun (`làm tới khi hết quota`)
+walks down `## Now` then `## Next` skipping items it has already
+attempted in this session.
 
 ## Done
 
@@ -21,37 +23,88 @@ Tracked sequentially. The agent's `/agent_next` command surfaces the
 - [x] Task lifecycle state machine (`bot/agent/task_lifecycle.py`)
 - [x] Structured planner v2 with per-step risk/test/expected_output
 - [x] Prompt builder for Claude/Codex coding sessions
-- [x] Eval harness (72 evals across 9 categories) wired to `/agent_evals`
+- [x] Eval harness (72→272 evals across 9+ categories) wired to `/agent_evals`
 - [x] `/agent_status` + `/agent_metrics` observability dashboards
 - [x] Permission session grants (`/grant_session` / `/revoke_session`)
 - [x] Self-improve run-once loop (`/self_improve_once`)
+- [x] SEO / Marketing engine v0 — keyword research worker
+      (Google Autocomplete + DDG, no key) — `bot/seo_research.py`
+- [x] Content / image factory v0 — caption writer + image-brief stub
+- [x] Owner Command Agent v2 — Vietnamese NL router with 30+ intents,
+      autorun pump loop, GPT-5.5 prompt refinement, Claude CLI
+      autonomous coding, quota-aware pause+resume
 
-## Now
+## Now — Brain capability layer (memory + tools + NL)
 
-- [ ] Verify real product catalog — replace placeholder prices on the 2 `active`
-  products with the actual muaesim.vn price list. Use
-  `/product_update <id> | price_vnd=… | price_jpy=… | notes=verified-YYYY-MM-DD`
-  then `/product_verify <id>`.
+> Owner directive: focus autorun on the brain's command-understanding
+> and self-improvement capability before adding more business
+> features. The agent should be able to receive ANY admin instruction
+> in natural Vietnamese and route it correctly.
 
-## Next (strategic)
+- [ ] Memory v2 — importance scoring auto-decay, embedding-based
+      semantic search via the existing Sonnet-4.6 path (no new key),
+      per-skill lesson injection on retry, dedup by content-hash.
+      Touch `bot/memory_store.py`, `bot/memory.py`, `bot/agent/runner.py`.
+      Add evals: memory dedup, importance decay, lesson injection.
 
-- [ ] SEO / Marketing engine v0 — keyword research worker (free Google Trends
-  + DDG), competitor crawler (rotated UA), landing-page brief generator.
-  Output stored as code_tasks for the content_factory.
-- [ ] Content / image factory v0 — caption writer (cx/gpt-5.5), image
-  generator (placeholder; pluggable), TikTok post drafter that creates
-  a `pending_action` for admin review before publishing.
+- [ ] Tool registry v2 — auto-discover registered skills at startup,
+      surface them in `/skills` with risk/last-used/success-rate, allow
+      admin to enable/disable a skill via NL ("tắt skill X"), warn when
+      a skill hasn't been used in N days. Touch
+      `bot/agent/skill_registry.py`, `bot/agent/runner.py`.
+      Add evals: skill discovery, enable/disable NL, stats.
+
+- [ ] NL router v3 — confidence calibration (don't fall to chat when
+      a partial pattern matched; ask "ý anh là X hay Y?"), unknown-
+      intent → propose `build_missing_tool` automatically, intent
+      explanation API ("vì sao em hiểu thế"), and a deterministic
+      VN->EN intent translation table for cross-cultural commands.
+      Touch `bot/agent/nl_router.py`. Add 30+ new evals covering
+      ambiguous phrases.
+
+- [ ] Brain context builder — when answering a free-form admin
+      question (chat fallback), inject the most relevant 3-5 memories,
+      last 10 audit entries, current autorun state, and current
+      pending_actions into the LLM system prompt. Touch
+      `backend/server.py` chat path. Add evals: context relevance.
+
+- [ ] Skill auto-suggest — on every admin message, log the chosen
+      intent and a short reason; surface "Bro hay dùng X" suggestions
+      after N uses. Build `bot/agent/intent_stats.py`. Add evals.
+
+- [ ] Memory NL surface — beyond `nhớ là …` / `quên cái …`, support
+      `gắn tag X cho memory Y`, `xem memory liên quan task Z`,
+      `học từ task này`, `lesson cho skill X`. Touch
+      `bot/agent/nl_router.py`, `bot/telegram_bot.py` (handlers).
+
+- [ ] NL eval suite — automated weekly eval that runs 200+ admin
+      phrases and reports classifier drift. Output → Telegram digest.
+      Touch `bot/agent/evals.py`. Add eval cohort file
+      `data/nl_eval_cohort.jsonl`.
+
+## Next — Business features (after brain layer)
+
+- [ ] Verify real product catalog — replace placeholder prices on the 2
+      `active` products with the actual muaesim.vn price list. **Owner
+      action required**: `/product_update <id> | price_vnd=… | …` then
+      `/product_verify <id>`. The agent will NOT invent prices
+      (Operating Rules §4) so this stays in `Next` until owner provides
+      the data.
+
 - [ ] Browser / OCR worker v0 — Playwright research worker that can
-  read competitor sites for the SEO engine; OCR on customer-uploaded
-  screenshots via a vision-role LLM call.
+      read competitor sites for the SEO engine; OCR on customer-uploaded
+      screenshots via a vision-role LLM call.
+
 - [ ] Daily-jobs scheduler — daily catalog freshness check (which active
-  products haven't been verified in N days), daily lead-followup digest,
-  daily SEO crawl.
+      products haven't been verified in N days), daily lead-followup digest,
+      daily SEO crawl.
+
 - [ ] Lead intelligence v1 — LLM-based lead scoring (replace the regex
-  baseline), automatic followup scheduling that creates `pending_action`s
-  rather than auto-sending DMs.
+      baseline), automatic followup scheduling that creates `pending_action`s
+      rather than auto-sending DMs.
+
 - [ ] Worker manager UI — `/workers` shows live heartbeats, last-seen,
-  model usage / token spend per worker.
+      model usage / token spend per worker.
 
 ## Future / blocked
 
