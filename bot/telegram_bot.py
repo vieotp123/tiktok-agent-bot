@@ -4057,6 +4057,23 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         replies.append(_cq.status_summary())
         return "\n".join(replies)
 
+    if name == "quota_clear":
+        try:
+            _cq.set_limited(False)
+            # Force a fresh probe so /claude_status reflects reality.
+            try:
+                if _cq.should_probe_now():
+                    await asyncio.to_thread(
+                        _cq.probe_claude_available, True,
+                    )
+            except Exception:
+                pass
+            return ("✅ Đã gỡ flag <b>limited</b>. Claude sẽ probe "
+                    "lại — kết quả thật:\n\n"
+                    + _cq.format_claude_status_vi())
+        except Exception as e:
+            return f"⚠ Không gỡ được: {_esc(str(e))[:120]}"
+
     if name == "quota_status":
         # Force a fresh probe so the answer reflects reality. Run the
         # blocking subprocess in a thread to keep Telegram responsive.

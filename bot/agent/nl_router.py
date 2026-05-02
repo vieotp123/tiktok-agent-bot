@@ -268,12 +268,16 @@ _PATTERNS_CREATE_CODE = (
 )
 
 _PATTERNS_QUOTA = (
-    _RE(r"\b(claude|opus|sonnet)\s+(hết\s+(quota|quote)|limit|out\s+of)",
-        re.I),
+    # Schedule-only patterns. STATUS / question forms are checked
+    # FIRST in classify() and won't reach here.
+    # Declaration: "claude bị limit rồi" / "claude đã hết quota" — only
+    # when there's an explicit declarative verb (bị/đã/đang/vừa) so
+    # that questions like "claude limit chưa" don't fall in.
+    _RE(r"\b(claude|opus|sonnet)\s+(bị|đã|đang|vừa)\s+(limit(ed)?|"
+        r"hết\s+quota|out\s+of)", re.I),
     _RE(r"\bhẹn\s+(\d+\s*(?:h|tiếng|giờ|m|phút))", re.I),
     _RE(r"\b(\d+\s*(?:h|tiếng|giờ|m|phút))\s+(nữa|sau)\s+(chạy|cho|run)",
         re.I),
-    _RE(r"\bkhi\s+nào\s+(hồi|reset|về)\s+quota", re.I),
     # "hết quota thì hẹn chạy tiếp" / "khi có quota thì chạy tiếp"
     _RE(r"\bhết\s+quota\s+thì\s+(hẹn|chạy|\d|thử|probe)", re.I),
     _RE(r"\bkhi\s+(có|hồi|về)\s+quota\s+thì", re.I),
@@ -281,6 +285,17 @@ _PATTERNS_QUOTA = (
     # "1 tiếng thử lại" / "1h thử lại" / "60 phút probe lại"
     _RE(r"\b\d+\s*(tiếng|giờ|h|phút|m)\s+(thử|probe|chạy)\s+lại", re.I),
     _RE(r"\bcó\s+quota\s+thì\s+(tự\s+)?chạy\s+tiếp", re.I),
+)
+
+# Patterns that DECLARE Claude is back / clear limited state.
+_PATTERNS_QUOTA_CLEAR = (
+    _RE(r"^\s*chưa\s+(có\s+)?(limit|hết\s+quota)\s*[\.!]?$", re.I),
+    _RE(r"\bclaude\s+(vẫn|còn)\s+(ok|ổn|chạy\s+được|xài\s+được)", re.I),
+    _RE(r"\bclaude\s+(đã\s+)?(về|có)\s+quota\s+(rồi|lại)", re.I),
+    _RE(r"\bclear\s+(limit(ed)?|quota)", re.I),
+    _RE(r"\bgỡ\s+limit(ed)?\b", re.I),
+    _RE(r"\bbỏ\s+(đánh\s+dấu\s+)?limit", re.I),
+    _RE(r"\bclaude\s+(không|ko)\s+(bị\s+)?limit", re.I),
 )
 
 _PATTERNS_QUOTA_STATUS = (
@@ -302,6 +317,20 @@ _PATTERNS_QUOTA_STATUS = (
     _RE(r"\bclaude\s+(rảnh|free)\s+(chưa|không)", re.I),
     _RE(r"\bclaude\s+(còn\s+)?(work|hoạt\s+động)\s+(không|chưa)", re.I),
     _RE(r"\bclaude\s+(đang|hiện)\s+sao\b", re.I),
+    # When/how-long questions about the limit/reset — also STATUS,
+    # not schedule (admin is asking, not commanding).
+    _RE(r"\b(claude|quota)\s+(limit|hết\s+quota|reset)\s+"
+        r"(khi\s+nào|bao\s+giờ|lúc\s+nào|when)", re.I),
+    _RE(r"\b(khi\s+nào|bao\s+giờ|lúc\s+nào|when)\s+"
+        r"(claude|quota)\s+(hết|reset|về|hồi|limit)", re.I),
+    # "claude/quota X khi nào Y" — admin question with subject first
+    _RE(r"\b(claude|quota)\s+(khi\s+nào|bao\s+giờ|lúc\s+nào)\s+"
+        r"(hết|reset|về|hồi|limit)", re.I),
+    # "claude bao giờ hết limit" — subject + bao-giờ + verb-phrase
+    _RE(r"\bclaude\s+(bao\s+giờ|khi\s+nào|lúc\s+nào)\s+"
+        r"(hết|về|reset|có)\s*(limit|quota)?", re.I),
+    _RE(r"\bclaude\s+(reset|hồi)\s+(khi\s+nào|bao\s+giờ|lúc\s+nào)", re.I),
+    _RE(r"\b(còn\s+bao\s+lâu|how\s+long)\s+(claude|quota)", re.I),
 )
 
 _PATTERNS_GRANT_PERM = (
@@ -737,12 +766,18 @@ def classify(text: str) -> Intent:
 
     high_risk = _has_any(t, _PATTERNS_HIGH_RISK)
 
-    # 2. Quota intents — STATUS (yes/no questions) BEFORE SCHEDULE so
-    #    "claude đã limit chưa" / "claude limit chưa" goes to read-state
-    #    not schedule-retry.
+    # 2. Quota intents — STATUS (yes/no + when questions) BEFORE
+    #    SCHEDULE so "claude đã limit chưa" / "claude limit khi nào"
+    #    goes to read-state, not schedule-retry. CLEAR ("chưa có
+    #    limit" / "claude vẫn ok") clears the limited flag without
+    #    asking confirm.
     if _has_any(t, _PATTERNS_QUOTA_STATUS):
         return Intent("quota_status", 0.9,
                       "Xem trạng thái quota Claude.", {}, "low", False)
+    if _has_any(t, _PATTERNS_QUOTA_CLEAR):
+        return Intent("quota_clear", 0.9,
+                      "Gỡ flag limited cho Claude (admin xác nhận "
+                      "Claude đang chạy được).", {}, "low", False)
     if _has_any(t, _PATTERNS_QUOTA):
         mins = parse_duration_vi(t) or 0
         m2 = re.search(r"\bchạy\s+(\d+)\s+task", t, re.I)
