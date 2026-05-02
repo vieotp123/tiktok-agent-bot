@@ -10,7 +10,7 @@ Cross-references:
 - `docs/SELF_OPERATING_AGENT.md` §5 (worker roles), §6 (model policy).
 - `docs/OPERATING_RULES.md` §1 (secrets), §6 (risk levels).
 - `docs/CLAUDE_CODE_WORKER.md` §3 (hard rules).
-- `docs/ROADMAP.md` "Next (strategic)" — SEO / Marketing engine v0.
+- `docs/ROADMAP.md` "Done" — SEO / Marketing engine v0 keyword research.
 
 ## Scope of v0
 
