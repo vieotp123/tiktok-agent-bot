@@ -129,7 +129,19 @@ async def handle_reminder(username: str, content: str) -> str:
     return f"ok tao set nhắc lúc {remind_at.strftime('%d/%m %H:%M')}: \"{text}\""
 
 
-async def call_llm(username: str, content: str) -> tuple[str, bool]:
+def _infer_source(username: str) -> str:
+    """Derive log source tag from username convention."""
+    u = username.lower()
+    if u.startswith("tg_admin_file"):
+        return "file_summary"
+    if u.startswith("tg_"):
+        return "telegram"
+    if u.startswith("task_"):
+        return "task"
+    return "tiktok"
+
+
+async def call_llm(username: str, content: str, source: str = "backend") -> tuple[str, bool]:
     """Call LLM, return (reply_text, had_error)."""
     mem = format_memory_for_prompt(username)
     recent = get_recent_messages(username, n=8)
@@ -144,7 +156,9 @@ async def call_llm(username: str, content: str) -> tuple[str, bool]:
         messages.append({"role": role, "content": m["content"]})
     messages.append({"role": "user", "content": content})
 
-    result = await complete(messages, role="fast", temperature=0.8)
+    # Choose role based on source — never use coding model for normal chat
+    chat_role = "telegram_chat" if source == "telegram" else "tiktok_chat"
+    result = await complete(messages, role=chat_role, temperature=0.8, source=source)
 
     if result.get("error"):
         detail = result.get("error_detail", "unknown")
@@ -158,6 +172,7 @@ async def call_llm(username: str, content: str) -> tuple[str, bool]:
 class MessageRequest(BaseModel):
     username: str
     content: str
+    source: str = ""   # optional: "tiktok" | "telegram" | "task" | "file_summary" | ...
 
 
 class MessageResponse(BaseModel):
@@ -194,7 +209,8 @@ def _rate_limited_error(username: str) -> str | None:
 @app.post("/message", response_model=MessageResponse)
 async def handle_message(req: MessageRequest):
     username = req.username.strip() or "user"
-    content = req.content.strip()
+    content  = req.content.strip()
+    source   = req.source.strip() if req.source else _infer_source(username)
 
     if not content:
         raise HTTPException(status_code=400, detail="content rỗng")
@@ -252,7 +268,8 @@ async def handle_message(req: MessageRequest):
         if mem:
             messages.append({"role": "system", "content": f"Memory về user:\n{mem}"})
         messages.append({"role": "user", "content": search_prompt})
-        result = await complete(messages, role="fast", temperature=0.6)
+        result = await complete(messages, role="search_summary", temperature=0.6,
+                                source=source if source else "search")
         if result.get("error"):
             reply = f"Tìm được nhưng tóm tắt lỗi. Kết quả thô:\n{context[:500]}"
         else:
@@ -271,7 +288,7 @@ async def handle_message(req: MessageRequest):
 
     # General LLM
     add_message(username, "user", content)
-    reply, had_error = await call_llm(username, content)
+    reply, had_error = await call_llm(username, content, source=source)
 
     if had_error:
         err_msg = _rate_limited_error(username)

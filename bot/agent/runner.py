@@ -29,12 +29,12 @@ def detect_task_type(goal: str) -> str:
     return "chat"
 
 
-async def _call_backend(username: str, content: str) -> str:
+async def _call_backend(username: str, content: str, source: str = "task") -> str:
     """POST to /message and return reply string."""
     async with httpx.AsyncClient(timeout=35) as c:
         r = await c.post(
             f"{BACKEND}/message",
-            json={"username": username, "content": content},
+            json={"username": username, "content": content, "source": source},
         )
     if r.status_code == 200:
         return r.json().get("reply", "")
@@ -54,11 +54,10 @@ async def run_task(goal: str, user: str = "tg_admin") -> dict:
             result = await get_btc_price()
 
         elif task_type == "search_web":
-            # Route through backend /message so LLM summarises results
-            result = await _call_backend(f"task_{task_id}", goal)
+            result = await _call_backend(f"task_{task_id}", goal, source="search")
 
         else:  # chat
-            result = await _call_backend(f"task_{task_id}", goal)
+            result = await _call_backend(f"task_{task_id}", goal, source="task")
 
         update_task(
             task_id,
