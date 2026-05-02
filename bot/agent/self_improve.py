@@ -42,12 +42,26 @@ ROADMAP = Path("/opt/tiktok-bot/docs/ROADMAP.md")
 STATUS  = Path("/opt/tiktok-bot/docs/CURRENT_STATUS.md")
 
 
-def _first_unchecked_roadmap_item() -> str | None:
+def _first_unchecked_roadmap_item(skip_titles: set[str] | None = None
+                                    ) -> str | None:
+    """Return the first `- [ ]` item in ROADMAP whose first 80 chars
+    are NOT in skip_titles. Used by autorun to avoid infinite-loop
+    on items that Claude can't complete autonomously (e.g. tasks
+    that need real owner data — "Verify product catalog" requires
+    actual prices the agent must NOT invent per Operating Rules §4)."""
     if not ROADMAP.exists():
         return None
     txt = ROADMAP.read_text(encoding="utf-8")
-    m = re.search(r"^- \[ \] (.+)$", txt, re.MULTILINE)
-    return m.group(1).strip() if m else None
+    skip = skip_titles or set()
+    for line in txt.splitlines():
+        m = re.match(r"^- \[ \] (.+)$", line)
+        if not m:
+            continue
+        item = m.group(1).strip()
+        title = _short_title(item, 80)
+        if title not in skip:
+            return item
+    return None
 
 
 def _short_title(text: str, n: int = 60) -> str:
@@ -55,8 +69,14 @@ def _short_title(text: str, n: int = 60) -> str:
     return s[:n]
 
 
-def self_improve_once(*, user: str = "tg_admin") -> dict:
-    """Run-once flow. Returns a summary dict for the Telegram report."""
+def self_improve_once(*, user: str = "tg_admin",
+                        skip_titles: set[str] | None = None) -> dict:
+    """Run-once flow. Returns a summary dict for the Telegram report.
+
+    `skip_titles` lets autorun pass a set of roadmap-item titles
+    that have already been attempted this session — so the loop
+    doesn't keep queuing the same item Claude can't complete.
+    """
     out: dict = {
         "status":            "noop",
         "queued_task_id":    "",
@@ -64,6 +84,7 @@ def self_improve_once(*, user: str = "tg_admin") -> dict:
         "pending_action_id": "",
         "prompt_path":       "",
         "summary":           "",
+        "roadmap_item":      "",
     }
 
     # Step 1: existing queued coding work?
@@ -80,13 +101,21 @@ def self_improve_once(*, user: str = "tg_admin") -> dict:
         out["prompt_path"] = str(path)
         return out
 
-    # Step 2: pull the next roadmap item
-    item = _first_unchecked_roadmap_item()
+    # Step 2: pull the next roadmap item (skipping already-attempted titles)
+    item = _first_unchecked_roadmap_item(skip_titles=skip_titles)
     if not item:
         out["status"]  = "noop"
-        out["summary"] = ("Nothing queued and ROADMAP has no unchecked "
-                          "items. Update docs/ROADMAP.md.")
+        if skip_titles:
+            out["summary"] = (
+                f"Nothing queued. All {len(skip_titles)} unchecked "
+                f"roadmap items have already been attempted this "
+                f"session. Update docs/ROADMAP.md or clear skip-set."
+            )
+        else:
+            out["summary"] = ("Nothing queued and ROADMAP has no unchecked "
+                              "items. Update docs/ROADMAP.md.")
         return out
+    out["roadmap_item"] = _short_title(item, 80)
 
     risk = classify_risk(item)
     coding_risk = estimate_code_task_risk(item)

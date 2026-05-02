@@ -63,6 +63,12 @@ _DEFAULT: dict = {
     # on the first noop.
     "auto_self_improve":    False,
     "self_improve_runs":    0,
+    # Roadmap items already attempted this autorun session — used to
+    # avoid the infinite-loop where Claude can't complete an item
+    # (e.g. "Verify product catalog" requires owner data per Operating
+    # Rules §4 "never invent prices") and self_improve keeps re-pulling
+    # the same first-unchecked item.
+    "attempted_items":      [],
 }
 
 _FAIL_STATUSES = {
@@ -141,6 +147,7 @@ def start(
     d["user"]                 = user
     d["auto_self_improve"]    = bool(auto_self_improve)
     d["self_improve_runs"]    = 0
+    d["attempted_items"]      = []
     _save(d)
     try:
         from bot.agent.audit_log import log_action
@@ -278,11 +285,23 @@ def populate_queue_from_roadmap() -> dict:
     """
     try:
         from bot.agent import self_improve as _si
-        # Public API in self_improve.py is `self_improve_once(user=...)`,
-        # not `run_once`. Returns dict with `status` in
-        # {existing_queue, queued, pending_action, noop, error}.
-        result = _si.self_improve_once(user="autorun_pump")
         d = state()
+        # Pass attempted-items so self_improve skips them instead of
+        # re-queuing the same first unchecked roadmap item forever
+        # (the infinite-loop bug owner caught in autorun cycle 2+).
+        skip_titles = set(d.get("attempted_items") or [])
+        result = _si.self_improve_once(user="autorun_pump",
+                                         skip_titles=skip_titles)
+        # Record the roadmap item we just attempted so the next pump
+        # cycle skips it. Status "queued" / "pending_action" both mean
+        # we picked an item; "noop" / "existing_queue" / "error" mean
+        # we didn't pick a new one (don't add to attempted).
+        if (result.get("status") in ("queued", "pending_action")
+                and result.get("roadmap_item")):
+            attempted = list(d.get("attempted_items") or [])
+            if result["roadmap_item"] not in attempted:
+                attempted.append(result["roadmap_item"])
+            d["attempted_items"] = attempted[-50:]  # cap memory
         d["self_improve_runs"] = int(d.get("self_improve_runs") or 0) + 1
         _save(d)
         return result if isinstance(result, dict) else {
