@@ -1935,21 +1935,87 @@ async def handle_agent_progress() -> str:
         pass
 
     # 4. Code queue snapshot — currently running / next queued
+    # Plus a Claude/Codex process-alive indicator with elapsed time so
+    # admin can tell at a glance whether the worker is genuinely
+    # grinding vs the bridge has died. Without this, --print mode looks
+    # static: the log file only gets the final response when Claude
+    # exits, so panels appeared "đứng yên" mid-task.
     try:
         all_q = code_list_tasks(limit=200)
         running = [t for t in all_q if t.get("status") == "running"]
         queued = [t for t in all_q if t.get("status") == "queued"]
+        # Probe live worker process(es) via pgrep — best-effort, never
+        # raise. Returns list of (pid, etime_seconds, pcpu_str).
+        worker_procs: list[tuple[str, int, str]] = []
+        try:
+            import subprocess as _sp
+            r = _sp.run(
+                ["ps", "-eo", "pid,etime,pcpu,comm,cmd"],
+                capture_output=True, text=True, timeout=3,
+            )
+            for ln in (r.stdout or "").splitlines():
+                if "claude" not in ln and "codex" not in ln:
+                    continue
+                if "--print" not in ln:
+                    continue
+                if "grep" in ln:
+                    continue
+                parts = ln.split(None, 4)
+                if len(parts) < 4:
+                    continue
+                pid_, etime_, pcpu_, comm_ = parts[0], parts[1], parts[2], parts[3]
+                # Parse etime: [[DD-]HH:]MM:SS
+                secs = 0
+                try:
+                    et = etime_
+                    if "-" in et:
+                        days, rest = et.split("-", 1)
+                        secs += int(days) * 86400
+                        et = rest
+                    bits = et.split(":")
+                    bits = [int(b) for b in bits]
+                    if len(bits) == 3:
+                        secs += bits[0] * 3600 + bits[1] * 60 + bits[2]
+                    elif len(bits) == 2:
+                        secs += bits[0] * 60 + bits[1]
+                    elif len(bits) == 1:
+                        secs += bits[0]
+                except Exception:
+                    secs = 0
+                worker_procs.append((pid_, secs, pcpu_))
+        except Exception:
+            pass
         if running:
             lines.append(f"<b>🔧 Đang chạy:</b>")
             for t in running[:2]:
                 lines.append(f"  • <code>{_esc(str(t['id']))}</code> "
                              f"<i>{_esc((t.get('title') or '')[:60])}</i>")
+        # Show live worker even if no task in DB is "running"
+        # (the bridge may be between snapshots).
+        if worker_procs:
+            for pid_, secs, pcpu_ in worker_procs[:2]:
+                m, s = divmod(secs, 60)
+                h, m = divmod(m, 60)
+                if h:
+                    elapsed = f"{h}h {m}m {s}s"
+                elif m:
+                    elapsed = f"{m}m {s}s"
+                else:
+                    elapsed = f"{s}s"
+                lines.append(
+                    f"  ⚙ Claude PID <code>{pid_}</code> alive "
+                    f"<b>{elapsed}</b> ({pcpu_}% CPU)")
+        elif running:
+            # Task in DB says running but no worker process exists →
+            # likely stale; flag it so admin knows.
+            lines.append("  ⚠ <i>Task DB =running nhưng không thấy "
+                         "Claude/Codex process — có thể stale</i>")
         nx = code_next_task() if queued else None
         if nx:
             lines.append(f"<b>📋 Next queued:</b> "
                          f"<code>{_esc(str(nx['id']))}</code> "
                          f"<i>{_esc((nx.get('title') or '')[:60])}</i>")
-        if not running and not nx:
+        if not running and not nx and not worker_procs:
             lines.append("💤 Không có task nào đang chạy / queued.")
     except Exception as e:
         lines.append(f"⚠ queue: {_esc(str(e))[:80]}")
