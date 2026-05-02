@@ -512,6 +512,18 @@ _PATTERNS_AGENT_PROGRESS = (
     # "task chạy đến đâu rồi" / "task xong chưa"
     _RE(r"\btask\s+(đang\s+)?(chạy|làm)\s+(đến|tới)\s+đâu", re.I),
     _RE(r"\btask\s+xong\s+(chưa|rồi)\b", re.I),
+    # Ambiguous yes/no questions ABOUT THE TASK — when admin types these
+    # while a task is running, route to progress instead of LLM chat
+    # (which would hallucinate from stale chat history).
+    _RE(r"^\s*(ổn|ok|okay)\s+(ko|không|chưa|hông)\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*xong\s+(chưa|chưa\s*v|rồi)\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*được\s+chưa\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*chạy\s+(xong|được)\s+(chưa|chưa\s*v)\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*có\s+chạy\s+(không|ko|hông)\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*sao\s+rồi\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*đang\s+sao\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*tới\s+đâu\s+(rồi)?\s*[\?!\.]*$", re.I),
+    _RE(r"^\s*how\s*'?s\s+it\s+going\s*[\?!\.]*$", re.I),
 )
 
 # ── EsimAccess / API integration intents ────────────────────────────────────
