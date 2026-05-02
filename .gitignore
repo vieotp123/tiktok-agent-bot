@@ -13,6 +13,9 @@ data/cache/
 data/memory.json
 data/reminders.json
 data/tasks.db
+data/agent_memory.db
+data/business.db
+data/memory_store.db
 data/pending_actions.json
 data/chat_info.json
 data/audit/

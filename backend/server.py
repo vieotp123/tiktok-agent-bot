@@ -21,6 +21,11 @@ from bot.tools import (
     get_btc_price, is_btc_query,
     search_web, format_search_results, is_search_query, extract_search_query,
 )
+from bot.business_store import (
+    detect_esim_intent, build_consult_reply,
+    add_consulting_log, upsert_lead, add_conversation,
+)
+from bot.memory_store import add_raw_event
 
 app = FastAPI(title="TikTok Bot Backend")
 
@@ -278,6 +283,74 @@ async def handle_message(req: MessageRequest):
         add_message(username, "assistant", reply)
         bubbles = split_bubbles(reply)
         return MessageResponse(reply=reply, messages=bubbles or [reply])
+
+    # eSIM / sales consulting (DB-grounded, never invents prices)
+    if detect_esim_intent(content):
+        reply, product_ids, confidence = build_consult_reply(content)
+        # Determine platform from source
+        platform = "tiktok" if source in ("tiktok", "") else (
+            "telegram" if source.startswith("telegram") else (source or "internal")
+        )
+        sender_key  = username
+        sender_name = username
+
+        # Upsert lead
+        try:
+            lead_id = upsert_lead(
+                platform=platform, sender_key=sender_key,
+                username=username, display_name=username,
+                source=source, need_summary=content[:120],
+                lead_score=max(1, int(confidence * 10)),
+                status="consulting",
+            )
+        except Exception as e:
+            print(f"[consult] upsert_lead error: {e}", flush=True)
+            lead_id = ""
+
+        # Log inbound + outbound conversation
+        try:
+            add_conversation(
+                lead_id=lead_id, platform=platform,
+                sender_key=sender_key, sender_name=sender_name,
+                direction="in", message=content,
+                intent="esim_consult",
+                product_suggested=",".join(product_ids[:3]),
+            )
+            add_conversation(
+                lead_id=lead_id, platform=platform,
+                sender_key=sender_key, sender_name=sender_name,
+                direction="out", message=reply,
+                intent="esim_consult",
+                product_suggested=",".join(product_ids[:3]),
+            )
+        except Exception as e:
+            print(f"[consult] add_conversation error: {e}", flush=True)
+
+        # Log consulting record
+        try:
+            add_consulting_log(
+                platform=platform, sender_key=sender_key, sender_name=sender_name,
+                user_message=content, bot_reply=reply,
+                products_used=product_ids, confidence=confidence,
+            )
+        except Exception as e:
+            print(f"[consult] add_consulting_log error: {e}", flush=True)
+
+        # Memory: raw event (no PII / no prices)
+        try:
+            add_raw_event(
+                source=platform, action="sales_consult",
+                summary=f"consult q={content[:60]!r} conf={confidence:.2f} prods={len(product_ids)}",
+                actor=sender_key, event_type="consulting",
+                tags=["sales", "esim"],
+            )
+        except Exception as e:
+            print(f"[consult] add_raw_event error: {e}", flush=True)
+
+        add_message(username, "user", content)
+        add_message(username, "assistant", reply)
+        bubbles = split_bubbles(reply) or [reply]
+        return MessageResponse(reply=reply, messages=bubbles)
 
     # Reminder
     if is_reminder(content):

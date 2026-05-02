@@ -181,21 +181,25 @@ register(Skill(
 # ── Future skills (disabled — placeholders for roadmap) ──────────────────────
 
 register(Skill(
-    name="product_lookup",
-    description="[FUTURE] Tìm kiếm sản phẩm trong catalog hoặc web.",
+    name="sales_consult",
+    description="Tư vấn eSIM Nhật Bản dựa trên product DB. Không bao giờ bịa giá.",
     risk_level="low",
-    enabled=False,
-    handler="product_lookup_handler",
-    examples=["tìm sản phẩm X giá bao nhiêu"],
+    enabled=True,
+    handler="sales_consult_handler",
+    examples=[
+        "có eSIM Nhật nhận SMS không?",
+        "gói nào phát wifi được?",
+        "có gói Nhật nào gia hạn được không?",
+    ],
 ))
 
 register(Skill(
-    name="sales_consult",
-    description="[FUTURE] Tư vấn bán hàng dựa trên context.",
-    risk_level="medium",
-    enabled=False,
-    handler="sales_consult_handler",
-    examples=["tư vấn khách hỏi về sản phẩm Y"],
+    name="product_lookup",
+    description="Tra cứu danh mục sản phẩm eSIM trong product DB.",
+    risk_level="low",
+    enabled=True,
+    handler="product_lookup_handler",
+    examples=["xem các gói eSIM Nhật", "có gói nào của Docomo không"],
 ))
 
 register(Skill(

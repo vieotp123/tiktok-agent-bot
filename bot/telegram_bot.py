@@ -37,6 +37,23 @@ from bot.memory_store import (
     add_memory, delete_memory, compact_memories,
     build_memory_context, list_memories,
 )
+from bot.business_store import (
+    init_business_db, seed_products_if_empty,
+    list_products, add_product, update_product, get_product,
+    detect_esim_intent, build_consult_reply,
+    upsert_lead, get_lead, list_leads, add_conversation,
+    add_consulting_log, list_consulting_logs,
+    add_followup, list_followups,
+    format_products_list, format_leads_list, format_lead_detail,
+    format_followups_list,
+)
+
+# Ensure business DB exists at import time
+try:
+    init_business_db()
+    seed_products_if_empty()
+except Exception as _e:
+    print(f"[tg] business_store init warning: {_e}", flush=True)
 
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_ADMIN   = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
@@ -214,7 +231,8 @@ def menu_main() -> tuple[str, dict]:
         [("📊 Status", "nav:status"), ("🤖 Router/Models", "nav:router")],
         [("🧠 Tasks",  "nav:tasks"),  ("🔎 Search",        "nav:search")],
         [("📁 Files",  "nav:files"),  ("🧩 Skills",        "nav:skills")],
-        [("💾 Memory", "nav:memory"), ("⚙️ Admin",         "nav:admin")],
+        [("💾 Memory", "nav:memory"), ("🛒 Sales/CRM",      "nav:sales")],
+        [("⚙️ Admin",  "nav:admin")],
     ])
     return text, kb
 
@@ -282,6 +300,17 @@ def menu_admin() -> tuple[str, dict]:
     kb = make_keyboard([
         [("📊 Git Status", "do:git_status"), ("💾 Backup", "do:backup")],
         [("🔄 Restart Bot", "confirm:restart_bot")],
+        BACK_ROW,
+    ])
+    return text, kb
+
+
+def menu_sales() -> tuple[str, dict]:
+    text = "<b>🛒 Sales / CRM</b>"
+    kb = make_keyboard([
+        [("📦 Products", "do:products"), ("✏ Add Product", "input:product_add")],
+        [("💬 Consult", "input:consult"), ("👥 Leads", "do:leads")],
+        [("⏰ Followups", "do:followups"), ("➕ Lead Add", "input:lead_add")],
         BACK_ROW,
     ])
     return text, kb
@@ -764,6 +793,141 @@ def handle_memory_context(query: str) -> str:
     return f"<b>Memory context for:</b> {_esc(query)}\n\n<pre>{_esc(ctx[:3000])}</pre>"
 
 
+# ── Sales / CRM handlers ──────────────────────────────────────────────────────
+
+def handle_products() -> str:
+    return format_products_list()
+
+
+def handle_product_add(spec: str) -> str:
+    """
+    Parse: name | network | country | duration_days | data_amount | sms | hotspot | renew | notes
+    """
+    parts = [p.strip() for p in spec.split("|")]
+    if len(parts) < 2:
+        return "Usage: name | network | country | duration_days | data_amount | sms(0/1) | hotspot(0/1) | renew(0/1) | notes"
+    pad = parts + [""] * (9 - len(parts))
+    name, network, country, dur, data_amt, sms, hot, renew, notes = pad[:9]
+    try:
+        pid = add_product(
+            name=name, network=network, country=country or "JP",
+            duration_days=int(dur or 0), data_amount=data_amt,
+            supports_sms=bool(int(sms or 0)),
+            supports_hotspot=bool(int(hot or 1)),
+            renewable=bool(int(renew or 0)),
+            notes=notes, status="needs_update",
+        )
+    except Exception as e:
+        return f"❌ Add failed: {_esc(str(e))}"
+    log_action(user="tg_admin", action="product_add", risk_level="low",
+               status="ok", result_summary=f"id={pid} name={name[:40]!r}")
+    return (f"✅ Product <code>{pid}</code> added (status=<b>needs_update</b> — "
+            f"verify before customer use).")
+
+
+def handle_product_update(spec: str) -> str:
+    """
+    Parse: <product_id> | field=value [| field=value ...]
+    """
+    parts = [p.strip() for p in spec.split("|")]
+    if len(parts) < 2:
+        return "Usage: <product_id> | field=value | field=value ..."
+    pid = parts[0]
+    if not get_product(pid):
+        return f"❌ Product <code>{_esc(pid)}</code> not found."
+    fields: dict = {}
+    for kv in parts[1:]:
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k in ("duration_days", "price_jpy", "price_vnd"):
+            try: fields[k] = int(v)
+            except ValueError: continue
+        elif k in ("supports_sms", "supports_hotspot", "renewable"):
+            fields[k] = v in ("1", "true", "yes", "True")
+        else:
+            fields[k] = v
+    if not fields:
+        return "❌ No valid field=value pairs."
+    ok = update_product(pid, **fields)
+    if ok:
+        log_action(user="tg_admin", action="product_update", risk_level="low",
+                   status="ok", result_summary=f"id={pid} fields={list(fields.keys())}")
+        return f"✅ Updated <code>{pid}</code>: {', '.join(fields.keys())}"
+    return f"❌ Update failed for <code>{pid}</code>."
+
+
+async def handle_consult(text: str) -> str:
+    """Run sales consult for an admin-provided customer question."""
+    text = text.strip()
+    if not text:
+        return "Usage: /consult <customer message>"
+    if not detect_esim_intent(text):
+        # Still allow it, but warn
+        prefix = "⚠️ Không detect intent eSIM rõ ràng, vẫn thử lookup:\n\n"
+    else:
+        prefix = ""
+    reply, ids, confidence = build_consult_reply(text)
+
+    # Log as Telegram-admin consult
+    add_consulting_log(
+        platform="telegram", sender_key="telegram_admin",
+        sender_name="tg_admin", user_message=text, bot_reply=reply,
+        products_used=ids, confidence=confidence,
+    )
+    try:
+        from bot.memory_store import add_raw_event
+        add_raw_event(
+            source="telegram", action="sales_consult",
+            summary=f"admin consult q={text[:50]!r} conf={confidence:.2f}",
+            actor="telegram_admin", event_type="consulting",
+            tags=["sales", "esim", "admin"],
+        )
+    except Exception:
+        pass
+    log_action(user="tg_admin", action="consult", risk_level="low",
+               status="ok", result_summary=f"conf={confidence:.2f} products={len(ids)}",
+               goal=text[:120])
+    return (
+        f"{prefix}<b>Consult result</b> (confidence={confidence:.2f})\n"
+        f"Products considered: {', '.join(ids) if ids else '(none)'}\n\n"
+        f"<b>Reply:</b>\n{_esc(reply)}"
+    )
+
+
+def handle_leads() -> str:
+    return format_leads_list()
+
+
+def handle_lead_detail(lead_id: str) -> str:
+    return format_lead_detail(lead_id.strip())
+
+
+def handle_lead_add(spec: str) -> str:
+    """Parse: platform | sender_key | name | need_summary"""
+    parts = [p.strip() for p in spec.split("|")]
+    if len(parts) < 2:
+        return "Usage: platform | sender_key | name | need_summary"
+    pad = parts + [""] * (4 - len(parts))
+    platform, sk, name, need = pad[:4]
+    if not platform or not sk:
+        return "❌ platform and sender_key are required."
+    lid = upsert_lead(
+        platform=platform, sender_key=sk,
+        username=name, display_name=name,
+        need_summary=need, source="manual_admin",
+    )
+    log_action(user="tg_admin", action="lead_add", risk_level="low",
+               status="ok", result_summary=f"id={lid}")
+    return f"✅ Lead <code>{lid}</code> upserted ({platform}:{_esc(sk)})."
+
+
+def handle_followups() -> str:
+    return format_followups_list()
+
+
 async def handle_run_task(goal: str) -> str:
     if not goal:
         return "Usage: /run_task <goal>"
@@ -935,6 +1099,7 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             "status": menu_status, "router": menu_router, "tasks": menu_tasks,
             "search": menu_search, "files":  menu_files,  "skills": menu_skills,
             "admin":  menu_admin,  "memory": menu_memory,
+            "sales":  menu_sales,
         }.get(val)
         if menu_fn:
             text, kb = menu_fn()
@@ -972,6 +1137,11 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             "memory_add":    "➕ Enter memory text (format: <b>Title</b> | content | tag1,tag2):",
             "memory_forget": "🗑 Enter memory ID to delete:",
             "memory_context":"🔎 Enter goal/query for context preview:",
+            "consult":       "💬 Enter customer question for sales consult:",
+            "product_add":   ("✏ Enter product (format: name | network | country | "
+                              "duration_days | data_amount | sms(0/1) | hotspot(0/1) | renew(0/1) | notes):"),
+            "product_update":"🔧 Enter: <product_id> | field=value [| field=value ...]",
+            "lead_add":      "➕ Enter lead (format: platform | sender_key | name | need):",
         }
         prompt = prompts.get(val, "✏️ Enter input:")
         _session_save(val, prompt)
@@ -1030,6 +1200,12 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return handle_lessons("")
     if action == "memory_compact":
         return await handle_memory_compact()
+    if action == "products":
+        return handle_products()
+    if action == "leads":
+        return handle_leads()
+    if action == "followups":
+        return handle_followups()
     if action == "restart_bot":
         try:
             subprocess.run(
@@ -1067,6 +1243,14 @@ async def handle_pending_input(action: str, text: str, chat_id: str | int) -> st
         return handle_memory_forget(text)
     if action == "memory_context":
         return handle_memory_context(text)
+    if action == "consult":
+        return await handle_consult(text)
+    if action == "product_add":
+        return handle_product_add(text)
+    if action == "product_update":
+        return handle_product_update(text)
+    if action == "lead_add":
+        return handle_lead_add(text)
     return f"Unknown action: {action}"
 
 
@@ -1122,6 +1306,14 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/tiktok_chat_info": return handle_tiktok_chat_info()
     if cmd == "/agent_blueprint":  return handle_agent_blueprint()
     if cmd == "/workers":          return handle_workers()
+    if cmd == "/products":         return handle_products()
+    if cmd == "/product_add":      return handle_product_add(arg)
+    if cmd == "/product_update":   return handle_product_update(arg)
+    if cmd == "/consult":          return await handle_consult(arg)
+    if cmd == "/leads":            return handle_leads()
+    if cmd == "/lead":             return handle_lead_detail(arg)
+    if cmd == "/lead_add":         return handle_lead_add(arg)
+    if cmd == "/followups":        return handle_followups()
     if cmd == "/memory_search":    return await handle_memory_search(arg)
     if cmd == "/memory_add":       return await handle_memory_add(arg)
     if cmd == "/memory_forget":    return handle_memory_forget(arg)
@@ -1137,8 +1329,9 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
             "/pending_actions /confirm_action &lt;id&gt; /cancel_action &lt;id&gt;\n"
             "/files /file &lt;id&gt; /send_file &lt;path&gt; /logs /tiktok_chat_info\n"
             "/agent_blueprint /workers /lessons [skill] /audit_recent\n"
-            "/memory_search &lt;q&gt; /memory_add &lt;text&gt; /memory_forget &lt;id&gt; "
-            "/memory_compact /memory_context &lt;q&gt;\n"
+            "/memory_search &lt;q&gt; /memory_add /memory_forget /memory_compact /memory_context\n"
+            "/products /product_add /product_update /consult &lt;q&gt; "
+            "/leads /lead &lt;id&gt; /lead_add /followups\n"
             "/start /help /menu /cancel"
         )
 
