@@ -9,6 +9,7 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 > contract this task exercised.
 
 - `/agent_progress` is now reachable from the Self-Operating Agent menu (`📊 Progress` button under `nav:agent`); same handler the slash command + NL intent already use, surfacing autorun/brain/quota/queue/audit snapshots in one panel.
+- `/agent_progress` is now listed in the `/help` panel (and the unknown-slash fallback hint), so admins discover the live progress reporter without having to dig through the Agent submenu.
 
 ## Owner Tooling Doctrine + Remote Workers v1
 

@@ -1198,7 +1198,8 @@ def handle_help_panel() -> str:
         "/cancel — clear pending input + return to main menu\n"
         "/status /health /router_status /tasks /skills\n"
         "/products /consult &lt;q&gt; /leads /lead &lt;id&gt;\n"
-        "/memory_search &lt;q&gt; /lessons /audit_recent\n\n"
+        "/memory_search &lt;q&gt; /lessons /audit_recent\n"
+        "/agent_progress — what the agent is doing right now\n\n"
         "Long results land as a separate message; the panel stays put."
     )
 
@@ -3731,6 +3732,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
             "/pending_actions /confirm_action &lt;id&gt; /cancel_action &lt;id&gt;\n"
             "/files /file &lt;id&gt; /send_file &lt;path&gt; /logs /tiktok_chat_info\n"
             "/agent_blueprint /workers /lessons [skill] /audit_recent\n"
+            "/agent_progress — current task progress\n"
             "/memory_search &lt;q&gt; /memory_add /memory_forget /memory_compact /memory_context\n"
             "/products /product_add /product_update /consult &lt;q&gt; "
             "/leads /lead &lt;id&gt; /lead_add /followups\n"
