@@ -46,6 +46,14 @@ PAUSE_FILE = REPO / "data" / "coding_bridge.paused"
 DEFAULT_TIMEOUT_SEC = 45 * 60          # 45 min
 MAX_OUTPUT_BYTES    = 4 * 1024 * 1024  # 4 MB log cap
 
+# When set, the claude subprocess is launched via `sudo -u <user> -H` so
+# that it picks up that user's ~/.claude/ auth state instead of root's.
+# Service still runs as root; only the claude exec drops privileges.
+CODING_WORKER_USER = (os.environ.get("CODING_WORKER_USER") or "").strip()
+# Absolute path to the claude binary (usually a per-user install). When
+# unset we fall back to shutil.which("claude").
+CLAUDE_CLI_PATH    = (os.environ.get("CLAUDE_CLI_PATH")    or "").strip()
+
 # Forbidden-name regex applied to staged files before commit. Matches the
 # kill-list in bot/agent/sessions.py + obvious credential patterns.
 FORBIDDEN_PATH_PATTERNS = (
@@ -90,8 +98,32 @@ class ToolInfo:
 # ── Tool detection ────────────────────────────────────────────────────────────
 
 def _which(name: str) -> str | None:
-    p = shutil.which(name)
-    return p
+    if name == "claude" and CLAUDE_CLI_PATH:
+        # Honour explicit override even if it lives outside PATH (e.g.
+        # ~/.local/bin which root's PATH normally omits).
+        if Path(CLAUDE_CLI_PATH).exists():
+            return CLAUDE_CLI_PATH
+    return shutil.which(name)
+
+
+def _run_as_prefix(tool_name: str) -> list[str]:
+    """argv prefix to drop privileges to CODING_WORKER_USER for the
+    claude CLI. Returns [] when no user is configured or the tool is
+    not claude."""
+    if tool_name == "claude" and CODING_WORKER_USER:
+        return ["sudo", "-n", "-u", CODING_WORKER_USER, "-H"]
+    return []
+
+
+def effective_run_user(tool_name: str) -> str:
+    """The OS user the given tool will execute as."""
+    if tool_name == "claude" and CODING_WORKER_USER:
+        return CODING_WORKER_USER
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER", "?")
 
 
 def _try_version(binary: str) -> str:
@@ -152,6 +184,59 @@ def get_preferred_coding_tool() -> Optional[ToolInfo]:
     return pool[0]
 
 
+_AUTH_TEST_CACHE: dict[str, tuple[float, str]] = {}
+_AUTH_TEST_TTL_SEC = 60.0
+
+
+def quick_auth_test(tool: ToolInfo, *, timeout: float = 20.0) -> str:
+    """Drive a tiny non-interactive completion to confirm the CLI is
+    authenticated. Returns 'ok' on success, otherwise 'fail: <reason>'.
+    Cached for _AUTH_TEST_TTL_SEC per (binary, run_as) to avoid burning
+    quota on each /code_worker_status call. The probe prompt is fixed
+    ('ping') so it never carries user content.
+    """
+    if not tool or not tool.noninteractive_ok:
+        return "fail: tool not non-interactive"
+    cache_key = f"{tool.binary}|{effective_run_user(tool.name)}"
+    now = time.time()
+    cached = _AUTH_TEST_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < _AUTH_TEST_TTL_SEC:
+        return cached[1]
+    cmd: list[str] = []
+    if tool.name == "claude":
+        cmd = _run_as_prefix("claude") + [tool.binary, "--print"]
+    else:
+        # Only claude has a stable cheap probe; codex would need an
+        # actual `codex exec` round-trip. Skip for now.
+        result = "skip: only claude probed"
+        _AUTH_TEST_CACHE[cache_key] = (now, result)
+        return result
+    try:
+        proc = subprocess.run(
+            cmd, input="ping\n", capture_output=True, text=True,
+            timeout=timeout, cwd=str(REPO), env=_scrub_env(),
+        )
+    except subprocess.TimeoutExpired:
+        result = f"fail: timeout after {timeout:.0f}s"
+        _AUTH_TEST_CACHE[cache_key] = (now, result)
+        return result
+    except FileNotFoundError as e:
+        result = f"fail: {e}"
+        _AUTH_TEST_CACHE[cache_key] = (now, result)
+        return result
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        head = err[0][:120] if err else f"rc={proc.returncode}"
+        result = f"fail: {head}"
+    elif "login" in (proc.stdout + proc.stderr).lower() and \
+         "not logged in" in (proc.stdout + proc.stderr).lower():
+        result = "fail: not logged in"
+    else:
+        result = "ok"
+    _AUTH_TEST_CACHE[cache_key] = (now, result)
+    return result
+
+
 def coding_tool_status() -> str:
     tools = detect_coding_tools()
     lines = ["<b>🛠 Coding tool detection</b>"]
@@ -168,10 +253,16 @@ def coding_tool_status() -> str:
         if t.notes:
             lines.append(f"   <i>{t.notes}</i>")
     if pref:
+        run_as     = effective_run_user(pref.name)
+        nonint     = "ok" if pref.noninteractive_ok else "no"
+        auth       = quick_auth_test(pref) if pref.name == "claude" else "skip"
         lines.append("")
-        lines.append(f"<b>Preferred:</b> <code>{pref.binary}</code>")
-        lines.append(f"<b>Non-interactive:</b> "
-                     f"{'yes' if pref.noninteractive_ok else 'no'}")
+        lines.append("<b>Effective config</b>")
+        lines.append(f"  tool=<code>{pref.name}</code>")
+        lines.append(f"  path=<code>{pref.binary}</code>")
+        lines.append(f"  run_as=<code>{run_as}</code>")
+        lines.append(f"  auth_test=<code>{auth}</code>")
+        lines.append(f"  non_interactive=<code>{nonint}</code>")
     return "\n".join(lines)
 
 
@@ -200,7 +291,7 @@ def build_worker_command(tool: ToolInfo, prompt_path: Path, task_id: str
         # the assistant's reply; combined with the prompt template it
         # is enough to drive a code_task end-to-end IF the user has
         # already authenticated the CLI (claude login).
-        return [tool.binary, "--print"]
+        return _run_as_prefix("claude") + [tool.binary, "--print"]
     if tool.name == "codex":
         return [tool.binary, "exec", "--cd", str(REPO)]
     # Unknown tool — refuse to invent flags
