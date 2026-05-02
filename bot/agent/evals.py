@@ -269,6 +269,192 @@ def eval_code_tasks(rep: EvalReport) -> None:
             get_task(tid2)["status"])
 
 
+def eval_telegram_routing(rep: EvalReport) -> None:
+    """Verify the v2 reply-policy separation is intact:
+       - send_chat_reply -> sendMessage path, never edits menu
+       - edit_menu_panel -> editMessageText path, only for menu UI
+       - rebuild_menu_at_bottom -> deletes old menu, sends fresh
+    """
+    import inspect as _inspect
+    from bot import telegram_bot as tb
+
+    src_send = _inspect.getsource(tb.send_chat_reply)
+    rep.add("send_chat_reply_uses_sendMessage", "telegram_routing",
+            "await send(" in src_send and "edit_msg" not in src_send,
+            "calls send() and not edit_msg")
+
+    src_edit = _inspect.getsource(tb.edit_menu_panel)
+    rep.add("edit_menu_panel_uses_editMessageText", "telegram_routing",
+            "edit_msg" in src_edit and "tg_call(\"editMessageText" not in src_edit,
+            "calls edit_msg()")
+
+    src_rebuild = _inspect.getsource(tb.rebuild_menu_at_bottom)
+    rep.add("rebuild_menu_deletes_old", "telegram_routing",
+            "delete_message" in src_rebuild and "save_menu_state" in src_rebuild,
+            "deletes old + saves new")
+    rep.add("rebuild_menu_sends_new", "telegram_routing",
+            "await send(" in src_rebuild,
+            "uses send() to land at bottom")
+
+    # Plain-text path: bot_loop must use send_chat_reply, NOT
+    # show_action_result, for non-callback replies.
+    src_loop = _inspect.getsource(tb.bot_loop)
+    rep.add("bot_loop_plain_text_uses_send_chat_reply", "telegram_routing",
+            "await send_chat_reply(chat_id, reply" in src_loop,
+            "plain-text branch routes through send_chat_reply")
+    rep.add("bot_loop_outer_error_uses_send_chat_reply", "telegram_routing",
+            "Telegram handler error" in src_loop,
+            "outer try/except surfaces error to admin")
+    rep.add("bot_loop_clears_pending_before_handle", "telegram_routing",
+            ("_session_clear()" in src_loop and
+             "consumed action=" in src_loop),
+            "session cleared before handler runs")
+
+    # Callback do:* path SHOULD still use show_action_result (legitimate
+    # menu edit) — confirm we didn't accidentally remove it.
+    src_cb = _inspect.getsource(tb.dispatch_callback)
+    rep.add("callback_do_uses_show_action_result", "telegram_routing",
+            "show_action_result" in src_cb,
+            "callback do: still edits panel")
+
+    # Auth must compare as strings (avoid int/str mismatch).
+    src_auth = _inspect.getsource(tb.is_admin_chat)
+    rep.add("is_admin_chat_compares_strings", "telegram_routing",
+            "str(chat_id) == str(TG_ADMIN)" in src_auth,
+            "string comparison only")
+
+
+def eval_sessions(rep: EvalReport) -> None:
+    """Permission-session scopes + ALWAYS_CONFIRM_HINTS overrides."""
+    from bot.agent.sessions import (
+        VALID_SCOPES, can_auto_approve, grant_session, revoke_session,
+        current_session, current_scope, ALWAYS_CONFIRM_HINTS,
+    )
+
+    rep.add("sessions_default_low_only", "sessions",
+            current_scope() == "low_only",
+            f"current_scope={current_scope()}")
+
+    # No active session → low only auto-approves
+    revoke_session(user="eval")  # clear any leftover
+    ok, _ = can_auto_approve("low",    goal="hello")
+    rep.add("sessions_default_low_ok", "sessions", ok, "")
+    ok, _ = can_auto_approve("medium", goal="update product")
+    rep.add("sessions_default_medium_blocked", "sessions",
+            not ok, "medium blocked at default scope")
+    ok, _ = can_auto_approve("high",   goal="restart bot")
+    rep.add("sessions_default_high_blocked", "sessions",
+            not ok, "high always blocked at default")
+
+    # Grant low_medium for 5 min → medium auto-approves, high still blocked.
+    grant_session("low_medium", 5, user="eval")
+    ok, _ = can_auto_approve("medium", goal="update product")
+    rep.add("sessions_low_medium_allows_medium", "sessions", ok,
+            "low_medium → medium auto-approve")
+    ok, _ = can_auto_approve("high",   goal="post to TikTok")
+    rep.add("sessions_low_medium_blocks_high", "sessions",
+            not ok, "high still blocked")
+
+    # ALWAYS_CONFIRM_HINTS override every scope.
+    for hint_word, sample_goal in [
+        (".env",          "edit .env file"),
+        ("storage_state", "rotate storage_state"),
+        ("restart",       "restart tiktok-bot"),
+        ("deploy",        "deploy prod"),
+        ("rollback",      "rollback prod"),
+    ]:
+        ok, why = can_auto_approve("low", goal=sample_goal)
+        rep.add(f"always_confirm[{hint_word}]", "sessions",
+                not ok, f"blocked: {why[:60]}")
+
+    # Cleanup
+    revoke_session(user="eval")
+    rep.add("sessions_revoke_works", "sessions",
+            current_session() is None, "session cleared")
+
+    # Validate scope set is sealed
+    expected_scopes = {"low_only", "low_medium",
+                       "code_low_medium", "admin_readonly"}
+    rep.add("sessions_valid_scope_set", "sessions",
+            set(VALID_SCOPES) == expected_scopes,
+            f"VALID_SCOPES={set(VALID_SCOPES)}")
+
+
+def eval_lifecycle_edges(rep: EvalReport) -> None:
+    """Edge cases the basic lifecycle eval doesn't cover."""
+    from bot.agent.task_lifecycle import (validate_transition, can_auto_execute,
+                                            is_terminal, valid_next_states,
+                                            transition_table, TERMINAL)
+
+    # paused → queued is the safe re-entry point
+    ok, _ = validate_transition("paused", "queued")
+    rep.add("paused_to_queued_ok", "lifecycle_edges", ok, "")
+    # paused → running is NOT allowed (must go via queued)
+    ok, _ = validate_transition("paused", "running")
+    rep.add("paused_to_running_blocked", "lifecycle_edges",
+            not ok, "must re-queue from paused")
+
+    # failed → queued reopens; failed → running is rejected
+    ok, _ = validate_transition("failed", "queued")
+    rep.add("failed_can_reopen_to_queued", "lifecycle_edges", ok, "")
+    ok, _ = validate_transition("failed", "running")
+    rep.add("failed_to_running_blocked", "lifecycle_edges",
+            not ok, "")
+
+    # cancelled is fully terminal — cannot reopen anywhere
+    for new in ("queued", "planning", "running", "done"):
+        ok, _ = validate_transition("cancelled", new)
+        rep.add(f"cancelled_to_{new}_blocked", "lifecycle_edges",
+                not ok, "cancelled is sticky")
+
+    # done is terminal
+    rep.add("done_is_terminal", "lifecycle_edges",
+            is_terminal("done"), "")
+    rep.add("cancelled_is_terminal", "lifecycle_edges",
+            is_terminal("cancelled"), "")
+    rep.add("failed_is_terminal", "lifecycle_edges",
+            is_terminal("failed"), "")
+    rep.add("queued_not_terminal", "lifecycle_edges",
+            not is_terminal("queued"), "")
+
+    # can_auto_execute: never auto-runs high-risk
+    rep.add("auto_exec_blocks_high_risk", "lifecycle_edges",
+            not can_auto_execute({"status": "queued",
+                                   "risk_level": "high"})[0],
+            "high never auto-runs")
+    # paused tasks never auto-run
+    rep.add("auto_exec_blocks_paused", "lifecycle_edges",
+            not can_auto_execute({"status": "paused",
+                                   "risk_level": "low"})[0],
+            "paused blocked")
+    # waiting_confirm never auto-runs without confirm
+    rep.add("auto_exec_blocks_waiting_confirm", "lifecycle_edges",
+            not can_auto_execute({"status": "waiting_confirm",
+                                   "risk_level": "low"})[0],
+            "waiting_confirm blocked")
+    # low + queued → can auto-run
+    rep.add("auto_exec_low_queued_ok", "lifecycle_edges",
+            can_auto_execute({"status": "queued",
+                                "risk_level": "low"})[0],
+            "")
+
+    # transition_table is well-formed (every key in STATES, every value
+    # only contains valid states)
+    tt = transition_table()
+    from bot.agent.task_lifecycle import STATES
+    rep.add("transition_table_keys_valid", "lifecycle_edges",
+            all(k in STATES for k in tt.keys()), "")
+    rep.add("transition_table_values_valid", "lifecycle_edges",
+            all(v in STATES for vs in tt.values() for v in vs), "")
+
+    # No state can transition to itself except via the no-op pathway
+    # (we accept self-loops in validate_transition explicitly).
+    for s in STATES:
+        ok, why = validate_transition(s, s)
+        rep.add(f"selfloop[{s}]", "lifecycle_edges", ok,
+                "self-loop accepted as no-op")
+
+
 def eval_prompt_builder(rep: EvalReport) -> None:
     from bot.agent.prompt_builder import (build_coding_prompt,
                                            classify_coding_task,
@@ -375,6 +561,12 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_code_tasks(rep)
     if category in (None, "prompt"):
         eval_prompt_builder(rep)
+    if category in (None, "telegram_routing"):
+        eval_telegram_routing(rep)
+    if category in (None, "sessions"):
+        eval_sessions(rep)
+    if category in (None, "lifecycle_edges"):
+        eval_lifecycle_edges(rep)
 
     rep.finished_at = time.time()
     return rep
