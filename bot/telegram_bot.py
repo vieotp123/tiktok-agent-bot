@@ -715,6 +715,7 @@ def menu_agent() -> tuple[str, dict]:
          ("📜 Policy",         "do:agent_policy")],
         [("👥 Workers",        "do:agent_workers"),
          ("➡ Next Mission",    "do:agent_next")],
+        [("📊 Progress",       "do:agent_progress")],
         [("🧭 Plan Goal",      "input:agent_plan"),
          ("▶ Run Goal",        "input:agent_run")],
         _nav_row("main"),
@@ -3433,6 +3434,8 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return handle_agent_workers()
     if action == "agent_next":
         return handle_agent_next()
+    if action == "agent_progress":
+        return await handle_agent_progress()
     if action == "products":
         return handle_products()
     if action == "products_active":

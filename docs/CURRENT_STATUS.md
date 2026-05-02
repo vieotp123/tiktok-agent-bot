@@ -8,6 +8,8 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 > `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
 > contract this task exercised.
 
+- `/agent_progress` is now reachable from the Self-Operating Agent menu (`📊 Progress` button under `nav:agent`); same handler the slash command + NL intent already use, surfacing autorun/brain/quota/queue/audit snapshots in one panel.
+
 ## Owner Tooling Doctrine + Remote Workers v1
 
 ### Doctrine — never refuse a request generically
