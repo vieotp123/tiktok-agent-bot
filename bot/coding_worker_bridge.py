@@ -53,6 +53,17 @@ CODING_WORKER_USER = (os.environ.get("CODING_WORKER_USER") or "").strip()
 # Absolute path to the claude binary (usually a per-user install). When
 # unset we fall back to shutil.which("claude").
 CLAUDE_CLI_PATH    = (os.environ.get("CLAUDE_CLI_PATH")    or "").strip()
+# Model alias or full id passed to `claude --model`. Aliases ('opus',
+# 'sonnet') resolve to the latest of that family inside the CLI; full
+# ids ('claude-opus-4-7') pin to a specific version. Default 'opus'
+# because we want the strongest available coding model.
+_CLAUDE_MODEL_ENV   = (os.environ.get("CLAUDE_CODE_MODEL") or "").strip()
+CLAUDE_CODE_MODEL   = _CLAUDE_MODEL_ENV or "opus"
+CLAUDE_CODE_MODEL_SOURCE = "env" if _CLAUDE_MODEL_ENV else "default"
+# Hardcoded fallback handed to `claude --fallback-model` so the CLI auto-
+# switches when the primary is overloaded. Sonnet 4.6 is the
+# next-best coding model below Opus 4.7.
+CLAUDE_FALLBACK_MODEL = "sonnet"
 
 # Forbidden-name regex applied to staged files before commit. Matches the
 # kill-list in bot/agent/sessions.py + obvious credential patterns.
@@ -108,11 +119,25 @@ def _which(name: str) -> str | None:
 
 def _run_as_prefix(tool_name: str) -> list[str]:
     """argv prefix to drop privileges to CODING_WORKER_USER for the
-    claude CLI. Returns [] when no user is configured or the tool is
-    not claude."""
-    if tool_name == "claude" and CODING_WORKER_USER:
-        return ["sudo", "-n", "-u", CODING_WORKER_USER, "-H"]
-    return []
+    claude CLI, including an `env` wrapper so we can still pass
+    ANTHROPIC_MODEL through (sudo otherwise strips it). Returns []
+    when no user is configured or the tool is not claude.
+    """
+    if tool_name != "claude" or not CODING_WORKER_USER:
+        return []
+    return [
+        "sudo", "-n", "-u", CODING_WORKER_USER, "-H",
+        "env", f"ANTHROPIC_MODEL={CLAUDE_CODE_MODEL}",
+    ]
+
+
+def _claude_model_args() -> list[str]:
+    """Flags appended after the claude binary so we always pin the
+    selected model and have an automatic fallback when it's overloaded."""
+    return [
+        "--model", CLAUDE_CODE_MODEL,
+        "--fallback-model", CLAUDE_FALLBACK_MODEL,
+    ]
 
 
 def effective_run_user(tool_name: str) -> str:
@@ -184,57 +209,87 @@ def get_preferred_coding_tool() -> Optional[ToolInfo]:
     return pool[0]
 
 
-_AUTH_TEST_CACHE: dict[str, tuple[float, str]] = {}
-_AUTH_TEST_TTL_SEC = 60.0
+_AUTH_TEST_CACHE: dict[str, tuple[float, dict]] = {}
+_AUTH_TEST_TTL_SEC = 300.0  # 5 min — model probe is billable
 
 
-def quick_auth_test(tool: ToolInfo, *, timeout: float = 20.0) -> str:
+def quick_auth_test(tool: ToolInfo, *, timeout: float = 30.0) -> dict:
     """Drive a tiny non-interactive completion to confirm the CLI is
-    authenticated. Returns 'ok' on success, otherwise 'fail: <reason>'.
-    Cached for _AUTH_TEST_TTL_SEC per (binary, run_as) to avoid burning
-    quota on each /code_worker_status call. The probe prompt is fixed
-    ('ping') so it never carries user content.
+    authenticated AND record which model actually answered.
+
+    Returns a dict::
+        {"auth": "ok"|"fail: <reason>",
+         "actual_model": "claude-opus-4-7"|"" ,
+         "fallback_used": bool}
+
+    The prompt is fixed ("ping") so it never carries user content. We
+    request --output-format json so the response includes a modelUsage
+    map keyed by the actual model id, which is the only honest way to
+    detect that --fallback-model fired.
+
+    Cached per (binary, run_as, selected_model) for _AUTH_TEST_TTL_SEC.
     """
+    blank = {"auth": "skip: tool not probable",
+             "actual_model": "", "fallback_used": False}
     if not tool or not tool.noninteractive_ok:
-        return "fail: tool not non-interactive"
-    cache_key = f"{tool.binary}|{effective_run_user(tool.name)}"
+        return {**blank, "auth": "fail: tool not non-interactive"}
+    cache_key = (f"{tool.binary}|{effective_run_user(tool.name)}|"
+                 f"{CLAUDE_CODE_MODEL}")
     now = time.time()
     cached = _AUTH_TEST_CACHE.get(cache_key)
     if cached and (now - cached[0]) < _AUTH_TEST_TTL_SEC:
         return cached[1]
-    cmd: list[str] = []
-    if tool.name == "claude":
-        cmd = _run_as_prefix("claude") + [tool.binary, "--print"]
-    else:
+    if tool.name != "claude":
         # Only claude has a stable cheap probe; codex would need an
         # actual `codex exec` round-trip. Skip for now.
-        result = "skip: only claude probed"
+        result = {**blank, "auth": "skip: only claude probed"}
         _AUTH_TEST_CACHE[cache_key] = (now, result)
         return result
+
+    cmd = (_run_as_prefix("claude")
+           + [tool.binary, *_claude_model_args(),
+              "--output-format", "json", "--print"])
     try:
         proc = subprocess.run(
             cmd, input="ping\n", capture_output=True, text=True,
             timeout=timeout, cwd=str(REPO), env=_scrub_env(),
         )
     except subprocess.TimeoutExpired:
-        result = f"fail: timeout after {timeout:.0f}s"
+        result = {**blank, "auth": f"fail: timeout after {timeout:.0f}s"}
         _AUTH_TEST_CACHE[cache_key] = (now, result)
         return result
     except FileNotFoundError as e:
-        result = f"fail: {e}"
+        result = {**blank, "auth": f"fail: {e}"}
         _AUTH_TEST_CACHE[cache_key] = (now, result)
         return result
+
+    out: dict = {"auth": "ok", "actual_model": "", "fallback_used": False}
+    combined_lower = (proc.stdout + proc.stderr).lower()
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip().splitlines()
         head = err[0][:120] if err else f"rc={proc.returncode}"
-        result = f"fail: {head}"
-    elif "login" in (proc.stdout + proc.stderr).lower() and \
-         "not logged in" in (proc.stdout + proc.stderr).lower():
-        result = "fail: not logged in"
+        out["auth"] = f"fail: {head}"
+    elif "not logged in" in combined_lower:
+        out["auth"] = "fail: not logged in"
     else:
-        result = "ok"
-    _AUTH_TEST_CACHE[cache_key] = (now, result)
-    return result
+        # Parse JSON to discover the actual model. Fall back to "ok"
+        # without model info if parsing fails — the CLI succeeded.
+        try:
+            import json as _json
+            parsed = _json.loads(proc.stdout.strip().splitlines()[-1])
+            mu = parsed.get("modelUsage") or {}
+            if mu:
+                actual = sorted(mu.keys())[0]
+                out["actual_model"]  = actual
+                out["fallback_used"] = (
+                    CLAUDE_CODE_MODEL.lower() in ("opus",)
+                    and not actual.startswith("claude-opus")
+                )
+        except Exception:
+            pass
+
+    _AUTH_TEST_CACHE[cache_key] = (now, out)
+    return out
 
 
 def coding_tool_status() -> str:
@@ -253,15 +308,31 @@ def coding_tool_status() -> str:
         if t.notes:
             lines.append(f"   <i>{t.notes}</i>")
     if pref:
-        run_as     = effective_run_user(pref.name)
-        nonint     = "ok" if pref.noninteractive_ok else "no"
-        auth       = quick_auth_test(pref) if pref.name == "claude" else "skip"
+        run_as = effective_run_user(pref.name)
+        nonint = "ok" if pref.noninteractive_ok else "fail"
+        if pref.name == "claude":
+            probe = quick_auth_test(pref)
+        else:
+            probe = {"auth": "skip", "actual_model": "",
+                     "fallback_used": False}
         lines.append("")
         lines.append("<b>Effective config</b>")
         lines.append(f"  tool=<code>{pref.name}</code>")
         lines.append(f"  path=<code>{pref.binary}</code>")
         lines.append(f"  run_as=<code>{run_as}</code>")
-        lines.append(f"  auth_test=<code>{auth}</code>")
+        lines.append(f"  selected_model=<code>{CLAUDE_CODE_MODEL}</code>")
+        lines.append(f"  model_source=<code>{CLAUDE_CODE_MODEL_SOURCE}</code>")
+        if probe.get("actual_model"):
+            lines.append(
+                f"  actual_model=<code>{probe['actual_model']}</code>"
+            )
+        if probe.get("fallback_used"):
+            lines.append(
+                f"  ⚠ <i>Opus unavailable, using "
+                f"{CLAUDE_FALLBACK_MODEL} fallback</i>"
+            )
+        lines.append(f"  fallback_model=<code>{CLAUDE_FALLBACK_MODEL}</code>")
+        lines.append(f"  auth_test=<code>{probe['auth']}</code>")
         lines.append(f"  non_interactive=<code>{nonint}</code>")
     return "\n".join(lines)
 
@@ -290,8 +361,11 @@ def build_worker_command(tool: ToolInfo, prompt_path: Path, task_id: str
         # `claude --print` reads instructions from stdin and prints
         # the assistant's reply; combined with the prompt template it
         # is enough to drive a code_task end-to-end IF the user has
-        # already authenticated the CLI (claude login).
-        return _run_as_prefix("claude") + [tool.binary, "--print"]
+        # already authenticated the CLI (claude login). --model pins
+        # the family (default 'opus'); --fallback-model lets the CLI
+        # auto-switch to sonnet if Opus is overloaded.
+        return (_run_as_prefix("claude")
+                + [tool.binary, *_claude_model_args(), "--print"])
     if tool.name == "codex":
         return [tool.binary, "exec", "--cd", str(REPO)]
     # Unknown tool — refuse to invent flags
@@ -364,7 +438,8 @@ def _scrub_env() -> dict[str, str]:
     """
     keep = {"HOME", "PATH", "USER", "LANG", "LC_ALL", "TERM",
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY",
-            "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL"}
+            "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_MODEL", "ANTHROPIC_MODEL"}
     env = {k: v for k, v in os.environ.items() if k in keep}
     # Force a non-interactive terminal so the CLI doesn't try to draw
     # a TUI and block on a missing TTY.
@@ -664,10 +739,18 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin"
     code_finish(nx["id"], commit_hash=sha,
                 test_summary=f"smoke+evals ok; pushed {sha}",
                 deploy_summary="")
+    probe = quick_auth_test(tool) if tool.name == "claude" else {}
+    actual_model = probe.get("actual_model", "")
+    fallback     = probe.get("fallback_used", False)
+    out["selected_model"] = CLAUDE_CODE_MODEL
+    out["actual_model"]   = actual_model
+    out["fallback_used"]  = fallback
     out["status"]  = "done"
     out["commit"]  = sha
-    out["summary"] = (f"worker done. tool={tool.name} duration={duration}s "
-                      f"commit={sha} log={log_path.name}")
+    model_part = (f" model={actual_model or CLAUDE_CODE_MODEL}"
+                  + (" (fallback)" if fallback else ""))
+    out["summary"] = (f"worker done. tool={tool.name}{model_part} "
+                      f"duration={duration}s commit={sha} log={log_path.name}")
     log_action(user=user, action="code_worker_done", risk_level="medium",
                status="done", result_summary=f"task={nx['id']} commit={sha}")
     return out
@@ -712,6 +795,10 @@ def format_run_result(r: dict) -> str:
         parts.append(f"task: <code>{r['task_id']}</code>")
     if r.get("tool"):
         parts.append(f"tool: <code>{r['tool']}</code>")
+    if r.get("actual_model") or r.get("selected_model"):
+        m = r.get("actual_model") or r.get("selected_model")
+        parts.append(f"model: <code>{m}</code>"
+                     + (" ⚠ fallback" if r.get("fallback_used") else ""))
     if r.get("commit"):
         parts.append(f"commit: <code>{r['commit']}</code>")
     if r.get("pending_action_id"):
