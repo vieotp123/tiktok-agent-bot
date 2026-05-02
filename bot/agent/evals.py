@@ -312,6 +312,44 @@ def eval_prompt_builder(rep: EvalReport) -> None:
     plan = build_test_plan(task)
     rep.add("test_plan_includes_smoke", "prompt",
             "smoke_test.sh" in plan, "")
+    rep.add("test_plan_includes_evals", "prompt",
+            "bot.agent.evals" in plan, "")
+    rep.add("test_plan_includes_dup_check", "prompt",
+            "uniq -d" in plan, "")
+
+    # ── New file-hint coverage ────────────────────────────────────────────
+    hint_cases = [
+        ("fix telegram menu rendering",      "bot/telegram_bot.py"),
+        ("update prompt_builder hints",      "bot/agent/prompt_builder.py"),
+        ("expand evals coverage",            "bot/agent/evals.py"),
+        ("session grant scope tweak",        "bot/agent/sessions.py"),
+        ("tweak self_check observability",   "bot/agent/self_check.py"),
+        ("new code_tasks status field",      "bot/code_tasks.py"),
+        ("worker_roles dashboard order",     "bot/agent/worker_roles.py"),
+        ("audit log JSON schema",            "bot/agent/audit_log.py"),
+        ("self_improve loop",                "bot/agent/self_improve.py"),
+        ("BTC fallback",                     "bot/tools.py"),
+        ("rebrand telegram_report",          "bot/telegram_report.py"),
+    ]
+    for desc, expect in hint_cases:
+        files = select_files_to_inspect(desc)
+        ok = expect in files
+        rep.add(f"hint[{desc[:28]!r}]", "prompt", ok,
+                f"got={files[:3]} need={expect}")
+
+    # ── New high-risk classification cases ────────────────────────────────
+    risk_cases_high = [
+        "edit deploy_prod.sh",
+        "modify rollback_prod.sh",
+        "rotate GITHUB_TOKEN",
+        "drop table products",
+        "alter table memories",
+        "merge main",
+    ]
+    for desc in risk_cases_high:
+        got = estimate_code_task_risk(desc)
+        rep.add(f"risk_high[{desc[:28]!r}]", "prompt",
+                got == "high", f"got={got}")
 
 
 # ── Driver ────────────────────────────────────────────────────────────────────

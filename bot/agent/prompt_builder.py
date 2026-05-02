@@ -30,34 +30,75 @@ PROMPTS_DIR = Path("/opt/tiktok-bot/data/code_prompts")
 # ── File-pattern hints — keyword → likely files to inspect ────────────────────
 
 _FILE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
-    (re.compile(r"\btelegram\b|\bmenu\b|\b/cancel\b|\binline\b", re.I),
+    (re.compile(r"\btelegram\b|\bmenu\b|\b/cancel\b|\binline\b|"
+                r"\bsend_chat_reply\b|\bedit_menu_panel\b", re.I),
         ("bot/telegram_bot.py", "data/telegram/menu_state.json (gitignored)")),
-    (re.compile(r"\btiktok\b|\bplaywright\b|\bdm\b|\bsender_key\b", re.I),
+    (re.compile(r"\btiktok\b|\bplaywright\b|\bdm\b|\bsender_key\b|"
+                r"\bchatgibiti\b", re.I),
         ("bot/tiktok_bot.py",  "data/chat_info.json (gitignored)")),
     (re.compile(r"\bbackend\b|\b/message\b|\b/router_status\b|\b/health\b", re.I),
         ("backend/server.py",)),
-    (re.compile(r"\b9router\b|\bllm\b|\bmodel\b|\bcomplete\b", re.I),
+    (re.compile(r"\b9router\b|\bllm\b|\bmodel\b|\bcomplete\b|"
+                r"\bgpt-5\b|\bclaude\b|\bsonnet\b|\bopus\b", re.I),
         ("bot/llm_client.py",)),
-    (re.compile(r"\bcrm\b|\bproduct\b|\blead\b|\bconsult\b|\bsales\b|\besim\b", re.I),
+    (re.compile(r"\bcrm\b|\bproduct\b|\blead\b|\bconsult\b|\bsales\b|"
+                r"\besim\b|\bsoftbank\b|\bdocomo\b", re.I),
         ("bot/business_store.py", "data/business.db (gitignored)")),
-    (re.compile(r"\bmemory\b|\blesson\b|\braw_event\b", re.I),
+    (re.compile(r"\bmemory\b|\blesson\b|\braw_event\b|\bmemory_context\b",
+                re.I),
         ("bot/memory_store.py", "data/agent_memory.db (gitignored)")),
-    (re.compile(r"\bcode[_\s]task\b|\bcoding\s+queue\b|\bworker\b", re.I),
-        ("bot/code_tasks.py", "docs/CLAUDE_CODE_WORKER.md")),
-    (re.compile(r"\bplanner\b|\bexecutor\b|\brisk\b|\bagent\b", re.I),
+    (re.compile(r"\bcode[_\s]task\b|\bcoding\s+queue\b|\bworker\b|"
+                r"\bcode_tasks\b", re.I),
+        ("bot/code_tasks.py", "docs/CLAUDE_CODE_WORKER.md",
+         "data/code_prompts/ (gitignored)")),
+    (re.compile(r"\bplanner\b|\bexecutor\b|\brisk\b|\bagent\b|"
+                r"\btask_lifecycle\b|\bplan_goal\b|\bprompt[_\s]builder\b",
+                re.I),
         ("bot/agent/planner.py", "bot/agent/executor.py",
-         "bot/agent/risk.py", "bot/agent/task_lifecycle.py")),
+         "bot/agent/risk.py", "bot/agent/task_lifecycle.py",
+         "bot/agent/prompt_builder.py")),
+    (re.compile(r"\bself[_\s]check\b|\bagent_health\b|\bagent_status\b|"
+                r"\bagent_metrics\b|\bobservability\b", re.I),
+        ("bot/agent/self_check.py", "bot/telegram_bot.py")),
+    (re.compile(r"\bsessions?\b|\bgrant_session\b|\brevoke_session\b|"
+                r"\bpermissions?\b|\bconfirm_action\b|\bpending_action\b",
+                re.I),
+        ("bot/agent/sessions.py", "bot/agent/permissions.py")),
+    (re.compile(r"\beval\b|\bevals\b|\btest\s+harness\b|\bregression\b",
+                re.I),
+        ("bot/agent/evals.py",)),
+    (re.compile(r"\bworker[_\s]roles?\b|\bworker_manager\b|\bworkers\b",
+                re.I),
+        ("bot/agent/worker_roles.py", "bot/worker_manager.py")),
+    (re.compile(r"\baudit\b|\bjsonl\b|\baudit_recent\b", re.I),
+        ("bot/agent/audit_log.py", "data/audit/actions.jsonl (gitignored)")),
+    (re.compile(r"\bself[_\s]improve\b|\bself_improve_once\b", re.I),
+        ("bot/agent/self_improve.py", "docs/ROADMAP.md",
+         "docs/CURRENT_STATUS.md")),
+    (re.compile(r"\bskill\b|\bskill_registry\b", re.I),
+        ("bot/agent/skill_registry.py",)),
     (re.compile(r"\bocr\b|\bvision\b|\bimage\b|\bphoto\b", re.I),
         ("bot/agent/skill_registry.py", "bot/telegram_files.py")),
     (re.compile(r"\bsearch\b|\bduckduckgo\b|\bcrawl\b", re.I),
         ("bot/tools.py",)),
-    (re.compile(r"\bdeploy\b|\bbackup\b|\brollback\b|\bsmoke\b", re.I),
+    (re.compile(r"\bdeploy\b|\bbackup\b|\brollback\b|\bsmoke\b|"
+                r"\bsmoke_test\b", re.I),
         ("scripts/deploy_prod.sh", "scripts/smoke_test.sh",
          "scripts/backup_prod.sh", "scripts/rollback_prod.sh")),
-    (re.compile(r"\bskill\b", re.I),
-        ("bot/agent/skill_registry.py",)),
-    (re.compile(r"\bsystemd\b|\b\.service\b|\bunit\b", re.I),
+    (re.compile(r"\bsystemd\b|\b\.service\b|\bunit\b|\bmanage\.sh\b",
+                re.I),
         ("systemd/", "manage.sh")),
+    (re.compile(r"\bbtc\b|\bbitcoin\b|\bcoingecko\b", re.I),
+        ("bot/tools.py",)),
+    (re.compile(r"\breminder\b|\bremind_at\b", re.I),
+        ("bot/reminders.py",)),
+    (re.compile(r"\bfile[_\s]upload\b|\bfile[_\s]hub\b|\binbox\b|"
+                r"\bsend_file\b", re.I),
+        ("bot/telegram_files.py",)),
+    (re.compile(r"\btelegram_report\b|\bnotif\b", re.I),
+        ("bot/telegram_report.py",)),
+    (re.compile(r"\btask_queue\b|\brun_task\b|\bgeneral\s+task\b", re.I),
+        ("bot/agent/task_queue.py", "bot/agent/runner.py")),
 )
 
 
@@ -93,9 +134,20 @@ def estimate_code_task_risk(description: str) -> str:
     if re.search(r"\btiktok_bot\.py\b|\btiktok\s+reader\b|\bplaywright\b", d):
         return "high"
     if re.search(r"\b\.env\b|\bstorage[_\s]state\b|\bsystemd\b|"
-                 r"\bnginx\b|\bmain\s+branch\b", d):
+                 r"\bnginx\b|\bmain\s+branch\b|\bmerge\s+main\b", d):
         return "high"
-    if re.search(r"\bdb\s+migration\b|\bdrop\s+table\b|\bschema\b", d):
+    if re.search(r"\bdb\s+migration\b|\bdrop\s+table\b|\bschema\s+change\b|"
+                 r"\balter\s+table\b|\brm\s+-rf\b", d):
+        return "high"
+    # Deploy / rollback scripts and systemd unit files run with elevated
+    # privileges; treat as high unless the change is purely textual (the
+    # admin must confirm the actual deploy).
+    if re.search(r"\bdeploy_prod\.sh\b|\brollback_prod\.sh\b|"
+                 r"\b/etc/systemd\b|\b\.service\s+file\b", d):
+        return "high"
+    # Auth / secret / token plumbing is high-risk: any bug leaks creds.
+    if re.search(r"\bgithub_token\b|\btelegram_bot_token\b|"
+                 r"\b9router\s+key\b|\bcredential\b|\bauth\s+header\b", d):
         return "high"
 
     cls = classify_coding_task(description)
@@ -275,43 +327,67 @@ def build_test_plan(task: dict) -> str:
 
     base = [
         "1. `python -m py_compile <changed files>` — must succeed.",
-        "2. `bash scripts/smoke_test.sh` — must end with `🎉 SMOKE TEST PASSED`.",
-        "3. `python -m bot.code_tasks list` — your task should still appear "
-        "in queued/running until you finish/fail it.",
+        "2. `bash scripts/smoke_test.sh` — must end with "
+        "`🎉 SMOKE TEST PASSED`.",
+        "3. `python -m bot.agent.evals` — must end with "
+        "`Agent Evals — N/N passed`. No new regressions.",
+        "4. `python -m bot.code_tasks list` — your task should still "
+        "appear in queued/running until you finish/fail it.",
+        "5. No duplicate function names: "
+        "`grep -nE '^(async )?def [a-zA-Z_]+\\b' bot/telegram_bot.py | "
+        "sed -E 's/.*def ([a-zA-Z_]+).*/\\1/' | sort | uniq -d` "
+        "must be empty.",
     ]
 
     extras: dict[str, list[str]] = {
         "bug": [
-            "4. Add or extend a test that exercises the bug. The test "
+            "6. Add or extend a test that exercises the bug. The test "
             "must FAIL on the buggy code and PASS on your fix.",
-            "5. Reproduce the bug end-to-end via the Telegram menu or "
+            "7. Reproduce the bug end-to-end via the Telegram menu or "
             "backend curl, then verify the fix end-to-end the same way.",
+            "8. Add a regression eval to `bot/agent/evals.py` so the "
+            "bug is locked out for the future.",
         ],
         "feature": [
-            "4. Run `python -m bot.agent.evals` (when present) — no new "
-            "regressions.",
-            "5. Add at least one direct test invocation in the test plan "
-            "of the form `python -c 'from bot... import X; assert X(...)'`.",
+            "6. Add at least one direct in-process test of the form "
+            "`python -c 'from bot... import X; assert X(...)'`.",
+            "7. If the feature exposes a Telegram command, add a "
+            "live-style test: import the handler and call it with a "
+            "representative input; assert the returned text contains "
+            "the expected markers.",
+            "8. Update `docs/CURRENT_STATUS.md` with one bullet "
+            "describing the new behaviour.",
         ],
         "refactor": [
-            "4. Run the eval suite. Behaviour must be byte-identical "
-            "wherever feasible.",
-            "5. Diff is structural, not behavioural — prefer renames + "
+            "6. Run the eval suite. Behaviour must be byte-identical "
+            "where feasible.",
+            "7. Diff is structural, not behavioural — prefer renames + "
             "extracts to logic changes.",
+            "8. If you removed a public symbol, grep the repo for "
+            "remaining call sites: "
+            "`grep -rn 'old_name' bot backend scripts docs`.",
         ],
         "docs": [
-            "4. Verify the markdown renders sanely (no broken HTML).",
-            "5. Check that any code blocks copy-paste-runnable.",
+            "6. Verify the markdown renders sanely (no unclosed code "
+            "fences, no broken HTML, no `<` outside code blocks).",
+            "7. Every code block should be copy-paste runnable as-is.",
+            "8. Cross-link to related docs (SELF_OPERATING_AGENT, "
+            "OPERATING_RULES, CLAUDE_CODE_WORKER) where relevant.",
         ],
         "infra": [
-            "4. Run the script locally with `--dry-run` if it supports it.",
-            "5. Manually verify the post-restart smoke test passes if the "
-            "change touches systemd or service definitions.",
+            "6. Run the script locally with a dry-run flag or echo "
+            "harness before invoking systemctl / git-push.",
+            "7. Manually verify a post-restart smoke test passes if the "
+            "change touches systemd, nginx, or service definitions.",
+            "8. Confirm the script does NOT log any token / cookie / "
+            "storage_state to stdout or journal.",
         ],
         "test": [
-            "4. Run the new test once with the bug present (must fail), "
-            "then with the fix (must pass).",
-            "5. Time-box the new test under 30s total.",
+            "6. Run the new test once with the bug present (must FAIL), "
+            "then with the fix (must PASS).",
+            "7. Time-box the new test under 30s total.",
+            "8. Wire the new test into `bot/agent/evals.py` so it runs "
+            "as part of `/agent_evals` going forward.",
         ],
     }
 
