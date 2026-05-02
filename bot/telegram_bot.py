@@ -182,9 +182,17 @@ async def tg_call_multipart(method: str, data: dict, files: dict) -> dict:
         return r.json()
 
 
+def _strip_html_tags(text: str) -> str:
+    """Naive HTML strip — for fallback when Telegram rejects parse_mode=HTML."""
+    import re as _re
+    return _re.sub(r"<[^>]+>", "", text)
+
+
 async def send(chat_id: str | int, text: str,
                reply_markup: Optional[dict] = None) -> Optional[int]:
-    """Send message, return message_id or None."""
+    """Send message with HTML; on parse failure, fall back to plain text.
+    Returns message_id or None.
+    """
     if not text:
         return None
     payload: dict = {
@@ -196,7 +204,16 @@ async def send(chat_id: str | int, text: str,
         payload["reply_markup"] = reply_markup
     r = await tg_call("sendMessage", payload)
     if not r.get("ok"):
-        log(f"send error: {r.get('description','?')} text_preview={text[:40]!r}")
+        desc = (r.get("description") or "?")[:160]
+        log(f"send error: {desc} text_preview={text[:40]!r}")
+        if "parse" in desc.lower() or "entit" in desc.lower():
+            # Retry as plain text — at least the admin sees something
+            payload.pop("parse_mode", None)
+            payload["text"] = _strip_html_tags(text)[:MAX_REPLY_LEN]
+            r = await tg_call("sendMessage", payload)
+            if r.get("ok"):
+                log(f"send fallback=plain ok message_id="
+                    f"{(r.get('result') or {}).get('message_id')}")
     mid = (r.get("result") or {}).get("message_id")
     if reply_markup and mid:
         log(f"menu sent chat_id={chat_id} message_id={mid}")
@@ -205,7 +222,8 @@ async def send(chat_id: str | int, text: str,
 
 async def edit_msg(chat_id: str | int, message_id: int, text: str,
                    reply_markup: Optional[dict] = None) -> bool:
-    """Edit a message; return True on success."""
+    """Edit message with HTML; on parse failure fall back to plain text.
+    Returns True on success."""
     payload: dict = {
         "chat_id":    chat_id,
         "message_id": message_id,
@@ -216,11 +234,17 @@ async def edit_msg(chat_id: str | int, message_id: int, text: str,
         payload["reply_markup"] = reply_markup
     r = await tg_call("editMessageText", payload)
     if not r.get("ok"):
-        desc = (r.get("description") or "")[:120]
-        # "message is not modified" is a benign no-op — counts as success
+        desc = (r.get("description") or "")[:160]
         if "not modified" in desc.lower():
             return True
         log(f"menu edit failed reason={desc!r} message_id={message_id}")
+        if "parse" in desc.lower() or "entit" in desc.lower():
+            payload.pop("parse_mode", None)
+            payload["text"] = _strip_html_tags(text)[:MAX_REPLY_LEN]
+            r = await tg_call("editMessageText", payload)
+            if r.get("ok"):
+                log(f"menu edit fallback=plain ok message_id={message_id}")
+                return True
         return False
     return True
 
@@ -230,6 +254,22 @@ async def answer_cb(callback_query_id: str, text: str = "") -> None:
         "callback_query_id": callback_query_id,
         "text": text[:200],
     })
+
+
+async def delete_message(chat_id: str | int, message_id: int) -> bool:
+    """Best-effort delete. Returns True if Telegram accepted it."""
+    try:
+        r = await tg_call("deleteMessage",
+                          {"chat_id": chat_id, "message_id": int(message_id)})
+        return bool(r.get("ok"))
+    except Exception:
+        return False
+
+
+async def is_admin_chat(chat_id: str | int) -> bool:
+    """Authorize callback / message: only TELEGRAM_ADMIN_CHAT_ID may interact.
+    Compares as strings to avoid int/str mismatch."""
+    return str(chat_id) == str(TG_ADMIN)
 
 
 async def send_document(chat_id: str | int, path: str, caption: str = "") -> bool:
@@ -300,6 +340,34 @@ def result_keyboard(back_to: str = "main") -> dict:
 
 
 # ── High-level menu rendering (edit-in-place; resend only when needed) ────────
+
+async def rebuild_menu_at_bottom(chat_id: str | int, text: str, keyboard: dict,
+                                 menu_name: str = "main") -> int:
+    """
+    Force-place a fresh menu at the bottom of the chat:
+      1. Send a new menu message → it appears at the bottom.
+      2. Delete the previously-tracked menu message (if any) so the chat
+         doesn't accumulate stale duplicate menus.
+      3. Save the new message_id as active.
+
+    Used for /menu, /start, /help — places where the user explicitly wants
+    the menu in front of them right now.
+    """
+    old_state = get_menu_state(chat_id) or {}
+    old_mid   = old_state.get("message_id")
+
+    new_id = await send(chat_id, text, keyboard)
+    if not new_id:
+        log(f"menu mode=send FAILED — could not send fresh menu chat_id={chat_id}")
+        return 0
+    log(f"menu mode=send message_id={new_id} view={menu_name!r} (rebuild_at_bottom)")
+    save_menu_state(chat_id, int(new_id), last_menu=menu_name)
+
+    if old_mid and int(old_mid) != int(new_id):
+        ok = await delete_message(chat_id, int(old_mid))
+        log(f"menu old_mid={old_mid} deleted={ok}")
+    return int(new_id)
+
 
 async def send_or_edit_menu(chat_id: str | int, text: str, keyboard: dict,
                             menu_name: str = "main",
@@ -411,117 +479,165 @@ async def show_result(chat_id: str | int, result: str, *,
                              preferred_message_id=msg_id, view=view)
 
 
+# Common nav row: 🏠 Main Menu only at root sub-menus; deeper screens get
+# both Back + Main. We expose helpers here so all menus look consistent.
+HOME_BTN = ("🏠 Main Menu", "menu:main")
+BACK_BTN = ("◀ Back",      "menu:main")  # rebuilt below per submenu
+
+
+def _nav_row(back_to: str = "main") -> list[tuple[str, str]]:
+    """Footer row for every sub-menu: Back to parent + 🏠 Main Menu."""
+    if back_to == "main":
+        return [HOME_BTN]
+    return [("◀ Back", f"nav:{back_to}"), HOME_BTN]
+
+
+def _panel(header_emoji: str, title: str, body: str = "", footer: str = "") -> str:
+    """Render a consistent panel header + optional body block."""
+    parts = [f"{header_emoji} <b>{title}</b>"]
+    if body:
+        parts.append(body.strip())
+    if footer:
+        parts.append(f"<i>{footer}</i>")
+    return "\n\n".join(parts)
+
+
 def menu_main() -> tuple[str, dict]:
-    text = (
-        "<b>🤖 Bot Control Panel</b>\n"
-        "Choose a category:"
+    text = _panel(
+        "🤖", "Agent Command Center",
+        body=(
+            "Status: ✅ online\n"
+            "Router: <code>cx/gpt-5.5</code>\n"
+            "Mode: Telegram Control Plane\n\n"
+            "Choose a module:"
+        ),
+        footer="Type a message to chat with the agent · /help for commands",
     )
     kb = make_keyboard([
-        [("📊 Status", "nav:status"), ("🤖 Router/Models", "nav:router")],
-        [("🧠 Tasks",  "nav:tasks"),  ("🔎 Search",        "nav:search")],
-        [("📁 Files",  "nav:files"),  ("🧩 Skills",        "nav:skills")],
-        [("💾 Memory", "nav:memory"), ("💼 Sales/CRM",      "nav:sales")],
-        [("⚙️ Admin",  "nav:admin")],
+        [("📊 Status",   "nav:status"), ("🤖 Models",     "nav:router")],
+        [("🧠 Tasks",    "nav:tasks"),  ("🔎 Search",     "nav:search")],
+        [("📁 Files",    "nav:files"),  ("🧩 Skills",     "nav:skills")],
+        [("💾 Memory",   "nav:memory"), ("💼 Sales CRM",  "nav:sales")],
+        [("⚙️ Admin",    "nav:admin"),  ("❓ Help",       "do:help")],
     ])
     return text, kb
 
 
 def menu_status() -> tuple[str, dict]:
-    text = "<b>📊 Status</b>"
+    text = _panel("📊", "Status Center",
+                  body="Service health, recent logs, and TikTok DM context.")
     kb = make_keyboard([
-        [("🏥 Health", "do:health"), ("📋 Logs", "do:logs")],
-        [("🎮 TikTok Chat Info", "do:tiktok_chat_info")],
-        BACK_ROW,
+        [("🏥 Health",          "do:health"),
+         ("📋 Logs",            "do:logs")],
+        [("🎮 TikTok Chat",     "do:tiktok_chat_info")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_router() -> tuple[str, dict]:
-    text = "<b>🤖 Router / Models</b>"
+    text = _panel("🤖", "Model Router",
+                  body="9Router gateway — chat <code>cx/gpt-5.5</code>, "
+                       "coding <code>cc/claude-sonnet-4-6</code>.")
     kb = make_keyboard([
-        [("📡 Router Status", "do:router_status"), ("📑 Models", "do:models")],
-        [("🗂 Model Policy", "do:model_policy")],
-        BACK_ROW,
+        [("📡 Router Status", "do:router_status"),
+         ("🗂 Model Policy",  "do:model_policy")],
+        [("📑 Models",        "do:models")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_tasks() -> tuple[str, dict]:
-    text = "<b>🧠 Tasks</b>"
+    text = _panel("🧠", "Task Center",
+                  body="Durable jobs: search, BTC, chat. High-risk needs confirm.")
     kb = make_keyboard([
-        [("📋 Task List", "do:tasks"), ("▶ Run Task", "input:run_task")],
+        [("📋 Task List",       "do:tasks"),
+         ("▶ Run Task",         "input:run_task")],
         [("⏳ Pending Actions", "do:pending_actions")],
-        BACK_ROW,
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_search() -> tuple[str, dict]:
-    text = "<b>🔎 Search</b>"
+    text = _panel("🔎", "Research",
+                  body="Web search via DuckDuckGo, summarised by 9Router.")
     kb = make_keyboard([
-        [("🌐 Search Web", "input:search_web"), ("🔬 Deep Research", "input:deep_research")],
-        BACK_ROW,
+        [("🌐 Search Web",     "input:search_web"),
+         ("🔬 Deep Research",  "input:deep_research")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_files() -> tuple[str, dict]:
-    text = "<b>📁 Files</b>"
+    text = _panel("📁", "File Hub",
+                  body="Telegram inbox: photos, docs, audio, video, voice.")
     kb = make_keyboard([
-        [("📂 Recent Files", "do:files"), ("📤 Send File", "input:send_file")],
-        [("📖 Upload Guide", "do:upload_guide")],
-        BACK_ROW,
+        [("📂 Recent Files",   "do:files"),
+         ("📤 Send File",      "input:send_file")],
+        [("📖 Upload Guide",   "do:upload_guide")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_skills() -> tuple[str, dict]:
-    text = "<b>🧩 Skills</b>"
+    text = _panel("🧩", "Skills",
+                  body="Risk-tagged capabilities the agent can invoke.")
     kb = make_keyboard([
-        [("📋 List Skills", "do:skills"), ("🔍 Skill Detail", "input:skill_detail")],
-        BACK_ROW,
+        [("📋 List Skills",    "do:skills"),
+         ("🔍 Skill Detail",   "input:skill_detail")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_admin() -> tuple[str, dict]:
-    text = "<b>⚙️ Admin</b>"
+    text = _panel("⚙️", "Admin",
+                  body="High-risk admin actions. Restart requires confirm.")
     kb = make_keyboard([
-        [("📊 Git Status", "do:git_status"), ("💾 Backup", "do:backup")],
-        [("🔄 Restart Bot", "confirm:restart_bot")],
-        BACK_ROW,
+        [("📊 Git Status",     "do:git_status"),
+         ("💾 Backup",         "do:backup")],
+        [("🔄 Restart Bot",    "confirm:restart_bot")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_sales() -> tuple[str, dict]:
-    text = "<b>💼 Sales / CRM</b>"
+    text = _panel("💼", "Sales / CRM",
+                  body="Japan eSIM catalog · leads · consulting logs.\n"
+                       "Only <b>active</b> products may be quoted to customers.")
     kb = make_keyboard([
-        [("📦 All Products",  "do:products"),
-         ("✅ Active",         "do:products_active")],
-        [("⚠ Needs Update",   "do:products_needs_update"),
-         ("🚫 Disabled",       "do:products_disabled")],
-        [("➕ Add Product",    "input:product_add"),
-         ("✏ Update Product", "input:product_update")],
-        [("✅ Verify Product", "input:product_verify"),
-         ("🚫 Disable Product","input:product_disable")],
-        [("💬 Consult",        "input:consult"),
-         ("👥 Leads",          "do:leads")],
-        [("⏰ Followups",      "do:followups"),
-         ("➕ Add Lead",       "input:lead_add")],
-        BACK_ROW,
+        [("📦 All Products",   "do:products"),
+         ("✅ Active",          "do:products_active")],
+        [("⚠ Needs Update",    "do:products_needs_update"),
+         ("🚫 Disabled",        "do:products_disabled")],
+        [("➕ Add Product",     "input:product_add"),
+         ("✏ Update Product",  "input:product_update")],
+        [("✅ Verify",          "input:product_verify"),
+         ("🚫 Disable",         "input:product_disable")],
+        [("💬 Consult",         "input:consult"),
+         ("👥 Leads",           "do:leads")],
+        [("⏰ Followups",       "do:followups"),
+         ("➕ Add Lead",        "input:lead_add")],
+        _nav_row("main"),
     ])
     return text, kb
 
 
 def menu_memory() -> tuple[str, dict]:
-    text = "<b>💾 Memory</b>"
+    text = _panel("💾", "Memory",
+                  body="Persistent multi-tier memory. "
+                       "Hard prompt cap: 8 items · 6000 chars.")
     kb = make_keyboard([
-        [("🔍 Search Memory", "input:memory_search"),
-         ("➕ Add Memory",    "input:memory_add")],
-        [("📚 Lessons",       "do:memory_lessons"),
-         ("🔎 Context",       "input:memory_context")],
-        BACK_ROW,
+        [("🔍 Search Memory",  "input:memory_search"),
+         ("➕ Add Memory",     "input:memory_add")],
+        [("📚 Lessons",        "do:memory_lessons"),
+         ("🔎 Context Preview","input:memory_context")],
+        _nav_row("main"),
     ])
     return text, kb
 
@@ -655,25 +771,29 @@ def handle_skills_list() -> str:
     RISK = {"low": "🟢", "medium": "🟡", "high": "🔴"}
     lines = ["<b>Skills</b>"]
     for s in skills:
+        name = _esc(s.name)
+        desc = _esc(s.description[:60])
         lines.append(f"{'✅' if s.enabled else '❌'} {RISK.get(s.risk_level,'⚪')} "
-                     f"<b>{s.name}</b> — {s.description[:60]}")
-    lines.append("\nUse /skill <name> for details.")
+                     f"<b>{name}</b> — {desc}")
+    lines.append("\nUse /skill &lt;name&gt; for details.")
     return "\n".join(lines)
 
 
 def handle_skill_detail(name: str) -> str:
     s = get_skill(name.strip())
     if not s:
-        return f"Skill <b>{name}</b> not found."
+        return f"Skill <b>{_esc(name)}</b> not found."
     RISK = {"low": "🟢", "medium": "🟡", "high": "🔴"}
-    return "\n".join([
-        f"<b>{s.name}</b> {RISK.get(s.risk_level,'⚪')}",
-        f"Description: {s.description}",
-        f"Risk: <b>{s.risk_level}</b>",
+    parts = [
+        f"<b>{_esc(s.name)}</b> {RISK.get(s.risk_level,'⚪')}",
+        f"Description: {_esc(s.description)}",
+        f"Risk: <b>{_esc(s.risk_level)}</b>",
         f"Enabled: {'yes' if s.enabled else 'no'}",
-        f"Handler: <code>{s.handler}</code>",
-        ("Examples: " + " | ".join(s.examples[:3])) if s.examples else "",
-    ])
+        f"Handler: <code>{_esc(s.handler)}</code>",
+    ]
+    if s.examples:
+        parts.append("Examples: " + " | ".join(_esc(e) for e in s.examples[:3]))
+    return "\n".join(parts)
 
 
 def handle_tasks_list() -> str:
@@ -885,14 +1005,6 @@ def handle_workers() -> str:
     return format_workers_list()
 
 
-async def handle_memory_search(query: str) -> str:
-    """Search semantic memory for the admin user."""
-    if not query.strip():
-        return "Usage: /memory_search <query>"
-    results = search_memory_simple("tg_admin", query, limit=5)
-    return format_search_results(results, query)
-
-
 def handle_lessons(arg: str = "") -> str:
     """Return episodic lessons list, optionally filtered by skill name."""
     skill = arg.strip() or None
@@ -902,6 +1014,24 @@ def handle_lessons(arg: str = "") -> str:
 def handle_audit_recent() -> str:
     """Return last 10 audit log entries."""
     return format_audit_recent(n=10)
+
+
+def handle_help_panel() -> str:
+    """Quick command reference shown via the ❓ Help button."""
+    return (
+        "<b>❓ Help</b>\n\n"
+        "<b>Navigation:</b> tap any module button. The control panel edits "
+        "in place. Use 🏠 Main Menu to jump back.\n\n"
+        "<b>Plain text</b> sent to this chat is treated as a message to the "
+        "agent (chat / search / BTC / sales consult routed automatically).\n\n"
+        "<b>Common commands:</b>\n"
+        "/menu — refresh control panel at the bottom of chat\n"
+        "/cancel — clear pending input + return to main menu\n"
+        "/status /health /router_status /tasks /skills\n"
+        "/products /consult &lt;q&gt; /leads /lead &lt;id&gt;\n"
+        "/memory_search &lt;q&gt; /lessons /audit_recent\n\n"
+        "Long results land as a separate message; the panel stays put."
+    )
 
 
 async def handle_memory_search(query: str) -> str:
@@ -1517,6 +1647,8 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return handle_lessons("")
     if action == "memory_compact":
         return await handle_memory_compact()
+    if action == "help":
+        return handle_help_panel()
     if action == "products":
         return handle_products()
     if action == "products_active":
@@ -1592,18 +1724,20 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     arg   = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in ("/start", "/help"):
+        # Always rebuild at the bottom so the menu is in front of the admin.
         text_m, kb = menu_main()
-        await send_or_edit_menu(chat_id, text_m, kb, menu_name="main")
+        await rebuild_menu_at_bottom(chat_id, text_m, kb, menu_name="main")
         return ""
     if cmd == "/menu":
+        # /menu = "bring me the panel" → fresh send at bottom + delete stale.
         text_m, kb = menu_main()
-        await send_or_edit_menu(chat_id, text_m, kb, menu_name="main")
+        await rebuild_menu_at_bottom(chat_id, text_m, kb, menu_name="main")
         return ""
     if cmd == "/cancel":
         _session_clear()
         text_m, kb = menu_main()
-        await send_or_edit_menu(chat_id, text_m, kb, menu_name="main")
-        log("cancel: pending input cleared, menu refreshed")
+        await rebuild_menu_at_bottom(chat_id, text_m, kb, menu_name="main")
+        log("cancel: pending input cleared, menu refreshed at bottom")
         return ""
 
     if cmd == "/status":       return await handle_status()
@@ -1682,19 +1816,27 @@ async def bot_loop() -> None:
 
     log(f"start admin_chat={TG_ADMIN}")
 
-    # Drain stale updates
+    # Resume from disk-persisted offset to avoid dropping messages during
+    # bot restarts. If no offset file, use 0 = "give me all pending updates".
+    OFFSET_FILE = Path("/opt/tiktok-bot/data/telegram/getupdates_offset.txt")
+    OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
     offset = 0
-    try:
-        r = await tg_call("getUpdates", {"offset": -1, "timeout": 1})
-        updates = r.get("result", [])
-        if updates:
-            offset = updates[-1]["update_id"] + 1
-    except Exception:
-        pass
+    if OFFSET_FILE.exists():
+        try:
+            offset = int(OFFSET_FILE.read_text().strip() or "0")
+        except Exception:
+            offset = 0
+    log(f"polling offset={offset} (resumed from disk)")
 
-    log(f"polling offset={offset}")
+    def _save_offset(new_off: int) -> None:
+        try:
+            OFFSET_FILE.write_text(str(int(new_off)))
+        except Exception:
+            pass
 
+    poll_count = 0
     while True:
+        poll_count += 1
         try:
             r = await tg_call("getUpdates", {
                 "offset":          offset,
@@ -1702,20 +1844,33 @@ async def bot_loop() -> None:
                 "allowed_updates": ["message", "callback_query"],
             })
         except Exception as e:
-            log(f"getUpdates error: {e}")
+            log(f"getUpdates error #{poll_count}: {type(e).__name__}: {e}")
             await asyncio.sleep(5)
             continue
 
-        for update in r.get("result", []):
+        if not r.get("ok", True):
+            log(f"getUpdates rejected #{poll_count}: code={r.get('error_code')} "
+                f"desc={r.get('description','?')[:120]} offset={offset}")
+            await asyncio.sleep(3)
+            continue
+
+        results = r.get("result") or []
+        # Heartbeat every 5 polls (~150s) so journal shows the loop is alive
+        if poll_count % 5 == 1 or results:
+            log(f"poll #{poll_count} offset_in={offset} updates={len(results)}")
+
+        for update in results:
             offset = update["update_id"] + 1
+            _save_offset(offset)
 
             # ── Callback query (inline button press) ──────────────────────────
             cb = update.get("callback_query")
             if cb:
                 cb_chat_id = str((cb.get("message") or {}).get("chat", {}).get("id", TG_ADMIN))
                 cb_data    = cb.get("data", "")
-                authorized = cb_chat_id == str(TG_ADMIN)
-                log(f"callback data={cb_data!r} chat_id={cb_chat_id} authorized={authorized}")
+                authorized = await is_admin_chat(cb_chat_id)
+                log(f"update type=callback chat_id={cb_chat_id} data={cb_data!r}")
+                log(f"auth ok={authorized} chat_id={cb_chat_id}")
                 if not authorized:
                     await tg_call("answerCallbackQuery", {
                         "callback_query_id": cb["id"],
@@ -1741,25 +1896,19 @@ async def bot_loop() -> None:
 
             chat_id = str(msg["chat"]["id"])
             text    = (msg.get("text") or "").strip()
-            authorized = chat_id == str(TG_ADMIN)
+            authorized = await is_admin_chat(chat_id)
+            log(f"update type=message chat_id={chat_id} text={text[:60]!r}")
+            log(f"auth ok={authorized} chat_id={chat_id}")
 
             if not authorized:
-                log(f"unauthorized chat_id={chat_id}")
                 try:
-                    await tg_call("sendMessage", {"chat_id": chat_id, "text": "Not authorized."})
+                    await tg_call("sendMessage",
+                                  {"chat_id": chat_id, "text": "Not authorized."})
                 except Exception:
                     pass
                 continue
 
-            # Detect update type for logging
-            update_type = "message"
-            if text.startswith("/"):
-                cmd_name = text.split()[0].lower()
-                log(f"command={cmd_name} authorized=true chat_id={chat_id}")
-            else:
-                log(f"recv: {text[:80]!r}")
-
-            # File message (no text)
+            # ── File upload (no text) ─────────────────────────────────────────
             has_file = any(k in msg for k in ("photo","document","audio","video","voice"))
             if not text and has_file:
                 log(f"file_recv chat_id={chat_id}")
@@ -1769,63 +1918,79 @@ async def bot_loop() -> None:
                     log_action(user="tg_admin", action="file_upload", channel="telegram",
                                risk_level="low", status="ok", result_summary=reply[:100])
                 except Exception as e:
-                    log(f"file error: {e}")
+                    log(f"error handler=file_message message={e}")
                     try:
                         await show_action_result(chat_id, f"❌ File error: {e}",
                                                   view="file_error")
                     except Exception:
                         pass
                 continue
-
             if not text:
                 continue
 
-            # Check pending session state
-            session = _session_get()
-            if session and not text.startswith("/"):
-                pending_action = session["action"]
-                log(f"pending_input action={pending_action} text={text[:40]!r}")
-                try:
-                    reply = await handle_pending_input(pending_action, text, chat_id)
-                    # Show result via menu (edit if ≤3500, send + park if long)
-                    await show_action_result(chat_id, reply,
-                                             view=f"input_done:{pending_action}")
+            # ── Outer guard: every admin text must produce a reply ────────────
+            try:
+                # Pending input takes precedence over normal dispatch (only for
+                # non-command text — /cancel still works to clear it).
+                session = _session_get()
+                if session and not text.startswith("/"):
+                    pending_action = session["action"]
+                    log(f"pending_input complete={pending_action} "
+                        f"text={text[:40]!r} chat_id={chat_id}")
+                    try:
+                        reply = await handle_pending_input(pending_action, text, chat_id)
+                    except Exception as e:
+                        log(f"error handler=pending_input action={pending_action} message={e}")
+                        reply = f"❌ Error in pending input: {e}"
+                    await show_action_result(chat_id, reply or "(empty reply)",
+                                              view=f"input_done:{pending_action}")
                     log_action(user="tg_admin", action=f"input:{pending_action}",
                                channel="telegram", risk_level="low",
-                               status="ok", result_summary=reply[:100])
-                except Exception as e:
-                    log(f"pending_input error action={pending_action} err={e}")
-                    await show_action_result(chat_id, f"❌ Error: {e}",
-                                              view=f"input_error:{pending_action}")
-                continue
+                               status="ok", result_summary=(reply or "")[:100])
+                    continue
 
-            # Normal dispatch
-            try:
-                reply = await dispatch(text, chat_id)
+                # Normal dispatch (commands or plain text)
+                if text.startswith("/"):
+                    cmd_name = text.split()[0].lower()
+                    log(f"command={cmd_name} authorized=true chat_id={chat_id}")
+                else:
+                    log(f"plain_text chat_id={chat_id} text={text[:60]!r}")
+
+                try:
+                    reply = await dispatch(text, chat_id)
+                except Exception as e:
+                    log(f"error handler=dispatch text={text[:30]!r} message={e}")
+                    reply = f"❌ Error: {e}"
+
                 if reply:
-                    # Commands that return content go through show_action_result.
-                    # Short → edits the menu in place. Long → sends one extra
-                    # message and parks the menu with "Result sent above".
-                    await show_action_result(chat_id, reply,
-                                              view=f"cmd:{text.split()[0]}"
-                                              if text.startswith("/") else "chat")
+                    view = (f"cmd:{text.split()[0]}" if text.startswith("/")
+                            else "chat")
+                    await show_action_result(chat_id, reply, view=view)
                     if text.startswith("/"):
                         log(f"cmd_reply cmd={text.split()[0]} via show_action_result")
                     log_action(
                         user="tg_admin",
                         action=text.split()[0][:30] if text.startswith("/") else "chat",
-                        channel="telegram",
-                        risk_level="low",
-                        status="ok",
-                        result_summary=reply[:100],
+                        channel="telegram", risk_level="low",
+                        status="ok", result_summary=reply[:100],
                     )
                 elif text.startswith("/"):
-                    # /menu /start /cancel render menus directly via show_menu
-                    log(f"cmd_done cmd={text.split()[0]} (rendered via show_menu)")
+                    # /menu /start /cancel /help render menus inline via
+                    # rebuild_menu_at_bottom — return value is ""
+                    log(f"cmd_done cmd={text.split()[0]} (rendered via menu helper)")
+                else:
+                    # Plain text returned empty — never silently drop. Always
+                    # surface SOMETHING so the admin knows we received it.
+                    fallback = "🤔 (empty reply from agent — try rephrasing)"
+                    log(f"plain_text reply EMPTY — sending fallback to chat_id={chat_id}")
+                    await show_action_result(chat_id, fallback, view="chat_empty")
             except Exception as e:
-                log(f"dispatch error cmd={text[:30]!r} err={e}")
+                # Last-resort safety net — must not crash the polling loop.
+                log(f"error handler=outer text={text[:30]!r} message={e}")
                 try:
-                    await show_action_result(chat_id, f"❌ Error: {e}", view="error")
+                    await show_action_result(chat_id,
+                                              f"❌ Internal error: {e}",
+                                              view="fatal_error")
                 except Exception:
                     pass
 
