@@ -237,6 +237,41 @@ async def send(chat_id: str | int, text: str,
     return mid
 
 
+# ── Intent-named wrappers around send/edit_msg ───────────────────────────────
+#
+# IMPORTANT distinction (this caused the v1.5 "menu drift" bug):
+#   send_chat_reply  → ALWAYS a new sendMessage; does NOT touch the menu.
+#                       Use for plain admin chat, command results, errors,
+#                       pending-input results.
+#   edit_menu_panel  → editMessageText on the active menu message.
+#                       Use ONLY for menu navigation / button actions.
+#
+async def send_chat_reply(chat_id: str | int, text: str,
+                           reply_markup: Optional[dict] = None
+                           ) -> Optional[int]:
+    """Always send a NEW chat message. Never edits the menu panel.
+
+    This is the safe default for any reply that came from a normal text
+    message (plain admin chat, command results, pending-input results,
+    error reports). HTML→plain fallback inherited from send().
+    """
+    if not text:
+        return None
+    log(f"reply=send_chat chat_id={chat_id} text_preview={text[:40]!r}")
+    return await send(chat_id, text, reply_markup)
+
+
+async def edit_menu_panel(chat_id: str | int, message_id: int, text: str,
+                           reply_markup: Optional[dict] = None) -> bool:
+    """Edit the active menu panel in place. ONLY for menu/callback UI.
+
+    Returns True on success.
+    """
+    log(f"reply=edit_menu chat_id={chat_id} message_id={message_id} "
+        f"text_preview={text[:40]!r}")
+    return await edit_msg(chat_id, message_id, text, reply_markup)
+
+
 async def edit_msg(chat_id: str | int, message_id: int, text: str,
                    reply_markup: Optional[dict] = None) -> bool:
     """Edit message with HTML; on parse failure fall back to plain text.
@@ -2266,14 +2301,16 @@ async def bot_loop() -> None:
                 log(f"file_recv chat_id={chat_id}")
                 try:
                     reply = await handle_file_message(msg, chat_id)
-                    await show_action_result(chat_id, reply, view="file_upload")
-                    log_action(user="tg_admin", action="file_upload", channel="telegram",
-                               risk_level="low", status="ok", result_summary=reply[:100])
+                    # File-upload result is a normal chat message, not a
+                    # menu edit.
+                    await send_chat_reply(chat_id, reply)
+                    log_action(user="tg_admin", action="file_upload",
+                               channel="telegram", risk_level="low",
+                               status="ok", result_summary=reply[:100])
                 except Exception as e:
                     log(f"error handler=file_message message={e}")
                     try:
-                        await show_action_result(chat_id, f"❌ File error: {e}",
-                                                  view="file_error")
+                        await send_chat_reply(chat_id, f"❌ File error: {e}")
                     except Exception:
                         pass
                 continue
@@ -2282,67 +2319,85 @@ async def bot_loop() -> None:
 
             # ── Outer guard: every admin text must produce a reply ────────────
             try:
-                # Pending input takes precedence over normal dispatch (only for
-                # non-command text — /cancel still works to clear it).
+                # ── 1. pending_input ─────────────────────────────────────────
+                # Active iff:
+                #   - session exists and not expired (TTL=600s in _session_get)
+                #   - text is not a slash-command (so /cancel etc. still work)
                 session = _session_get()
                 if session and not text.startswith("/"):
                     pending_action = session["action"]
-                    log(f"pending_input complete={pending_action} "
-                        f"text={text[:40]!r} chat_id={chat_id}")
+                    log(f"route=pending_input action={pending_action} "
+                        f"chat_id={chat_id}")
+                    # Consume immediately — clear before processing so
+                    # any error doesn't leave the session "stuck".
+                    _session_clear()
+                    log(f"pending cleared reason=consumed action={pending_action}")
                     try:
-                        reply = await handle_pending_input(pending_action, text, chat_id)
+                        reply = await handle_pending_input(
+                            pending_action, text, chat_id,
+                        )
                     except Exception as e:
-                        log(f"error handler=pending_input action={pending_action} message={e}")
-                        reply = f"❌ Error in pending input: {e}"
-                    await show_action_result(chat_id, reply or "(empty reply)",
-                                              view=f"input_done:{pending_action}")
-                    log_action(user="tg_admin", action=f"input:{pending_action}",
+                        import traceback as _tb
+                        log(f"error handler=pending_input action={pending_action} "
+                            f"message={e}\n{_tb.format_exc()[:500]}")
+                        reply = f"❌ Pending-input error: {e}"
+                    # Result of a pending input is delivered as a NEW chat
+                    # message — never edits the menu panel.
+                    await send_chat_reply(chat_id, reply or "(empty reply)")
+                    log_action(user="tg_admin",
+                               action=f"input:{pending_action}",
                                channel="telegram", risk_level="low",
-                               status="ok", result_summary=(reply or "")[:100])
+                               status="ok",
+                               result_summary=(reply or "")[:100])
                     continue
 
-                # Normal dispatch (commands or plain text)
+                # ── 2. command vs plain text ─────────────────────────────────
                 if text.startswith("/"):
                     cmd_name = text.split()[0].lower()
-                    log(f"command={cmd_name} authorized=true chat_id={chat_id}")
+                    log(f"route=command command={cmd_name} chat_id={chat_id}")
                 else:
-                    log(f"plain_text chat_id={chat_id} text={text[:60]!r}")
+                    log(f"route=plain_text chat_id={chat_id} "
+                        f"text={text[:60]!r}")
 
                 try:
                     reply = await dispatch(text, chat_id)
                 except Exception as e:
-                    log(f"error handler=dispatch text={text[:30]!r} message={e}")
+                    import traceback as _tb
+                    log(f"error handler=dispatch text={text[:30]!r} "
+                        f"message={e}\n{_tb.format_exc()[:500]}")
                     reply = f"❌ Error: {e}"
 
+                # ── 3. Reply policy ──────────────────────────────────────────
+                # Plain text + most command results → NEW chat message.
+                # Menu commands (/menu /start /help /cancel) handle their
+                # own panel rendering inside dispatch and return "".
                 if reply:
-                    view = (f"cmd:{text.split()[0]}" if text.startswith("/")
-                            else "chat")
-                    await show_action_result(chat_id, reply, view=view)
-                    if text.startswith("/"):
-                        log(f"cmd_reply cmd={text.split()[0]} via show_action_result")
+                    await send_chat_reply(chat_id, reply)
                     log_action(
                         user="tg_admin",
-                        action=text.split()[0][:30] if text.startswith("/") else "chat",
+                        action=text.split()[0][:30] if text.startswith("/")
+                                                    else "chat",
                         channel="telegram", risk_level="low",
                         status="ok", result_summary=reply[:100],
                     )
                 elif text.startswith("/"):
-                    # /menu /start /cancel /help render menus inline via
-                    # rebuild_menu_at_bottom — return value is ""
-                    log(f"cmd_done cmd={text.split()[0]} (rendered via menu helper)")
+                    log(f"cmd_done cmd={text.split()[0]} "
+                        "(rendered via menu helper inside dispatch)")
                 else:
-                    # Plain text returned empty — never silently drop. Always
-                    # surface SOMETHING so the admin knows we received it.
+                    # Plain text returned empty — never silently drop.
                     fallback = "🤔 (empty reply from agent — try rephrasing)"
-                    log(f"plain_text reply EMPTY — sending fallback to chat_id={chat_id}")
-                    await show_action_result(chat_id, fallback, view="chat_empty")
+                    log(f"plain_text reply EMPTY — sending fallback "
+                        f"chat_id={chat_id}")
+                    await send_chat_reply(chat_id, fallback)
             except Exception as e:
                 # Last-resort safety net — must not crash the polling loop.
-                log(f"error handler=outer text={text[:30]!r} message={e}")
+                import traceback as _tb
+                log(f"error handler=outer text={text[:30]!r} message={e}\n"
+                    f"{_tb.format_exc()[:500]}")
                 try:
-                    await show_action_result(chat_id,
-                                              f"❌ Internal error: {e}",
-                                              view="fatal_error")
+                    await send_chat_reply(
+                        chat_id, f"⚠️ Telegram handler error: {e}",
+                    )
                 except Exception:
                     pass
 
