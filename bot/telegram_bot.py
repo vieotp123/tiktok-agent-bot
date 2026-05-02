@@ -59,6 +59,13 @@ def log(msg: str) -> None:
     print(f"[{ts}][tg] {msg}", flush=True)
 
 
+def _esc(text: str) -> str:
+    """Escape HTML special characters in user-provided text."""
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
 def _looks_like_task(text: str) -> bool:
     if len(text) < 25:
         return False
@@ -422,34 +429,36 @@ def handle_tasks_list() -> str:
     for t in tasks:
         in_f = json.loads(t.get("input_files") or "[]")
         ftag = f" 📎{len(in_f)}" if in_f else ""
+        goal_safe = _esc(t.get("goal", "")[:40])
+        type_safe = _esc(t.get("type", ""))
         lines.append(
             f"{ICON.get(t['status'],'•')} <code>{t['task_id']}</code> "
-            f"[{t['type']}]{ftag} {t['goal'][:40]} <i>({t['created_at'][11:16]})</i>"
+            f"[{type_safe}]{ftag} {goal_safe} <i>({t['created_at'][11:16]})</i>"
         )
-    lines.append("\nUse /task <id> for details.")
+    lines.append("\nUse /task &lt;id&gt; for details.")
     return "\n".join(lines)
 
 
 def handle_task_detail(task_id: str) -> str:
     t = get_task(task_id.strip())
     if not t:
-        return f"Task <code>{task_id}</code> not found."
+        return f"Task <code>{_esc(task_id)}</code> not found."
     in_f  = json.loads(t.get("input_files")  or "[]")
     out_f = json.loads(t.get("output_files") or "[]")
     lines = [
         f"<b>Task {t['task_id']}</b>",
-        f"Type: {t['type']} | Status: <b>{t['status']}</b>",
-        f"Goal: {t['goal'][:100]}",
+        f"Type: {_esc(t['type'])} | Status: <b>{t['status']}</b>",
+        f"Goal: {_esc(t['goal'][:100])}",
         f"Created: {t['created_at']}",
     ]
     if in_f:
-        lines.append(f"Input files: {', '.join(str(f) for f in in_f)}")
+        lines.append(f"Input files: {', '.join(_esc(str(f)) for f in in_f)}")
     if out_f:
-        lines.append(f"Output files: {', '.join(str(f) for f in out_f)}")
+        lines.append(f"Output files: {', '.join(_esc(str(f)) for f in out_f)}")
     if t.get("result_summary"):
-        lines.append(f"Result:\n<pre>{t['result_summary'][:400]}</pre>")
+        lines.append(f"Result:\n<pre>{_esc(t['result_summary'][:400])}</pre>")
     if t.get("error"):
-        lines.append(f"Error: {t['error'][:200]}")
+        lines.append(f"Error: {_esc(t['error'][:200])}")
     return "\n".join(lines)
 
 
