@@ -162,17 +162,55 @@ def start(
 
 
 def stop(*, user: str = "tg_admin", reason: str = "user") -> dict:
+    """Stop autorun and clean up any orphaned `running` code_tasks.
+
+    When stop() fires while a Claude CLI session is mid-edit (e.g.
+    admin redeploy / "dừng" mid-cycle), the bridge subprocess gets
+    killed but the task row stays at status=running forever. Owner
+    saw this exact symptom: '🔧 Đang chạy: ctk_2cfc4cd15b ... ⚠ Task
+    DB =running nhưng không thấy Claude/Codex process'.
+
+    Fix: on every stop(), sweep code_tasks. If a task is `running`
+    and no Claude/Codex process is currently active for it, reset
+    status to `queued` so the next start picks it up cleanly.
+    """
     d = state()
-    was_enabled = d.get("enabled")
     d["enabled"]   = False
     d["last_status"] = f"stopped:{reason}"
     _save(d)
+
+    # Sweep stale running tasks
+    recovered = 0
+    try:
+        from bot.code_tasks import list_tasks as _lt, update_task as _ut
+        # Are there active claude/codex --print processes?
+        worker_alive = False
+        try:
+            import subprocess as _sp
+            r = _sp.run(["pgrep", "-f", "(claude|codex).*--print"],
+                        capture_output=True, text=True, timeout=2)
+            worker_alive = bool(r.stdout.strip())
+        except Exception:
+            pass
+        if not worker_alive:
+            for t in _lt(limit=50):
+                if t.get("status") != "running":
+                    continue
+                try:
+                    _ut(t["id"], status="queued")
+                    recovered += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     try:
         from bot.agent.audit_log import log_action
         log_action(user=user, action="agent_autorun_stop",
                    risk_level="low", status="ok",
                    result_summary=f"reason={reason} "
-                                  f"completed={d.get('completed_tasks',0)}")
+                                  f"completed={d.get('completed_tasks',0)} "
+                                  f"recovered_stale={recovered}")
     except Exception:
         pass
     return d
@@ -358,6 +396,16 @@ def _esc(s: str) -> str:
 
 
 def status_panel_vi() -> str:
+    # Defer time formatting to telegram_bot._fmt_iso_local so all
+    # panels share one TZ logic. Avoid hard-importing at module load
+    # time (telegram_bot imports agent_autorun → cycle); call lazily.
+    def _ftime(s: str | None) -> str:
+        try:
+            from bot.telegram_bot import _fmt_iso_local
+            return _fmt_iso_local(s) or (s or "")
+        except Exception:
+            return s or ""
+
     d = state()
     icon = "🟢" if d.get("enabled") else "⚪"
     lines = [f"{icon} <b>Agent Autorun</b>"]
@@ -369,7 +417,7 @@ def status_panel_vi() -> str:
     if d.get("hours"):
         lines.append(f"Thời lượng: <b>{d['hours']}h</b>")
     if d.get("started_at"):
-        lines.append(f"Bắt đầu: <code>{d['started_at']}</code>")
+        lines.append(f"Bắt đầu: {_ftime(d['started_at'])}")
     if d.get("stop_at"):
         # Compute remaining
         nxt = _parse_iso(d["stop_at"])
@@ -378,9 +426,9 @@ def status_panel_vi() -> str:
             mins = int(remain.total_seconds() // 60)
             if mins > 0:
                 lines.append(f"Còn lại: <b>~{mins // 60}h {mins % 60}m</b> "
-                             f"(stop_at <code>{d['stop_at']}</code>)")
+                             f"(stop_at: {_ftime(d['stop_at'])})")
             else:
-                lines.append(f"⏰ Đã quá hạn stop_at <code>{d['stop_at']}</code>")
+                lines.append(f"⏰ Đã quá hạn stop_at {_ftime(d['stop_at'])}")
     lines.append(f"Đã xong: <b>{d.get('completed_tasks', 0)}</b> / "
                  f"<b>{d.get('max_tasks', 0)}</b> task · "
                  f"thất bại liên tiếp: <b>"
@@ -388,9 +436,9 @@ def status_panel_vi() -> str:
     if d.get("paused_reason"):
         lines.append(f"⏸ <b>Đang pause</b>: {_esc(str(d['paused_reason']))}")
         if d.get("next_probe_at"):
-            lines.append(f"  thử lại lúc: <code>{d['next_probe_at']}</code>")
+            lines.append(f"  thử lại lúc: {_ftime(d['next_probe_at'])}")
     if d.get("last_run_at"):
-        lines.append(f"Run gần nhất: <code>{d['last_run_at']}</code>")
+        lines.append(f"Run gần nhất: {_ftime(d['last_run_at'])}")
     if d.get("last_task_id"):
         lines.append(
             f"Task gần nhất: <code>{_esc(str(d['last_task_id']))}</code> "

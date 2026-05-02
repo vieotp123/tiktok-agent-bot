@@ -11,9 +11,52 @@ import os
 import subprocess
 import sys
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+
+# Owner timezone for friendly display in Telegram panels.
+# muaesim.vn / Chatgibiti is a Japan-eSIM business → default JST.
+# Override via env: OWNER_TIMEZONE=Asia/Ho_Chi_Minh / Asia/Tokyo / etc.
+try:
+    from zoneinfo import ZoneInfo
+    _OWNER_TZ_NAME = os.getenv("OWNER_TIMEZONE", "Asia/Tokyo")
+    _OWNER_TZ = ZoneInfo(_OWNER_TZ_NAME)
+    _OWNER_TZ_LABEL = {
+        "Asia/Tokyo":         "JST",
+        "Asia/Ho_Chi_Minh":   "ICT",
+        "Asia/Bangkok":       "ICT",
+        "Asia/Seoul":         "KST",
+        "Asia/Shanghai":      "CST",
+        "Asia/Singapore":     "SGT",
+    }.get(_OWNER_TZ_NAME, _OWNER_TZ_NAME.split("/")[-1])
+except Exception:
+    _OWNER_TZ = timezone.utc
+    _OWNER_TZ_LABEL = "UTC"
+
+
+def _fmt_iso_local(iso_str: str | None) -> str:
+    """Convert a UTC ISO string into "HH:MM:SS LOCAL (UTC YYYY-MM-DD HH:MM)".
+
+    Returns the original string on parse failure so we never crash a
+    panel just because of a bad timestamp. Empty/None input → "".
+    Owner's complaint: "giờ trên noti telegram đó ko chuẩn với giờ
+    thực tế" — UTC strings looked alien at 5 AM JST.
+    """
+    if not iso_str:
+        return ""
+    try:
+        s = iso_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt_utc = datetime.fromisoformat(s)
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(_OWNER_TZ)
+        return (f"{dt_local.strftime('%H:%M:%S')} {_OWNER_TZ_LABEL} "
+                f"<i>({dt_utc.strftime('%m-%d %H:%M')} UTC)</i>")
+    except Exception:
+        return iso_str
 
 import httpx
 from dotenv import load_dotenv
@@ -1923,13 +1966,13 @@ async def handle_agent_progress() -> str:
             if d.get("paused_reason"):
                 lines.append(f"  ⏸ Pause: <i>{_esc(str(d['paused_reason']))}</i>")
                 if d.get("next_probe_at"):
-                    lines.append(f"  thử lại: <code>{d['next_probe_at']}</code>")
+                    lines.append(f"  thử lại: {_fmt_iso_local(d['next_probe_at'])}")
             if d.get("last_task_id"):
                 lines.append(
                     f"  Task gần nhất: <code>{_esc(str(d['last_task_id']))}</code> "
                     f"<i>{_esc(str(d.get('last_status', '?')))}</i>")
             if d.get("stop_at"):
-                lines.append(f"  Stop_at: <code>{d['stop_at']}</code>")
+                lines.append(f"  Stop_at: {_fmt_iso_local(d['stop_at'])}")
         else:
             lines.append("⚪ Autorun: <b>off</b>")
     except Exception as e:
@@ -1960,9 +2003,9 @@ async def handle_agent_progress() -> str:
                 "unknown": "⚪"}.get(st, "❓")
         lines.append(f"{icon} <b>Claude:</b> {st}")
         if cqs.get("next_probe_at"):
-            lines.append(f"  next_probe: <code>{cqs['next_probe_at']}</code>")
+            lines.append(f"  next_probe: {_fmt_iso_local(cqs['next_probe_at'])}")
         if cqs.get("reset_at"):
-            lines.append(f"  reset_at: <code>{cqs['reset_at']}</code>")
+            lines.append(f"  reset_at: {_fmt_iso_local(cqs['reset_at'])}")
     except Exception:
         pass
 
@@ -2039,9 +2082,46 @@ async def handle_agent_progress() -> str:
                     f"<b>{elapsed}</b> ({pcpu_}% CPU)")
         elif running:
             # Task in DB says running but no worker process exists →
-            # likely stale; flag it so admin knows.
-            lines.append("  ⚠ <i>Task DB =running nhưng không thấy "
-                         "Claude/Codex process — có thể stale</i>")
+            # auto-recover by resetting to queued so the next autorun
+            # cycle / /code_worker_run_once picks it up cleanly.
+            # Owner: "ko biết worker có đang chạy ko nữa" — fix is to
+            # not just flag stale, but actively heal it.
+            recovered: list[str] = []
+            for t in running:
+                tid = t.get("id", "")
+                # Be conservative: only auto-reset if the running task
+                # was started > 60s ago (so we don't race with a
+                # bridge call that just flipped status=running but
+                # hasn't spawned the subprocess yet).
+                started = t.get("updated_at") or t.get("created_at") or ""
+                age_ok = True
+                try:
+                    s = started
+                    if s.endswith("Z"):
+                        s = s[:-1] + "+00:00"
+                    dt_started = datetime.fromisoformat(s)
+                    if dt_started.tzinfo is None:
+                        dt_started = dt_started.replace(tzinfo=timezone.utc)
+                    age_sec = (datetime.now(timezone.utc) -
+                               dt_started).total_seconds()
+                    age_ok = age_sec > 60
+                except Exception:
+                    pass
+                if age_ok and tid:
+                    try:
+                        from bot.code_tasks import update_task as _ut
+                        _ut(tid, status="queued")
+                        recovered.append(tid)
+                    except Exception:
+                        pass
+            if recovered:
+                lines.append(
+                    f"  🩹 Auto-recovered {len(recovered)} stale task(s) "
+                    f"→ <code>queued</code>: "
+                    + ", ".join(f"<code>{_esc(t)}</code>" for t in recovered[:3]))
+            else:
+                lines.append("  ⚠ <i>Task DB =running nhưng không thấy "
+                             "Claude/Codex process — chờ thêm để chắc</i>")
         nx = code_next_task() if queued else None
         if nx:
             lines.append(f"<b>📋 Next queued:</b> "
