@@ -1,0 +1,14 @@
+.env
+*.env
+tiktok_storage_state.json
+storage_state.json
+venv/
+__pycache__/
+*.pyc
+node_modules/
+backups/
+screenshots/
+data/uploads/
+data/cache/
+*.log
+.DS_Store

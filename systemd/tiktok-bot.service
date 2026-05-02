@@ -1,0 +1,22 @@
+[Unit]
+Description=TikTok DM AI Bot (Playwright)
+After=network.target tiktok-backend.service
+Requires=tiktok-backend.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tiktok-bot
+EnvironmentFile=/opt/tiktok-bot/.env
+Environment=DISPLAY=:99
+ExecStart=/opt/tiktok-bot/venv/bin/python -u bot/tiktok_bot.py
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tiktok-bot
+
+[Install]
+WantedBy=multi-user.target
