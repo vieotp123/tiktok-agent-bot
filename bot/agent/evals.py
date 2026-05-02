@@ -1050,6 +1050,65 @@ def eval_ocr(rep: EvalReport) -> None:
             f"skill={skill}")
 
 
+async def eval_seo(rep: EvalReport) -> None:
+    """SEO research worker v0 — module hygiene + skill + worker role."""
+    from bot.seo_research import (
+        _slug, fetch_google_suggestions, research_keyword,
+        format_research_vi,
+    )
+    from bot.agent.skill_registry import get_skill
+    from bot.agent.worker_roles import list_worker_roles
+
+    # _slug: stable, capped, never empty.
+    rep.add("seo_slug_basic", "seo",
+            _slug("eSIM Nhật") == "esim-nhật", f"got={_slug('eSIM Nhật')!r}")
+    rep.add("seo_slug_empty", "seo",
+            _slug("") == "seed", f"got={_slug('')!r}")
+    rep.add("seo_slug_cap", "seo",
+            len(_slug("a" * 200)) <= 40, f"len={len(_slug('a' * 200))}")
+    rep.add("seo_slug_strips_punct", "seo",
+            _slug("Hello, World!") == "hello-world",
+            f"got={_slug('Hello, World!')!r}")
+
+    # research_keyword on empty seed must be a clean error envelope, not a raise.
+    out = await research_keyword("", lang="vi")
+    rep.add("seo_empty_seed_envelope", "seo",
+            out.get("error") == "empty_seed"
+            and out.get("suggestions") == []
+            and out.get("results") == [],
+            f"out keys={sorted(out.keys())}")
+
+    # format_research_vi handles empty + populated cases without raising.
+    rep.add("seo_format_empty_safe", "seo",
+            "thiếu seed" in format_research_vi({"seed": ""}),
+            "")
+    sample = {
+        "seed": "test",
+        "suggestions": ["a", "b"],
+        "results": [{"title": "T", "url": "u", "snippet": "s"}],
+    }
+    s_out = format_research_vi(sample)
+    rep.add("seo_format_populated", "seo",
+            "test" in s_out and "DDG" in s_out and "Google" in s_out,
+            f"len={len(s_out)}")
+
+    # Skill registered, enabled, low-risk, correct handler.
+    skill = get_skill("seo_research")
+    rep.add("seo_skill_registered", "seo",
+            skill is not None and skill.enabled
+            and skill.risk_level == "low"
+            and skill.handler == "research_keyword",
+            f"skill={skill}")
+
+    # Worker role flipped from placeholder to live.
+    seo_role = next((w for w in list_worker_roles()
+                      if w.name == "seo_marketing"), None)
+    rep.add("seo_worker_role_live", "seo",
+            seo_role is not None and seo_role.status == "live"
+            and seo_role.risk_level == "low",
+            f"role={seo_role}")
+
+
 # ── Driver ────────────────────────────────────────────────────────────────────
 
 async def run_all_evals(category: str | None = None) -> EvalReport:
@@ -1093,6 +1152,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_handler_safety(rep)
     if category in (None, "ocr"):
         eval_ocr(rep)
+    if category in (None, "seo"):
+        await eval_seo(rep)
 
     rep.finished_at = time.time()
     return rep

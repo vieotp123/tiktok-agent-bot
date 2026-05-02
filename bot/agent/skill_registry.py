@@ -204,11 +204,16 @@ register(Skill(
 
 register(Skill(
     name="seo_research",
-    description="[FUTURE] Nghiên cứu từ khóa và đối thủ SEO.",
-    risk_level="medium",
-    enabled=False,
-    handler="seo_research_handler",
-    examples=["nghiên cứu SEO chủ đề Z"],
+    description="Nghiên cứu từ khóa SEO (Google Autocomplete + DDG, "
+                "miễn phí, không cần API key). v0 read-only.",
+    risk_level="low",
+    enabled=True,
+    handler="research_keyword",
+    examples=[
+        "seo research eSIM Nhật",
+        "nghiên cứu từ khóa esim",
+        "/seo eSIM Nhật",
+    ],
 ))
 
 register(Skill(

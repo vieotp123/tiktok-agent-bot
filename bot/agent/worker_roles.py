@@ -43,9 +43,10 @@ _ROLES: tuple[WorkerRole, ...] = (
     WorkerRole("planner_executor",     "Deterministic planner + risk-gated executor "
                                        "for /agent_run.",
                "internal", "reasoning",     "low", "live"),
-    WorkerRole("seo_marketing",        "Keyword research, competitor crawl. "
-                                       "Not yet implemented — placeholder.",
-               "internal", "reasoning",     "medium", "placeholder"),
+    WorkerRole("seo_marketing",        "Keyword research v0 — Google "
+                                       "Autocomplete + DDG (free, no key). "
+                                       "See bot/seo_research.py.",
+               "internal", "reasoning",     "low",    "live"),
     WorkerRole("content_factory",      "Caption / image-gen / TikTok post drafter. "
                                        "Not yet implemented.",
                "internal", "coding",        "medium", "placeholder"),
