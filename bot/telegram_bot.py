@@ -15,13 +15,16 @@ Commands:
   /pending_actions     — list actions waiting for confirmation
   /confirm_action <id> — approve a high-risk pending action
   /cancel_action <id>  — reject a pending action
+  /tiktok_chat_info    — show current TikTok chat metadata
   Any plain text       — forwarded to backend /message (9Router)
 """
 import asyncio
+import json
 import os
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -225,6 +228,28 @@ def handle_cancel_action(action_id: str) -> str:
     return f"❌ Action <code>{action_id}</code> not found or already resolved."
 
 
+def handle_tiktok_chat_info() -> str:
+    path = Path("/opt/tiktok-bot/data/chat_info.json")
+    if not path.exists():
+        return "❌ Chưa có thông tin chat — bot chưa khởi động hoặc chưa vào chat."
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return f"❌ Đọc chat_info lỗi: {e}"
+    title    = info.get("chatTitle") or info.get("chat_name") or "?"
+    members  = info.get("memberCount", 0)
+    visible  = info.get("membersVisible", 0)
+    updated  = info.get("updated_at", "?")[:19]
+    lines = [
+        f"<b>TikTok Chat Info</b>",
+        f"Chat: <b>{title}</b>",
+        f"Members (DOM count): {members}",
+        f"Avatar imgs in header: {visible}",
+        f"Updated: <i>{updated}</i>",
+    ]
+    return "\n".join(lines)
+
+
 async def handle_run_task(goal: str) -> str:
     if not goal:
         return "Usage: /run_task <goal>\nExample: /run_task tìm thông tin mới nhất về eSIM Nhật"
@@ -290,6 +315,8 @@ async def dispatch(text: str) -> str:
         return handle_confirm_action(arg)
     if cmd in ("/cancel_action",):
         return handle_cancel_action(arg)
+    if cmd in ("/tiktok_chat_info",):
+        return handle_tiktok_chat_info()
     if low.startswith("/"):
         return (
             "Commands:\n"
@@ -297,6 +324,7 @@ async def dispatch(text: str) -> str:
             "/skills · /skill <name>\n"
             "/tasks · /task <id> · /run_task <goal> · /cancel_task <id>\n"
             "/pending_actions · /confirm_action <id> · /cancel_action <id>\n"
+            "/tiktok_chat_info\n"
             "\nOr send plain text to chat with the bot."
         )
     # Plain text → backend

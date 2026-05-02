@@ -124,6 +124,17 @@ def make_msg_key(data_id: str, sender: str, text: str, index: int) -> str:
     return "h:" + hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
+def make_sender_key(sender_name: str, sender_avatar: str, side: str, idx: int) -> str:
+    """Stable sender identifier: name → avatar URL → positional fallback."""
+    name = (sender_name or "").strip()
+    if name and name.lower() not in ("", "unknown", "unknown_user"):
+        return "n:" + hashlib.sha1(("name:" + name).encode()).hexdigest()[:12]
+    avatar = (sender_avatar or "").strip()
+    if avatar:
+        return "a:" + hashlib.sha1(("avatar:" + avatar).encode()).hexdigest()[:12]
+    return "u:" + hashlib.sha1(f"unknown:{side}:{idx}".encode()).hexdigest()[:12]
+
+
 def is_bot_own(sender: str, text: str, is_self_dom: bool) -> bool:
     """True if this message is from the bot itself."""
     # DOM-level self detection (most reliable)
@@ -339,13 +350,35 @@ _JS_EXTRACT = r"""() => {
                        el.getAttribute('data-message-id') ||
                        el.querySelector('[data-id]')?.getAttribute('data-id') || '';
 
-        // Sender
+        // Sender — from explicit label element
         let sender = '';
         const senderEl = el.querySelector(
             '[data-e2e*="sender"], [class*="sender-name"], [class*="SenderName"],' +
             '[class*="nickname"], [class*="Nickname"], [class*="Username"]'
         );
         if (senderEl) sender = senderEl.textContent.trim();
+
+        // ── Enhanced sender identification from avatar img ───────────────────
+        // TikTok avatar imgs usually carry the sender's username in alt / aria-label.
+        // Avatar src (query-stripped) gives a stable per-sender key even when the
+        // name element is absent (e.g. consecutive messages from the same user).
+        let senderName = sender;
+        let senderAvatar = '';
+        const avatarImgsInRow = Array.from(el.querySelectorAll('img'));
+        for (const img of avatarImgsInRow) {
+            const imgCls   = img.className ? img.className.toString() : '';
+            const parentCls = img.parentElement ? img.parentElement.className.toString() : '';
+            if (!/avatar/i.test(imgCls) && !/avatar/i.test(parentCls)) continue;
+            // Found the avatar img
+            const alt  = (img.getAttribute('alt')        || '').trim();
+            const aria = (img.getAttribute('aria-label') || '').trim();
+            if (!senderName && alt  && alt.length  > 0 && alt.length  < 60) senderName = alt;
+            if (!senderName && aria && aria.length > 0 && aria.length < 60) senderName = aria;
+            const src = img.getAttribute('src') || '';
+            if (src.startsWith('http')) senderAvatar = src.split('?')[0];
+            break;  // use first avatar found per row
+        }
+        const bubbleSide = isSelf ? 'right' : 'left';
 
         // Message type: text / image / sticker
         let rawType = 'text';
@@ -384,7 +417,10 @@ _JS_EXTRACT = r"""() => {
 
         if (!text && rawType === 'text') continue;
 
-        results.push({ index: idx, dataId, sender, text, rawType, isSelf, top: rect.top });
+        results.push({
+            index: idx, dataId, sender: senderName, text, rawType, isSelf,
+            senderAvatar, bubbleSide, debugSource: itemsSource, top: rect.top,
+        });
     }
 
     return results;
@@ -427,6 +463,62 @@ _JS_DEBUG_DUMP = r"""() => {
     const dmItem = document.querySelectorAll('[data-e2e="dm-message-item"]').length;
     return { inputFound, ancestry, counts, msgEls, dmList, dmItem };
 }"""
+
+
+# ── JS: chat metadata ────────────────────────────────────────────────────────
+_JS_CHAT_INFO = r"""() => {
+    // Chat title from header
+    let chatTitle = '';
+    const titleEl = (
+        document.querySelector('[data-e2e="chat-header-title"]') ||
+        document.querySelector('[class*="DivChatHeader"] [class*="title"]') ||
+        document.querySelector('[class*="ChatHeader"] [class*="title"]') ||
+        document.querySelector('[class*="DivChatHeader"] h1') ||
+        document.querySelector('[class*="DivChatHeader"] h2') ||
+        document.querySelector('[class*="DivChatHeader"] span')
+    );
+    if (titleEl) chatTitle = titleEl.textContent.trim().slice(0, 80);
+
+    // Member count — TikTok may show "X members" in header
+    let memberCount = 0;
+    const memberEl = (
+        document.querySelector('[data-e2e="chat-member-count"]') ||
+        document.querySelector('[class*="member-count" i]') ||
+        document.querySelector('[class*="MemberCount"]')
+    );
+    if (memberEl) {
+        const m = memberEl.textContent.match(/\d+/);
+        if (m) memberCount = parseInt(m[0]);
+    } else {
+        // Try to find "N members" text in the header area
+        const headerEls = document.querySelectorAll('[class*="DivChatHeader"] *, [class*="ChatHeader"] *');
+        for (const el of headerEls) {
+            if (el.children.length === 0) {
+                const t = el.textContent.trim();
+                const m2 = t.match(/^(\d+)\s*(members?|thành viên)/i);
+                if (m2) { memberCount = parseInt(m2[1]); break; }
+            }
+        }
+    }
+
+    // Visible avatars in header (rough membership signal)
+    const headerAvatarImgs = document.querySelectorAll(
+        '[class*="DivChatHeader"] img, [class*="ChatHeader"] img'
+    );
+    const membersVisible = headerAvatarImgs.length;
+
+    return { chatTitle, memberCount, membersVisible };
+}"""
+
+
+async def get_chat_info(page: Page) -> dict:
+    """Return {chatTitle, memberCount, membersVisible} from the current chat DOM."""
+    try:
+        info = await page.evaluate(_JS_CHAT_INFO)
+        return info
+    except Exception as e:
+        log("chat", f"get_chat_info error: {e}")
+        return {"chatTitle": "", "memberCount": 0, "membersVisible": 0}
 
 
 async def debug_dom_dump(page: Page) -> None:
@@ -618,13 +710,21 @@ async def read_new_messages(page: Page) -> list[dict]:
 
     new_msgs = []
     for m in raw:
-        text = (m.get("text") or "").strip()
-        sender = (m.get("sender") or "").strip()
-        raw_type = m.get("rawType", "text")
-        is_self = bool(m.get("isSelf"))
-        idx = m.get("index", 0)
+        text          = (m.get("text") or "").strip()
+        sender        = (m.get("sender") or "").strip()
+        sender_avatar = (m.get("senderAvatar") or "").strip()
+        bubble_side   = m.get("bubbleSide", "")
+        raw_type      = m.get("rawType", "text")
+        is_self       = bool(m.get("isSelf"))
+        idx           = m.get("index", 0)
+        debug_src     = m.get("debugSource", "")
 
-        key = make_msg_key(m.get("dataId",""), sender, text, idx)
+        # Derive bubble_side fallback if JS didn't send it
+        if not bubble_side:
+            bubble_side = "right" if is_self else "left"
+
+        sender_key = make_sender_key(sender, sender_avatar, bubble_side, idx)
+        key = make_msg_key(m.get("dataId", ""), sender, text, idx)
 
         # Already seen?
         if key in seen_keys:
@@ -636,7 +736,7 @@ async def read_new_messages(page: Page) -> list[dict]:
 
         # Own message?
         if is_bot_own(sender, text, is_self):
-            log("read", f"skip own key={key[:12]} text={short}")
+            log("read", f"skip own key={key[:12]} sender_key={sender_key} text={short}")
             continue
 
         # Empty text + not media
@@ -645,17 +745,20 @@ async def read_new_messages(page: Page) -> list[dict]:
 
         # Image/sticker with no text
         if raw_type in ("image", "sticker") and not text:
-            log("read", f"new media key={key[:12]} type={raw_type} sender={sender}")
+            log("read", f"new media sender={sender!r} sender_key={sender_key} side={bubble_side} type={raw_type}")
             new_msgs.append({
-                "key": key, "sender": sender, "text": "[image]" if raw_type == "image" else "[sticker]",
+                "key": key, "sender": sender, "sender_avatar": sender_avatar,
+                "sender_key": sender_key, "bubble_side": bubble_side,
+                "text": "[image]" if raw_type == "image" else "[sticker]",
                 "raw_type": raw_type, "is_own": False,
             })
             continue
 
-        log("read", f"new msg sender={sender!r} type={raw_type} text={short}")
+        log("read", f"new user message sender={sender!r} sender_key={sender_key} side={bubble_side} type={raw_type} src={debug_src!r} text={short!r}")
         new_msgs.append({
-            "key": key, "sender": sender, "text": text,
-            "raw_type": raw_type, "is_own": False,
+            "key": key, "sender": sender, "sender_avatar": sender_avatar,
+            "sender_key": sender_key, "bubble_side": bubble_side,
+            "text": text, "raw_type": raw_type, "is_own": False,
         })
 
     return new_msgs
@@ -864,6 +967,19 @@ async def bot_loop():
                 except Exception:
                     pass
 
+                # Fetch and persist chat metadata for Telegram /tiktok_chat_info
+                try:
+                    chat_info = await get_chat_info(page)
+                    chat_info["chat_name"] = TARGET_CHAT_NAME
+                    chat_info["updated_at"] = datetime.now(TZ).isoformat()
+                    _chat_info_path = "/opt/tiktok-bot/data/chat_info.json"
+                    os.makedirs(os.path.dirname(_chat_info_path), exist_ok=True)
+                    with open(_chat_info_path, "w", encoding="utf-8") as _f:
+                        json.dump(chat_info, _f, ensure_ascii=False, indent=2)
+                    log("chat", f"chat_info title={chat_info.get('chatTitle')!r} members={chat_info.get('memberCount')}")
+                except Exception as _e:
+                    log("chat", f"chat_info save error: {_e}")
+
                 async def send_reminder(msg: str):
                     await send_message(page, msg)
                     await refresh_seen(page)
@@ -879,9 +995,11 @@ async def bot_loop():
 
                         msgs = await read_new_messages(page)
                         for m in msgs:
-                            text = m["text"]
-                            sender = m.get("sender", "?")
-                            log("read", f"new user message sender={sender!r} text={text[:120]!r}")
+                            text        = m["text"]
+                            sender      = m.get("sender", "?")
+                            sender_key  = m.get("sender_key", "")
+                            bubble_side = m.get("bubble_side", "")
+                            log("process", f"sender={sender!r} key={sender_key} side={bubble_side} text={text[:80]!r}")
                             handled = await maybe_handle_shot(page, context, text)
                             if handled:
                                 continue
