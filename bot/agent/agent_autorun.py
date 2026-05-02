@@ -278,7 +278,10 @@ def populate_queue_from_roadmap() -> dict:
     """
     try:
         from bot.agent import self_improve as _si
-        result = _si.run_once()  # already idempotent
+        # Public API in self_improve.py is `self_improve_once(user=...)`,
+        # not `run_once`. Returns dict with `status` in
+        # {existing_queue, queued, pending_action, noop, error}.
+        result = _si.self_improve_once(user="autorun_pump")
         d = state()
         d["self_improve_runs"] = int(d.get("self_improve_runs") or 0) + 1
         _save(d)
@@ -513,12 +516,23 @@ async def advance_one(user: str = "tg_admin") -> dict:
     if (d.get("enabled") and d.get("auto_self_improve")
             and (result or {}).get("status") == "noop"):
         pop = populate_queue_from_roadmap()
-        if pop.get("status") in ("queued", "ran", "ok"):
-            # Try again with the newly-queued task
+        pop_status = (pop or {}).get("status", "")
+        if pop_status in ("queued", "existing_queue"):
+            # New task in queue — run it.
             result2 = await bridge.run_once(user=user)
             record_outcome(result2)
             return result2
-        # If self_improve produced nothing actionable, leave state as
-        # "queue_empty_will_self_improve" — scheduler will retry on
-        # next quota tick.
+        if pop_status == "pending_action":
+            # Next roadmap item is high-risk → wait for owner.
+            d["paused_reason"] = "roadmap_high_risk_pending_action"
+            from datetime import timedelta
+            nxt = (_now() + timedelta(hours=1)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            d["next_probe_at"] = nxt
+            _save(d)
+        elif pop_status == "noop":
+            # Roadmap exhausted → stop politely.
+            stop(user="autorun_pump", reason="roadmap_exhausted")
+        # status="error" or unknown → leave as queue_empty_will_self_improve
+        # (the next pump cycle will retry).
     return result
