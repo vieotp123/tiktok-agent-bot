@@ -1,5 +1,6 @@
 """
 Task runner — executes skills, updates task queue, logs to audit.
+Auto-lesson hook: records episodic lessons after task completion/failure.
 """
 import asyncio
 import os
@@ -16,6 +17,7 @@ from bot.tools import (
 )
 from bot.agent.task_queue import create_task, update_task
 from bot.agent.audit_log import log_action
+from bot.memory_store import add_raw_event, add_lesson, update_task_state
 
 BACKEND = os.getenv("BACKEND_URL", "http://localhost:8000")
 
@@ -43,11 +45,29 @@ async def _call_backend(username: str, content: str, source: str = "task") -> st
 
 async def run_task(goal: str, user: str = "tg_admin") -> dict:
     """
-    Create task → execute → update queue → audit log.
+    Create task → execute → update queue → audit log → auto-lesson hook.
     Returns: {task_id, type, status, result}
     """
     task_type = detect_task_type(goal)
-    task_id = create_task(type_=task_type, goal=goal, status="running")
+    task_id   = create_task(type_=task_type, goal=goal, status="running")
+
+    # ── Track task state in memory store ──────────────────────────────────────
+    update_task_state(
+        str(task_id),
+        status="running",
+        goal=goal,
+        current_step="start",
+    )
+
+    # ── Log task start as raw event ───────────────────────────────────────────
+    add_raw_event(
+        source=user,
+        action=f"run_task:{task_type}",
+        summary=f"Starting {task_type}: {goal[:100]}",
+        actor=user,
+        event_type="task_start",
+        task_id=str(task_id),
+    )
 
     try:
         if task_type == "btc_price":
@@ -65,6 +85,8 @@ async def run_task(goal: str, user: str = "tg_admin") -> dict:
             progress="100%",
             result_summary=result[:500],
         )
+        update_task_state(str(task_id), status="done", current_step="complete")
+
         log_action(
             user=user,
             action=f"run_task:{task_type}",
@@ -74,11 +96,34 @@ async def run_task(goal: str, user: str = "tg_admin") -> dict:
             task_id=task_id,
             goal=goal[:120],
         )
+
+        # ── Auto-lesson: log successful task execution ────────────────────────
+        add_raw_event(
+            source=user,
+            action=f"run_task:{task_type}",
+            summary=f"Task done: {goal[:80]} → {result[:120]}",
+            actor=user,
+            event_type="task_done",
+            task_id=str(task_id),
+        )
+
+        # Record lesson for search/btc tasks (these have deterministic outcomes)
+        if task_type in ("search_web", "btc_price"):
+            add_lesson(
+                skill=task_type,
+                outcome="success",
+                lesson_text=f"Successfully executed '{goal[:60]}'. Result length: {len(result)} chars.",
+                task_id=str(task_id),
+                importance=3,  # routine success — low importance
+            )
+
         return {"task_id": task_id, "type": task_type, "status": "done", "result": result}
 
     except Exception as e:
         err = str(e)[:200]
         update_task(task_id, status="failed", error=err)
+        update_task_state(str(task_id), status="failed", current_step="error")
+
         log_action(
             user=user,
             action=f"run_task:{task_type}",
@@ -88,4 +133,24 @@ async def run_task(goal: str, user: str = "tg_admin") -> dict:
             task_id=task_id,
             goal=goal[:120],
         )
+
+        # ── Auto-lesson: record failure with root cause ───────────────────────
+        add_raw_event(
+            source=user,
+            action=f"run_task:{task_type}",
+            summary=f"Task failed: {goal[:80]} → error: {err[:100]}",
+            actor=user,
+            event_type="task_failed",
+            task_id=str(task_id),
+        )
+
+        add_lesson(
+            skill=task_type,
+            outcome="failure",
+            lesson_text=f"Failed: '{goal[:60]}'. Error: {err[:120]}",
+            task_id=str(task_id),
+            root_cause=err[:200],
+            importance=6,  # failures are more important to remember
+        )
+
         return {"task_id": task_id, "type": task_type, "status": "failed", "result": err}

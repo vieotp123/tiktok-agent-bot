@@ -32,8 +32,10 @@ from bot.telegram_files import (
 )
 from bot.worker_manager import format_workers_list, touch_worker
 from bot.memory_store import (
-    search_memory_simple, format_search_results,
+    search_memory_simple, search_memory, format_search_results,
     list_lessons, format_lessons_list,
+    add_memory, delete_memory, compact_memories,
+    build_memory_context, list_memories,
 )
 
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -212,7 +214,7 @@ def menu_main() -> tuple[str, dict]:
         [("📊 Status", "nav:status"), ("🤖 Router/Models", "nav:router")],
         [("🧠 Tasks",  "nav:tasks"),  ("🔎 Search",        "nav:search")],
         [("📁 Files",  "nav:files"),  ("🧩 Skills",        "nav:skills")],
-        [("⚙️ Admin", "nav:admin")],
+        [("💾 Memory", "nav:memory"), ("⚙️ Admin",         "nav:admin")],
     ])
     return text, kb
 
@@ -280,6 +282,17 @@ def menu_admin() -> tuple[str, dict]:
     kb = make_keyboard([
         [("📊 Git Status", "do:git_status"), ("💾 Backup", "do:backup")],
         [("🔄 Restart Bot", "confirm:restart_bot")],
+        BACK_ROW,
+    ])
+    return text, kb
+
+
+def menu_memory() -> tuple[str, dict]:
+    text = "<b>🧠 Memory</b>"
+    kb = make_keyboard([
+        [("🔍 Search Memory", "input:memory_search"), ("➕ Add Memory", "input:memory_add")],
+        [("📚 Lessons", "do:memory_lessons"), ("🗑 Forget", "input:memory_forget")],
+        [("🗜 Compact", "do:memory_compact"), ("🔎 Context", "input:memory_context")],
         BACK_ROW,
     ])
     return text, kb
@@ -663,6 +676,94 @@ def handle_audit_recent() -> str:
     return format_audit_recent(n=10)
 
 
+async def handle_memory_search(query: str) -> str:
+    """Search semantic memory for the admin namespace."""
+    if not query.strip():
+        return "Usage: /memory_search &lt;query&gt;"
+    results = search_memory(query.strip(), namespace="tg_admin", limit=5)
+    # Also search global
+    global_results = search_memory(query.strip(), namespace="global", limit=3)
+    seen = {r["id"] for r in results}
+    for r in global_results:
+        if r["id"] not in seen:
+            results.append(r)
+    return format_search_results(results, query.strip())
+
+
+async def handle_memory_add(text: str) -> str:
+    """
+    Add a memory from Telegram.
+    Format: Title | content | tag1,tag2
+    or just:  content
+    """
+    text = text.strip()
+    if not text:
+        return "Usage: /memory_add &lt;title&gt; | &lt;content&gt; [| tag1,tag2]"
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) >= 3:
+        title, content, tag_str = parts[0], parts[1], parts[2]
+        tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+    elif len(parts) == 2:
+        title, content = parts[0], parts[1]
+        tags = []
+    else:
+        title, content, tags = "", parts[0], []
+
+    if not content:
+        return "❌ Content cannot be empty."
+
+    mid = add_memory(
+        title=title or content[:60],
+        content=content,
+        namespace="tg_admin",
+        tags=tags,
+        importance=5,
+    )
+    log_action(user="tg_admin", action="memory_add", risk_level="low",
+               status="ok", result_summary=f"id={mid} title={title[:40]!r}")
+    return (
+        f"✅ Memory <code>{mid}</code> saved.\n"
+        f"Title: <b>{_esc(title or content[:60])}</b>\n"
+        + (f"Tags: {', '.join(tags)}" if tags else "")
+    )
+
+
+def handle_memory_forget(arg: str) -> str:
+    """Delete a memory by ID."""
+    arg = arg.strip()
+    if not arg.isdigit():
+        return "Usage: /memory_forget &lt;id&gt;  (get id from /memory_search)"
+    mid = int(arg)
+    ok = delete_memory(mid)
+    if ok:
+        log_action(user="tg_admin", action="memory_forget", risk_level="low",
+                   status="ok", result_summary=f"deleted id={mid}")
+        return f"🗑 Memory <code>{mid}</code> deleted."
+    return f"❌ Memory <code>{mid}</code> not found."
+
+
+async def handle_memory_compact() -> str:
+    """Compact memories: keep top-50 by importance, delete the rest."""
+    deleted = compact_memories(namespace="tg_admin", keep_top=50)
+    deleted += compact_memories(namespace="global", keep_top=100)
+    log_action(user="tg_admin", action="memory_compact", risk_level="low",
+               status="ok", result_summary=f"deleted={deleted}")
+    return f"🗜 Memory compacted. Removed {deleted} low-priority entries."
+
+
+def handle_memory_context(query: str) -> str:
+    """Preview the memory context that would be injected for a given query."""
+    query = query.strip()
+    if not query:
+        return "Usage: /memory_context &lt;goal/query&gt;"
+    ctx = build_memory_context(query, namespace="tg_admin")
+    if not ctx:
+        ctx = build_memory_context(query, namespace="global")
+    if not ctx:
+        return f"No memory context found for: <b>{_esc(query)}</b>"
+    return f"<b>Memory context for:</b> {_esc(query)}\n\n<pre>{_esc(ctx[:3000])}</pre>"
+
+
 async def handle_run_task(goal: str) -> str:
     if not goal:
         return "Usage: /run_task <goal>"
@@ -833,7 +934,7 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
         menu_fn = {
             "status": menu_status, "router": menu_router, "tasks": menu_tasks,
             "search": menu_search, "files":  menu_files,  "skills": menu_skills,
-            "admin":  menu_admin,
+            "admin":  menu_admin,  "memory": menu_memory,
         }.get(val)
         if menu_fn:
             text, kb = menu_fn()
@@ -862,11 +963,15 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
     # ── Input required: set session state ─────────────────────────────────────
     if kind == "input":
         prompts = {
-            "run_task":     "✏️ Enter the task goal:",
-            "search_web":   "🔎 Enter keyword to search:",
-            "deep_research":"🔬 Enter research topic:",
-            "send_file":    "📤 Enter file path or file_id:",
-            "skill_detail": "🧩 Enter skill name:",
+            "run_task":      "✏️ Enter the task goal:",
+            "search_web":    "🔎 Enter keyword to search:",
+            "deep_research": "🔬 Enter research topic:",
+            "send_file":     "📤 Enter file path or file_id:",
+            "skill_detail":  "🧩 Enter skill name:",
+            "memory_search": "🔍 Enter memory search query:",
+            "memory_add":    "➕ Enter memory text (format: <b>Title</b> | content | tag1,tag2):",
+            "memory_forget": "🗑 Enter memory ID to delete:",
+            "memory_context":"🔎 Enter goal/query for context preview:",
         }
         prompt = prompts.get(val, "✏️ Enter input:")
         _session_save(val, prompt)
@@ -921,6 +1026,10 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return await handle_git_status()
     if action == "backup":
         return await handle_backup()
+    if action == "memory_lessons":
+        return handle_lessons("")
+    if action == "memory_compact":
+        return await handle_memory_compact()
     if action == "restart_bot":
         try:
             subprocess.run(
@@ -950,6 +1059,14 @@ async def handle_pending_input(action: str, text: str, chat_id: str | int) -> st
         return await handle_send_file(text, chat_id)
     if action == "skill_detail":
         return handle_skill_detail(text)
+    if action == "memory_search":
+        return await handle_memory_search(text)
+    if action == "memory_add":
+        return await handle_memory_add(text)
+    if action == "memory_forget":
+        return handle_memory_forget(text)
+    if action == "memory_context":
+        return handle_memory_context(text)
     return f"Unknown action: {action}"
 
 
@@ -1006,16 +1123,22 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/agent_blueprint":  return handle_agent_blueprint()
     if cmd == "/workers":          return handle_workers()
     if cmd == "/memory_search":    return await handle_memory_search(arg)
+    if cmd == "/memory_add":       return await handle_memory_add(arg)
+    if cmd == "/memory_forget":    return handle_memory_forget(arg)
+    if cmd == "/memory_compact":   return await handle_memory_compact()
+    if cmd == "/memory_context":   return handle_memory_context(arg)
     if cmd == "/lessons":          return handle_lessons(arg)
     if cmd == "/audit_recent":     return handle_audit_recent()
 
     if low.startswith("/"):
         return (
             "Commands: /menu /status /health /router_status /models /model_policy\n"
-            "/skills /skill <name> /tasks /task <id> /run_task <goal> /cancel_task <id>\n"
-            "/pending_actions /confirm_action <id> /cancel_action <id>\n"
-            "/files /file <id> /send_file <path> /logs /tiktok_chat_info\n"
-            "/agent_blueprint /workers /memory_search <q> /lessons [skill] /audit_recent\n"
+            "/skills /skill &lt;name&gt; /tasks /task &lt;id&gt; /run_task &lt;goal&gt; /cancel_task &lt;id&gt;\n"
+            "/pending_actions /confirm_action &lt;id&gt; /cancel_action &lt;id&gt;\n"
+            "/files /file &lt;id&gt; /send_file &lt;path&gt; /logs /tiktok_chat_info\n"
+            "/agent_blueprint /workers /lessons [skill] /audit_recent\n"
+            "/memory_search &lt;q&gt; /memory_add &lt;text&gt; /memory_forget &lt;id&gt; "
+            "/memory_compact /memory_context &lt;q&gt;\n"
             "/start /help /menu /cancel"
         )
 
