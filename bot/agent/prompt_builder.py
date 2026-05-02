@@ -424,3 +424,102 @@ def load_prompt_for_task(task_id: str) -> str | None:
     if not p.exists():
         return None
     return p.read_text(encoding="utf-8")
+
+
+# ── LLM-refined prompt (GPT-5.5 via 9Router) ──────────────────────────────────
+
+_REFINE_SYSTEM = (
+    "You are a senior staff engineer writing a precise, complete coding "
+    "task brief for an autonomous Claude Code CLI worker.\n\n"
+    "Your job: take the deterministic prompt below and rewrite it as a "
+    "clearer, tighter, more professional English brief. Keep ALL "
+    "concrete information (file paths, constraints, tests, commit "
+    "message, owner safety rules). DO NOT invent file paths, function "
+    "names, or line numbers. DO NOT remove safety rules. DO NOT shorten "
+    "the test plan.\n\n"
+    "Output a complete markdown brief with these sections (use these "
+    "exact headers):\n"
+    "  ## Goal\n"
+    "  ## Files to inspect first\n"
+    "  ## Constraints\n"
+    "  ## Safety rules\n"
+    "  ## Implementation steps\n"
+    "  ## Tests to run\n"
+    "  ## Commit message\n"
+    "  ## Final report format\n\n"
+    "Write in English. Be concise but complete. Do not add commentary "
+    "outside the markdown brief."
+)
+
+
+async def refine_prompt_via_llm(deterministic_prompt: str,
+                                  *, timeout_s: float = 30.0
+                                  ) -> tuple[str, str]:
+    """Call 9Router/GPT-5.5 to refine the deterministic prompt.
+
+    Returns (refined_prompt, status):
+      - status="refined": LLM returned a usable prompt.
+      - status="fallback_deterministic": LLM error; prompt unchanged.
+      - status="fallback_too_short": LLM returned too little content.
+
+    Never raises. Caller can prepend a status banner so the worker
+    knows which prompt path was used.
+    """
+    if not deterministic_prompt or len(deterministic_prompt) < 200:
+        return deterministic_prompt, "fallback_too_short"
+    try:
+        from bot.llm_client import complete as _complete
+    except Exception:
+        return deterministic_prompt, "fallback_deterministic"
+
+    user_msg = (
+        "Rewrite the following deterministic coding-task prompt into a "
+        "tighter, professional English brief using the section headers "
+        "from the system instruction. Preserve all file paths, "
+        "constraints, safety rules, tests, and the commit message.\n\n"
+        "DETERMINISTIC PROMPT:\n"
+        "----- BEGIN -----\n"
+        + deterministic_prompt
+        + "\n----- END -----\n"
+    )
+    try:
+        # Role "reasoning" routes to the best Claude variant (Sonnet 4.6/4.7)
+        # via 9Router for tighter instruction-following. Fall through to
+        # chat (gpt-5.5) only if reasoning fails.
+        resp = await _complete(
+            messages=[
+                {"role": "system", "content": _REFINE_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            role="reasoning",
+            timeout=timeout_s,
+            max_tokens=3500,
+        )
+    except Exception:
+        try:
+            resp = await _complete(
+                messages=[
+                    {"role": "system", "content": _REFINE_SYSTEM},
+                    {"role": "user",   "content": user_msg},
+                ],
+                role="chat",
+                timeout=timeout_s,
+                max_tokens=3500,
+            )
+        except Exception:
+            return deterministic_prompt, "fallback_deterministic"
+
+    refined = ""
+    if isinstance(resp, dict):
+        if resp.get("error"):
+            return deterministic_prompt, "fallback_deterministic"
+        refined = (resp.get("content") or resp.get("text") or "").strip()
+    elif isinstance(resp, str):
+        refined = resp.strip()
+
+    if not refined or len(refined) < 400 or "## Goal" not in refined:
+        return deterministic_prompt, "fallback_too_short"
+    # Prefix banner so the Claude worker knows this is LLM-refined
+    banner = ("<!-- This prompt was refined by 9Router/GPT-5.5+ from a "
+              "deterministic builder. Source kept in section history. -->\n\n")
+    return banner + refined, "refined"

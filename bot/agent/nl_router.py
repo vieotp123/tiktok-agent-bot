@@ -239,6 +239,11 @@ _PATTERNS_RUN_NEXT = (
     _RE(r"\b(làm|chạy)\s+(task\s+)?code\s+tiếp", re.I),
     _RE(r"\brun_next_code_task\b", re.I),
     _RE(r"\brun\s+next\s+code", re.I),
+    # "tự code tiếp đi" / "tự tìm lỗi rồi sửa" — owner tells the worker to
+    # continue the next coding task. NO hour/duration → run_next.
+    _RE(r"^\s*tự\s+code\s+tiếp\s*(đi|nha)?\s*[\.!\?]*$", re.I),
+    _RE(r"\btự\s+(tìm|find)\s+(lỗi|bug)\s+(rồi|và)\s+(sửa|fix)\b", re.I),
+    _RE(r"\btiếp\s*tục(?:\s+task|\s+code)?\b", re.I),
 )
 
 _PATTERNS_RUN_BATCH = (
@@ -256,6 +261,10 @@ _PATTERNS_CREATE_CODE = (
     _RE(r"\bfix\s+(bug|lỗi|menu|telegram|tele)\b", re.I),
     _RE(r"\b(implement|tạo)\s+(file|module|skill|worker)\b", re.I),
     _RE(r"\b(sửa|fix)\s+(menu|tele|telegram|bot)\b", re.I),
+    # "tạo task <verb> ..." — generic create-task phrasing
+    _RE(r"\btạo\s+task\s+(?!tiếp|kế|sau)\w+", re.I),
+    _RE(r"\b(làm|build|tích\s*hợp)\s+(api|integration)\b", re.I),
+    _RE(r"\bđọc\s+file\s+rồi\s+sửa\b", re.I),
 )
 
 _PATTERNS_QUOTA = (
@@ -266,9 +275,12 @@ _PATTERNS_QUOTA = (
         re.I),
     _RE(r"\bkhi\s+nào\s+(hồi|reset|về)\s+quota", re.I),
     # "hết quota thì hẹn chạy tiếp" / "khi có quota thì chạy tiếp"
-    _RE(r"\bhết\s+quota\s+thì\s+(hẹn|chạy)", re.I),
+    _RE(r"\bhết\s+quota\s+thì\s+(hẹn|chạy|\d|thử|probe)", re.I),
     _RE(r"\bkhi\s+(có|hồi|về)\s+quota\s+thì", re.I),
     _RE(r"\bquota\s+về\s+thì", re.I),
+    # "1 tiếng thử lại" / "1h thử lại" / "60 phút probe lại"
+    _RE(r"\b\d+\s*(tiếng|giờ|h|phút|m)\s+(thử|probe|chạy)\s+lại", re.I),
+    _RE(r"\bcó\s+quota\s+thì\s+(tự\s+)?chạy\s+tiếp", re.I),
 )
 
 _PATTERNS_QUOTA_STATUS = (
@@ -310,7 +322,8 @@ _PATTERNS_CONFIRM = (
 )
 
 _PATTERNS_CANCEL = (
-    _RE(r"^(hủy|không|đừng|stop|cancel|no|n|khoan|đừng\s+làm)\s*[\.!]*$",
+    _RE(r"^(hủy|không|đừng|stop|cancel|no|n|khoan|đừng\s+làm|"
+        r"dừng|dừng\s*lại|dừng\s*đi|đừng\s+làm\s+nữa)\s*[\.!]*$",
         re.I),
 )
 
@@ -423,6 +436,130 @@ _PATTERNS_BRAIN_EVOLVE_STATUS = (
     _RE(r"\bxem\s+brain\s*evolve\b", re.I),
 )
 
+# ── Agent autorun loop (10–12h owner work session) ──────────────────────────
+_PATTERNS_AGENT_AUTORUN_START = (
+    # "tự làm việc 12 tiếng" / "làm việc độc lập 10 tiếng"
+    _RE(r"\b(tự|độc\s*lập)\s+(làm|làm\s*việc|code|chạy)\s+"
+        r"\d+\s*(tiếng|giờ|h)\b", re.I),
+    _RE(r"\blàm\s*việc\s+(độc\s*lập|tự\s*động)\s+\d+\s*(tiếng|giờ|h)", re.I),
+    _RE(r"\b(làm|chạy|code)\s+\d+\s*(tiếng|giờ|h)\s+(không\s*ngừng|liên\s*tục)",
+        re.I),
+    # "cài code liên tục cho tới khi t bảo dừng"
+    _RE(r"\b(cài|làm|chạy)\s+code\s+liên\s*tục\b", re.I),
+    _RE(r"\b(làm|chạy|code)\s+(liên\s*tục|không\s*ngừng)\s+(tới|cho\s*tới|"
+        r"đến)\s+(khi|lúc)\s+(t|tao|tôi|owner|admin)?\s*(bảo|nói|kêu)?\s*"
+        r"(dừng|stop)", re.I),
+    _RE(r"\b/?agent_autorun_start\b", re.I),
+    _RE(r"\bautorun\s+(start|on|begin)\b", re.I),
+    # "tự code 12 tiếng" (only when hours are present) — handled by the
+    # \d+\s*tiếng patterns above. "tự code tiếp đi" without an hour
+    # falls through to run_next_code_task / create_code_task.
+)
+
+# ── Admin shell-style intents — apt/restart/git/cat .env ─────────────────
+# Used to fulfil owner-tooling doctrine: these phrases MUST get an
+# explicit grant-gated or confirm reply, never a generic refusal.
+_PATTERNS_SYSTEM_PKG_INSTALL = (
+    _RE(r"\bapt\s+(install|remove|update|upgrade)\b", re.I),
+    _RE(r"\b(npm|pip|pip3)\s+install\b", re.I),
+)
+_PATTERNS_SYSTEM_RESTART = (
+    _RE(r"\brestart\s+(bot|service|tiktok|backend|nginx)", re.I),
+    _RE(r"\bsystemctl\s+(restart|stop|start)\s+\S+", re.I),
+    _RE(r"\b(khởi\s*động\s*lại)\s+(bot|service|tiktok|backend)", re.I),
+)
+_PATTERNS_GIT_COMMIT_PUSH = (
+    _RE(r"\bcommit[/\s]+push\b", re.I),
+    _RE(r"\bcommit\s+(và\s+|and\s+)?push\s+dev-?agent", re.I),
+    _RE(r"\bpush\s+dev-?agent\b", re.I),
+    _RE(r"\btest\s+xong\s+(đẩy|push)\s+git\b", re.I),
+    _RE(r"\b/?commit_and_push\b", re.I),
+)
+_PATTERNS_DUMP_SECRET = (
+    _RE(r"\bcat\s+\.env\b", re.I),
+    _RE(r"\bcat\s+.*storage[_\s]?state", re.I),
+    _RE(r"\bgửi\s+(?:tao|t|tôi|admin)\s+\.env", re.I),
+    _RE(r"\bdump\s+(secret|env|token|key)\b", re.I),
+    _RE(r"\bin\s+(token|secret|api[\s_]key)\s+ra\b", re.I),
+)
+
+_PATTERNS_AGENT_AUTORUN_STOP = (
+    _RE(r"\b/?agent_autorun_stop\b", re.I),
+    _RE(r"\bdừng\s+(autorun|làm\s*việc|tự\s*động)\b", re.I),
+    _RE(r"\bstop\s+autorun\b", re.I),
+    _RE(r"\b(đừng|không|không\s+cần)\s+làm\s+(nữa|thêm)\b", re.I),
+)
+
+_PATTERNS_AGENT_AUTORUN_STATUS = (
+    _RE(r"\b/?agent_autorun_status\b", re.I),
+    _RE(r"\b(xem|status)\s+autorun\b", re.I),
+    _RE(r"\bautorun\s+(status|sao\s*rồi|còn\s+chạy)", re.I),
+)
+
+# ── Agent progress — "đang làm tới đâu rồi" / "sao im vậy" ──────────────────
+_PATTERNS_AGENT_PROGRESS = (
+    _RE(r"\bđang\s+làm\s+(tới|đến)\s+đâu\s+(rồi|chưa)?", re.I),
+    _RE(r"\bsao\s+im\s+(vậy|thế)\b", re.I),
+    _RE(r"\bxem\s+tiến\s*độ\b", re.I),
+    _RE(r"\b(kẹt|stuck)\s+(ở\s+)?đâu", re.I),
+    _RE(r"\bagent\s+đang\s+lỗi\s+gì\b", re.I),
+    _RE(r"\bbáo\s+tiến\s*độ\b", re.I),
+    _RE(r"\b/?agent_progress\b", re.I),
+    _RE(r"\bcòn\s+(task|việc)\s+gì\s+chưa\s+làm\b", re.I),
+    _RE(r"\bxem\s+log\s+gần\s+(nhất|đây)\b", re.I),
+    _RE(r"\btiến\s*độ\s+task\b", re.I),
+)
+
+# ── EsimAccess / API integration intents ────────────────────────────────────
+_PATTERNS_ESIM_DOCS = (
+    _RE(r"\bđọc\s+docs?\s+(esim\s*access|esimaccess)\b", re.I),
+    _RE(r"\b(xem|read)\s+(docs?|tài\s*liệu)\s+(esim\s*access|esimaccess)",
+        re.I),
+    _RE(r"\bdocs?\s+esim\s*access\b", re.I),
+)
+
+_PATTERNS_ESIM_CURL_DRY = (
+    _RE(r"\b(tạo|viết|sinh)\s+curl\s+(esim\s*access|esimaccess)\b", re.I),
+    _RE(r"\b(test|thử)\s+(dry[-\s]?run|dryrun)\s+(api\s+)?esim", re.I),
+    _RE(r"\bdry[-\s]?run\s+(api\s+)?esim", re.I),
+    _RE(r"\bcurl\s+esim\s*access\s+(mẫu|dry)", re.I),
+)
+
+_PATTERNS_ESIM_ORDER_REAL = (
+    _RE(r"\b(gọi|chạy|call)\s+api\s+(mua|order)\s+esim\s+thật\b", re.I),
+    _RE(r"\b(mua|order)\s+esim\s+(thật|that|real)\b", re.I),
+    _RE(r"\btạo\s+order\s+esim\b", re.I),
+    _RE(r"\bcurl\s+esim\s*access\s+(mua|order)\b", re.I),
+)
+
+# ── System / network high-risk ("mở port 8080", "ufw allow ...") ───────────
+_PATTERNS_SYSTEM_NETWORK_HIGH = (
+    _RE(r"\bmở\s+port\s+\d+\b", re.I),
+    _RE(r"\bopen\s+port\s+\d+\b", re.I),
+    _RE(r"\bufw\s+(allow|enable|disable)\b", re.I),
+    _RE(r"\biptables\s+-[A-Z]", re.I),
+    _RE(r"\bsecurity\s+group\s+(allow|add|update)", re.I),
+    _RE(r"\bnginx\s+(reload|restart)", re.I),
+    _RE(r"\bexpose\s+(public|internet|service|port)\b", re.I),
+)
+
+# ── Web search / browser ────────────────────────────────────────────────────
+_PATTERNS_WEB_SEARCH_NL = (
+    _RE(r"\bsearch\s+web\s+(tìm|cho|về)\b", re.I),
+    _RE(r"\btìm\s+(thông\s*tin|tin|nhà\s+cung\s+cấp|đối\s+thủ|news)\s+", re.I),
+    _RE(r"\bdùng\s+api\s+search\b", re.I),
+    _RE(r"\bweb\s+search\b", re.I),
+    _RE(r"\b(google|duckduckgo|ddg)\s+tìm\b", re.I),
+)
+
+_PATTERNS_BROWSER_TASK = (
+    _RE(r"\bmở\s+(trình\s*duyệt|browser)\s+(tìm|đọc|crawl)", re.I),
+    _RE(r"\bcrawl\s+(trang|page|url|web)\b", re.I),
+    _RE(r"\bđọc\s+(trang|page|url|web|docs?\s+api)\b", re.I),
+    _RE(r"\b(mở|open)\s+browser\b", re.I),
+    _RE(r"\bplaywright\s+(crawl|read|tìm)\b", re.I),
+)
+
 # Memory NL: "nhớ X" / "quên X" / "tìm trong memory X"
 _PATTERNS_MEMORY_ADD = (
     _RE(r"^nhớ\s+(?:là\s+|rằng\s+)?(.+)$", re.I),
@@ -515,6 +652,24 @@ _PATTERNS_HIGH_RISK = (
     _RE(r"\bmerge\s+main\b", re.I),
     _RE(r"\bgit\s+push\s+main\b", re.I),
     _RE(r"\bdeploy\s+(prod|production)\b", re.I),
+    # Network / firewall — public exposure
+    _RE(r"\bmở\s+port\s+\d+\b", re.I),
+    _RE(r"\bopen\s+port\s+\d+\b", re.I),
+    _RE(r"\bufw\s+(allow|enable|disable)\b", re.I),
+    _RE(r"\biptables\b", re.I),
+    _RE(r"\bsecurity\s+group\b", re.I),
+    _RE(r"\bnginx\s+(reload|restart|config)", re.I),
+    _RE(r"\bexpose\s+(public|internet|service)\b", re.I),
+    # Money / order / public DM
+    _RE(r"\b(mua|order|thanh\s*toán|payment)\s+(esim|sim)\s+thật\b", re.I),
+    _RE(r"\bgọi\s+api\s+(mua|order)\s+esim\s+thật\b", re.I),
+    _RE(r"\btạo\s+order\s+esim\b", re.I),
+    _RE(r"\bgửi\s+(dm|tin\s+nhắn|message)\s+(cho\s+)?khách", re.I),
+    _RE(r"\b(public|đăng)\s+post\b", re.I),
+    # Secret dump
+    _RE(r"\bcat\s+\.env\b", re.I),
+    _RE(r"\bdump\s+(secret|env|token)\b", re.I),
+    _RE(r"\bin\s+(token|secret|api[\s_]key)\b", re.I),
 )
 
 
@@ -676,6 +831,102 @@ def classify(text: str) -> Intent:
                           f"Chạy lệnh trên worker {wid or '?'}.",
                           {"worker_id": wid, "command": cmd},
                           risk, requires_confirm=(risk == "high"))
+
+    # ── Agent autorun (10–12h owner work loop) ───────────────────────
+    # STATUS first (most specific), then START, then STOP.
+    # STOP is intentionally checked AFTER autorun_status so
+    # "autorun status" doesn't match "stop autorun" path.
+    if _has_any(t, _PATTERNS_AGENT_AUTORUN_STATUS):
+        return Intent("agent_autorun_status", 0.95,
+                      "Xem trạng thái agent autorun.",
+                      {}, "low", False)
+    if _has_any(t, _PATTERNS_AGENT_AUTORUN_START):
+        # Hours + max_tasks parsed from text
+        from bot.agent.agent_autorun import (parse_hours_vi,
+                                              parse_max_tasks_vi)
+        hrs = parse_hours_vi(t, default=12.0)
+        mx  = parse_max_tasks_vi(t, default=20)
+        return Intent("agent_autorun_start", 0.95,
+                      f"Khởi động agent autorun {hrs}h, max {mx} task.",
+                      {"hours": hrs, "max_tasks": mx,
+                       "objective": t[:300]},
+                      "medium", False)
+    if _has_any(t, _PATTERNS_AGENT_AUTORUN_STOP):
+        return Intent("agent_autorun_stop", 0.95,
+                      "Dừng agent autorun.",
+                      {}, "low", False)
+
+    # ── Agent progress — "đang làm tới đâu rồi" / "sao im vậy" ───────
+    if _has_any(t, _PATTERNS_AGENT_PROGRESS):
+        return Intent("agent_progress", 0.95,
+                      "Báo cáo tiến độ task hiện tại + "
+                      "autorun + claude.",
+                      {}, "low", False)
+
+    # ── System / network high-risk action — needs confirm ───────────
+    if _has_any(t, _PATTERNS_SYSTEM_NETWORK_HIGH):
+        return Intent("system_network_action", 0.95,
+                      "Hành động public/network — cần admin "
+                      "bấm Đồng ý vì có rủi ro mở port / firewall / "
+                      "expose internet.",
+                      {"raw": t}, "high", True)
+
+    # ── Secret dump — block, propose safe alternative ────────────────
+    if _has_any(t, _PATTERNS_DUMP_SECRET):
+        return Intent("system_secret_dump", 0.95,
+                      "Yêu cầu dump secret — em sẽ KHÔNG in nguyên "
+                      "giá trị. Đề xuất xem tên key thay thế.",
+                      {"raw": t}, "high", True)
+
+    # ── Package install — medium, grant-gated ────────────────────────
+    if _has_any(t, _PATTERNS_SYSTEM_PKG_INSTALL):
+        return Intent("system_pkg_install", 0.9,
+                      "Cài package — chạy nếu có grant low_medium, "
+                      "ngược lại tạo pending_action.",
+                      {"raw": t}, "medium", False)
+
+    # ── systemctl restart — medium, grant-gated ──────────────────────
+    if _has_any(t, _PATTERNS_SYSTEM_RESTART):
+        return Intent("system_restart", 0.9,
+                      "Restart service — chạy nếu có grant, ngược "
+                      "lại tạo pending_action.",
+                      {"raw": t}, "medium", False)
+
+    # ── git commit + push dev-agent ──────────────────────────────────
+    if _has_any(t, _PATTERNS_GIT_COMMIT_PUSH):
+        return Intent("system_git_push", 0.9,
+                      "Commit + push dev-agent — chạy nếu có grant, "
+                      "ngược lại tạo pending_action.",
+                      {"raw": t}, "medium", False)
+
+    # ── EsimAccess intents — order_real is HIGH (money) ──────────────
+    if _has_any(t, _PATTERNS_ESIM_ORDER_REAL):
+        return Intent("esim_order_real", 0.95,
+                      "Tạo order eSIM thật qua EsimAccess (cần "
+                      "xác nhận vì có rủi ro tiền).",
+                      {"raw": t}, "high", True)
+    if _has_any(t, _PATTERNS_ESIM_CURL_DRY):
+        return Intent("esim_curl_dry", 0.9,
+                      "Tạo curl dry-run cho EsimAccess (không "
+                      "gọi mua thật).", {"raw": t}, "low", False)
+    if _has_any(t, _PATTERNS_ESIM_DOCS):
+        return Intent("esim_docs", 0.9,
+                      "Đọc docs EsimAccess từ memory/docs.",
+                      {}, "low", False)
+
+    # ── Web search / browser ─────────────────────────────────────────
+    if _has_any(t, _PATTERNS_BROWSER_TASK):
+        return Intent("browser_task", 0.85,
+                      "Browser/crawl task — nếu chưa có Playwright "
+                      "thì tạo code_task build tool.",
+                      {"raw": t}, "medium", False)
+    if _has_any(t, _PATTERNS_WEB_SEARCH_NL):
+        # Best-effort: extract a query after "search" or "tìm"
+        q = re.sub(r"^.*?(?:search\s+web|tìm)\s+", "", t,
+                   count=1, flags=re.I).strip()
+        return Intent("web_search_nl", 0.85,
+                      "Search web qua tool search_web hiện có.",
+                      {"query": q or t}, "low", False)
 
     # Brain-evolve START matches BEFORE self_improve so "tự cải thiện brain"
     # without a stop word goes to the loop, not the one-shot.

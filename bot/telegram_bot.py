@@ -1711,6 +1711,430 @@ def handle_brain_evolve_status() -> str:
     return _be.status_panel_vi()
 
 
+# ── Agent Autorun (10-12h owner work session) ────────────────────────────────
+
+async def handle_agent_autorun_start(arg: str = "") -> str:
+    """Start owner-directed long-horizon autorun loop.
+
+    Usage: /agent_autorun_start [hours] [max_tasks] [objective...]
+    Or NL: "làm việc độc lập 12 tiếng"
+    """
+    from bot.agent import agent_autorun as _aa
+    arg = (arg or "").strip()
+    hours = 12.0
+    max_tasks = 20
+    objective = ""
+    if arg:
+        parts = arg.split(None, 2)
+        try:
+            hours = float(parts[0]) if parts else 12.0
+        except ValueError:
+            pass
+        if len(parts) >= 2:
+            try:
+                max_tasks = int(parts[1])
+            except ValueError:
+                pass
+        if len(parts) >= 3:
+            objective = parts[2]
+    d = _aa.start(hours=hours, max_tasks=max_tasks,
+                  objective=objective, user="tg_admin")
+    return (f"🟢 <b>Agent Autorun started</b>\n"
+            f"Thời lượng: <b>{d['hours']}h</b> · "
+            f"max <b>{d['max_tasks']}</b> task\n"
+            f"stop_at: <code>{d['stop_at']}</code>\n"
+            f"Mục tiêu: <i>{_esc((objective or '(tự chọn từ roadmap/queue)')[:200])}</i>\n\n"
+            f"Em sẽ tự pick task → refine prompt qua GPT-5.5 → "
+            f"chạy Claude CLI → test → commit/push → report. "
+            f"Hết quota thì pause 1h rồi probe lại.\n\n"
+            f"Lệnh dừng: <code>/agent_autorun_stop</code> hoặc "
+            f"nhắn <i>“dừng”</i>.")
+
+
+def handle_agent_autorun_stop() -> str:
+    from bot.agent import agent_autorun as _aa
+    d = _aa.stop(user="tg_admin", reason="user")
+    return (f"🛑 <b>Agent Autorun stopped</b>\n"
+            f"Đã xong: <b>{d.get('completed_tasks', 0)}</b> task")
+
+
+def handle_agent_autorun_status() -> str:
+    from bot.agent import agent_autorun as _aa
+    return _aa.status_panel_vi()
+
+
+# ── /agent_progress — current task progress ──────────────────────────────────
+
+async def handle_agent_progress() -> str:
+    """Vietnamese progress reporter — what's happening RIGHT NOW.
+
+    Reads:
+      - agent_autorun state (active task / paused_reason / stop_at)
+      - brain_evolve state (run_count / last_status)
+      - claude quota state (status / next_probe_at)
+      - last queued / running code_task
+      - last 3 audit lines
+    """
+    lines = ["<b>📊 Tiến độ agent</b>"]
+
+    # 1. Autorun
+    try:
+        from bot.agent import agent_autorun as _aa
+        d = _aa.state()
+        if d.get("enabled"):
+            lines.append(f"🟢 <b>Autorun đang chạy</b> ({d.get('hours', 0)}h)")
+            lines.append(f"  ✓ Đã xong: <b>{d.get('completed_tasks', 0)}</b> "
+                         f"/ <b>{d.get('max_tasks', 0)}</b> task")
+            if d.get("paused_reason"):
+                lines.append(f"  ⏸ Pause: <i>{_esc(str(d['paused_reason']))}</i>")
+                if d.get("next_probe_at"):
+                    lines.append(f"  thử lại: <code>{d['next_probe_at']}</code>")
+            if d.get("last_task_id"):
+                lines.append(
+                    f"  Task gần nhất: <code>{_esc(str(d['last_task_id']))}</code> "
+                    f"<i>{_esc(str(d.get('last_status', '?')))}</i>")
+            if d.get("stop_at"):
+                lines.append(f"  Stop_at: <code>{d['stop_at']}</code>")
+        else:
+            lines.append("⚪ Autorun: <b>off</b>")
+    except Exception as e:
+        lines.append(f"⚠ autorun: {_esc(str(e))[:80]}")
+
+    # 2. Brain evolve
+    try:
+        from bot.agent import brain_evolve as _be
+        bs = _be.state()
+        if bs.get("enabled"):
+            lines.append(f"🟢 <b>Brain Evolution active</b> "
+                         f"run_count={bs.get('run_count', 0)} "
+                         f"failures={bs.get('consecutive_failures', 0)}")
+            if bs.get("last_status"):
+                lines.append(f"  last_status: <i>{_esc(str(bs['last_status']))[:60]}</i>")
+        else:
+            lines.append(f"⚪ Brain Evolution: <b>off</b> "
+                         f"(run_count={bs.get('run_count', 0)})")
+    except Exception:
+        pass
+
+    # 3. Claude quota
+    try:
+        cqs = _cq.get_quota_state()
+        st = cqs.get("status", "unknown")
+        icon = {"available": "🟢", "limited": "🔴",
+                "auth_required": "🔒", "error": "❓",
+                "unknown": "⚪"}.get(st, "❓")
+        lines.append(f"{icon} <b>Claude:</b> {st}")
+        if cqs.get("next_probe_at"):
+            lines.append(f"  next_probe: <code>{cqs['next_probe_at']}</code>")
+        if cqs.get("reset_at"):
+            lines.append(f"  reset_at: <code>{cqs['reset_at']}</code>")
+    except Exception:
+        pass
+
+    # 4. Code queue snapshot — currently running / next queued
+    try:
+        all_q = code_list_tasks(limit=200)
+        running = [t for t in all_q if t.get("status") == "running"]
+        queued = [t for t in all_q if t.get("status") == "queued"]
+        if running:
+            lines.append(f"<b>🔧 Đang chạy:</b>")
+            for t in running[:2]:
+                lines.append(f"  • <code>{_esc(str(t['id']))}</code> "
+                             f"<i>{_esc((t.get('title') or '')[:60])}</i>")
+        nx = code_next_task() if queued else None
+        if nx:
+            lines.append(f"<b>📋 Next queued:</b> "
+                         f"<code>{_esc(str(nx['id']))}</code> "
+                         f"<i>{_esc((nx.get('title') or '')[:60])}</i>")
+        if not running and not nx:
+            lines.append("💤 Không có task nào đang chạy / queued.")
+    except Exception as e:
+        lines.append(f"⚠ queue: {_esc(str(e))[:80]}")
+
+    # 5. Last audit lines
+    try:
+        from bot.agent.audit_log import tail_audit
+        recent = tail_audit(3)
+        if recent:
+            lines.append("<b>📝 Audit gần nhất:</b>")
+            for r in recent:
+                lines.append(
+                    f"  <code>{_esc(str(r.get('action', '')))[:25]}</code> "
+                    f"{_esc(str(r.get('result_summary', '')))[:70]}")
+    except Exception:
+        pass
+
+    lines.append("")
+    lines.append("<i>Gợi ý: <code>/agent_diag</code> để xem state đầy đủ; "
+                 "<code>/agent_autorun_status</code> để xem autorun.</i>")
+    return "\n".join(lines)
+
+
+# ── EsimAccess intents ───────────────────────────────────────────────────────
+
+def handle_esim_docs() -> str:
+    """Look up EsimAccess docs from memory + docs/ first. Don't make up."""
+    from pathlib import Path as _P
+    lines = ["<b>📚 EsimAccess docs (best-effort)</b>"]
+    found_any = False
+
+    # 1. memory search
+    try:
+        from bot.memory_store import search_memory as _sm
+        rows = _sm("esimaccess esim access api docs", limit=5)
+        if rows:
+            lines.append("<b>Memory:</b>")
+            for r in rows:
+                title = (r.get("title") or "")[:60]
+                lines.append(f"  • <code>id={r.get('id')}</code> "
+                             f"<i>{_esc(title)}</i>")
+            found_any = True
+    except Exception:
+        pass
+
+    # 2. docs / research / data files
+    for root in ("docs", "research", "data/docs"):
+        try:
+            p = _P("/opt/tiktok-bot") / root
+            if not p.exists():
+                continue
+            hits = []
+            for f in p.rglob("*"):
+                if not f.is_file():
+                    continue
+                name = f.name.lower()
+                if "esim" in name or "access" in name:
+                    hits.append(str(f.relative_to("/opt/tiktok-bot")))
+            if hits:
+                lines.append(f"<b>{root}/:</b>")
+                for h in hits[:8]:
+                    lines.append(f"  • <code>{_esc(h)}</code>")
+                found_any = True
+        except Exception:
+            pass
+
+    if not found_any:
+        lines.append("⚠ Em chưa tìm thấy docs EsimAccess trong "
+                     "memory hoặc <code>docs/</code>.")
+        lines.append("")
+        lines.append("Để em tích hợp, anh gửi:")
+        lines.append("  • Link API docs (ví dụ "
+                     "<code>https://docs.esimaccess.com</code>)")
+        lines.append("  • API key (em sẽ tự lưu vào <code>.env</code>, "
+                     "không log/commit)")
+        lines.append("  • Endpoint base URL")
+        lines.append("")
+        lines.append("Hoặc gõ <code>/build_missing_tool EsimAccess API "
+                     "integration</code> để em tạo task code build "
+                     "tool sẵn skeleton.")
+    return "\n".join(lines)
+
+
+def handle_esim_curl_dry(raw: str = "") -> str:
+    """Build a dry-run curl template — does NOT call real API."""
+    import os as _os
+    base   = (_os.getenv("ESIM_ACCESS_API_BASE") or "").strip()
+    key    = (_os.getenv("ESIM_ACCESS_API_KEY") or "").strip()
+    has_key = bool(key)
+    lines = ["<b>🧪 EsimAccess curl dry-run</b>"]
+    lines.append("<i>Đây là template — KHÔNG chạy thật, không tạo order.</i>")
+    if not base:
+        lines.append("")
+        lines.append("⚠ Thiếu <code>ESIM_ACCESS_API_BASE</code> trong "
+                     "<code>.env</code>.")
+    if not has_key:
+        lines.append("⚠ Thiếu <code>ESIM_ACCESS_API_KEY</code> trong "
+                     "<code>.env</code>.")
+    lines.append("")
+    lines.append("<b>Template:</b>")
+    lines.append("<pre>")
+    lines.append("# 1. List available eSIM packages (read-only)")
+    lines.append(f"curl -s '{base or '<base_url>'}/packages' \\")
+    lines.append("  -H 'Authorization: Bearer <KEY>' \\")
+    lines.append("  -H 'Content-Type: application/json' \\")
+    lines.append("  --get --data-urlencode 'country=JP'")
+    lines.append("")
+    lines.append("# 2. Dry-run order (only if API supports `dry_run=true`)")
+    lines.append(f"curl -s '{base or '<base_url>'}/orders' \\")
+    lines.append("  -H 'Authorization: Bearer <KEY>' \\")
+    lines.append("  -H 'Content-Type: application/json' \\")
+    lines.append("  -d '{\"package_id\":\"<id>\",\"dry_run\":true}'")
+    lines.append("</pre>")
+    if not (base and has_key):
+        lines.append("")
+        lines.append("⚠ <b>Thiếu config</b>. Em chỉ in template — chưa "
+                     "thể chạy thật. Cung cấp endpoint + key để em "
+                     "tích hợp đầy đủ (em sẽ KHÔNG echo key ra chat).")
+    return "\n".join(lines)
+
+
+def handle_esim_order_real_pending(raw: str, chat_id) -> dict:
+    """Create a pending_action for a REAL eSIM order. Caller (telegram_bot
+    NL dispatch) must invoke _ask_confirm_action with the payload returned."""
+    return {
+        "action": "esim_order_real",
+        "goal":   raw[:300],
+        "pretty": ("Việc này sẽ <b>gọi API EsimAccess thật</b> và "
+                   "<b>tạo order mất tiền</b>. Không hoàn lại được.\n"
+                   "Em đang ở chế độ <b>chỉ chạy sau khi anh bấm "
+                   "✅ Đồng ý</b>. Bấm ❌ Hủy nếu chưa muốn."),
+        "payload": {"esim_order_real": True, "raw": raw},
+    }
+
+
+# ── Web search / browser intents ─────────────────────────────────────────────
+
+async def handle_web_search_nl(query: str) -> str:
+    """Best-effort: route through existing search backend. If query is empty,
+    return guidance instead of failing silently."""
+    q = (query or "").strip()
+    if not q:
+        return ("Cú pháp: <i>“search web &lt;keyword&gt;”</i>. "
+                "Ví dụ: <i>“search web nhà cung cấp eSIM Nhật”</i>.")
+    try:
+        # Reuse the legacy search routing inside handle_run_task
+        return await handle_run_task(f"tìm thông tin {q}")
+    except Exception as e:
+        return (f"⚠ Search lỗi: {_esc(str(e))[:120]}\n"
+                f"<i>Có thể thiếu key search engine. Em sẽ "
+                f"tạo code_task build search worker tốt hơn nếu cần — "
+                f"gõ <code>/build_missing_tool web_search v2</code>.</i>")
+
+
+def handle_browser_task(raw: str) -> str:
+    """Browser/Playwright tasks — currently no live worker; surface this
+    honestly and propose code_task to build it."""
+    # Probe Playwright availability — don't fail; just report.
+    try:
+        import playwright  # noqa: F401
+        playwright_ok = True
+    except Exception:
+        playwright_ok = False
+
+    lines = ["<b>🌐 Browser task</b>"]
+    if playwright_ok:
+        lines.append("✅ Playwright đã cài. Browser worker chưa wire vào "
+                     "task queue.")
+        lines.append("Em đang tạo code_task để build browser worker.")
+        title = "Browser worker (Playwright) — implement and wire to queue"
+    else:
+        lines.append("⚠ Playwright chưa cài. Em sẽ tạo code_task: "
+                     "(1) cài Playwright, (2) build browser worker.")
+        title = "Browser worker — install Playwright + implement worker"
+    try:
+        tid = code_add_task(
+            title=title,
+            description=f"Owner asked: {raw[:200]}\n\n"
+                        f"Build a Playwright-based browser worker that can "
+                        f"read URLs and extract structured data. Wire to "
+                        f"task queue. Add deterministic eval cases.",
+            risk_level="medium", priority=5, created_by="tg_admin_nl",
+        )
+        lines.append(f"📋 Đã tạo task: <code>{tid}</code>")
+    except Exception as e:
+        lines.append(f"⚠ Không tạo được task: {_esc(str(e))[:120]}")
+    return "\n".join(lines)
+
+
+# ── System action handlers (apt/restart/git/secret) ──────────────────────────
+
+def _has_grant(scope_needed: str = "low_medium") -> bool:
+    """Check if current session has scope_needed grant."""
+    try:
+        from bot.agent.sessions import current_session
+        s = current_session()
+        if not s:
+            return False
+        sc = s.get("scope") or ""
+        return scope_needed in sc or sc == "low_medium" or sc == "code_low_medium"
+    except Exception:
+        return False
+
+
+def handle_system_pkg_install(raw: str) -> str:
+    """apt install / pip install — check grant, else create code_task."""
+    if _has_grant("low_medium"):
+        # Owner has session grant — surface a code_task that the bridge
+        # can run. We don't directly subprocess from Telegram handler.
+        try:
+            tid = code_add_task(
+                title=f"[apt/pkg] {raw[:80]}",
+                description=f"Owner via Telegram: {raw[:200]}\n\n"
+                            f"Run package install in a controlled subprocess. "
+                            f"Audit log the result. Do NOT run with sudo "
+                            f"unless explicit.",
+                risk_level="medium", priority=4,
+                created_by="tg_admin_nl",
+            )
+            return (f"📦 Đã queue task package-install: "
+                    f"<code>{tid}</code>\n"
+                    f"<i>(Có grant — bridge sẽ chạy khi worker pick.)</i>")
+        except Exception as e:
+            return f"⚠ {_esc(str(e))[:120]}"
+    return ("📦 <b>Cài package</b> — cần grant trước.\n"
+            "Gõ <code>/grant_session low_medium 60</code> rồi nhắc lại "
+            "yêu cầu, hoặc gõ <code>/confirm_action latest</code> sau "
+            "khi tạo pending_action.")
+
+
+def handle_system_restart(raw: str) -> str:
+    """systemctl restart — check grant, else create code_task."""
+    if _has_grant("low_medium"):
+        try:
+            tid = code_add_task(
+                title=f"[restart] {raw[:80]}",
+                description=f"Owner via Telegram: {raw[:200]}\n\n"
+                            f"Restart the relevant service via systemctl. "
+                            f"Verify status afterward.",
+                risk_level="medium", priority=4,
+                created_by="tg_admin_nl",
+            )
+            return (f"🔁 Đã queue task restart: <code>{tid}</code>\n"
+                    f"<i>(Có grant — bridge sẽ chạy.)</i>")
+        except Exception as e:
+            return f"⚠ {_esc(str(e))[:120]}"
+    return ("🔁 <b>Restart service</b> — cần grant trước.\n"
+            "Gõ <code>/grant_session low_medium 30</code> rồi nhắc lại.")
+
+
+def handle_system_git_push(raw: str) -> str:
+    """commit + push dev-agent — check grant, else create code_task."""
+    if _has_grant("low_medium"):
+        try:
+            tid = code_add_task(
+                title="[git] commit + push dev-agent",
+                description=f"Owner via Telegram: {raw[:200]}\n\n"
+                            f"Run git status, stage explicit paths "
+                            f"(bot docs README.md .gitignore scripts), "
+                            f"create commit, push to origin/dev-agent "
+                            f"with inline-token URL. Reset remote URL.",
+                risk_level="medium", priority=3,
+                created_by="tg_admin_nl",
+            )
+            return (f"📦 Đã queue task commit+push: <code>{tid}</code>")
+        except Exception as e:
+            return f"⚠ {_esc(str(e))[:120]}"
+    return ("📦 <b>Commit + push dev-agent</b> — cần grant.\n"
+            "Gõ <code>/grant_session code_low_medium 30</code> rồi "
+            "nhắc lại.")
+
+
+def handle_system_secret_dump(raw: str) -> str:
+    """Refuse to dump secret values; offer safe alternative."""
+    return ("🔒 <b>Em không dump giá trị secret ra chat.</b>\n"
+            "Em sẽ KHÔNG <code>cat .env</code> hay echo key vào "
+            "Telegram (rule trong <code>OPERATING_RULES.md §1</code>).\n\n"
+            "<b>Lựa chọn an toàn:</b>\n"
+            "  • <i>Xem tên các key đang có:</i> "
+            "<code>grep -E '^[A-Z_]+=' .env | cut -d= -f1</code> "
+            "(em chạy được nếu có grant).\n"
+            "  • <i>Xem key cụ thể có set chưa:</i> nói "
+            "<code>“key X có set không”</code> — em trả set/unset, "
+            "không trả giá trị.\n"
+            "  • <i>Edit qua Telegram:</i> chưa support — phải SSH "
+            "vào VPS với key auth.")
+
+
 # ── /agent_diag — single-screen diagnostic ───────────────────────────────────
 
 # ── Self-introspection handlers ──────────────────────────────────────────────
@@ -3170,6 +3594,14 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/brain_evolve_start":   return await handle_brain_evolve_start(arg)
     if cmd == "/brain_evolve_stop":    return handle_brain_evolve_stop()
     if cmd == "/brain_evolve_status":  return handle_brain_evolve_status()
+    # ── Agent Autorun (10–12h owner work session) ────────────────────────
+    if cmd == "/agent_autorun_start":  return await handle_agent_autorun_start(arg)
+    if cmd == "/agent_autorun_stop":   return handle_agent_autorun_stop()
+    if cmd == "/agent_autorun_status": return handle_agent_autorun_status()
+    if cmd == "/agent_progress":       return await handle_agent_progress()
+    # ── EsimAccess shortcuts ─────────────────────────────────────────────
+    if cmd == "/esim_docs":            return handle_esim_docs()
+    if cmd == "/esim_curl_dry":        return handle_esim_curl_dry(arg)
     if cmd == "/agent_diag":           return await handle_agent_diag()
     if cmd == "/whoami":               return await handle_whoami()
     if cmd == "/whoami_model":         return await handle_whoami_model()
@@ -3327,20 +3759,56 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         tid = code_add_task(title=title, description=desc,
                             risk_level=intent.risk_level,
                             priority=5, created_by="tg_admin_nl")
-        # Best-effort prompt build now (so the worker has something
-        # ready immediately if admin says "chạy luôn").
+        # 1. Build deterministic prompt synchronously (so worker has
+        #    something ready immediately).
+        # 2. Schedule async LLM refinement via 9Router/GPT-5.5+ in the
+        #    background — overwrites the saved prompt on success, leaves
+        #    the deterministic prompt intact on failure.
+        prompt_status = "deterministic"
         try:
-            from bot.agent.prompt_builder import (build_coding_prompt,
-                save_prompt_for_task)
+            from bot.agent.prompt_builder import (
+                build_coding_prompt, save_prompt_for_task,
+                refine_prompt_via_llm,
+            )
             t = code_get_task(tid)
             if t:
                 prompt = build_coding_prompt(t)
                 save_prompt_for_task(tid, prompt)
+
+                async def _refine_in_bg(tid_: str, det_prompt: str) -> None:
+                    try:
+                        refined, status = await refine_prompt_via_llm(
+                            det_prompt, timeout_s=30.0,
+                        )
+                        if status == "refined":
+                            save_prompt_for_task(tid_, refined)
+                            log(f"prompt refined task={tid_} "
+                                f"len={len(refined)}")
+                            try:
+                                await send_chat_reply(
+                                    chat_id,
+                                    f"🪄 Prompt task <code>{tid_}</code> "
+                                    f"đã được refine qua 9Router. "
+                                    f"Bridge sẽ dùng bản refined.",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            log(f"prompt refine fallback task={tid_} "
+                                f"status={status}")
+                    except Exception as e:
+                        log(f"prompt refine error task={tid_}: {e}")
+
+                # Fire-and-forget
+                asyncio.create_task(_refine_in_bg(tid, prompt))
+                prompt_status = "deterministic+refining"
         except Exception as e:
             log(f"prompt build warning: {e}")
         return (f"✅ Đã tạo task code <code>{tid}</code> "
-                f"(risk={intent.risk_level})\n"
+                f"(risk={intent.risk_level}, prompt={prompt_status})\n"
                 f"<b>{_esc(title)}</b>\n\n"
+                f"Em đang gọi <b>GPT-5.5 qua 9Router</b> để refine "
+                f"prompt thành tiếng Anh sạch — sẽ báo khi xong.\n"
                 f"Bridge sẽ chạy khi mình ra lệnh "
                 f"<i>“làm tiếp task code tiếp theo”</i>, hoặc gõ "
                 f"<code>/code_worker_run_once</code>.")
@@ -3382,6 +3850,72 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
         return handle_brain_evolve_stop()
     if name == "brain_evolve_status":
         return handle_brain_evolve_status()
+
+    # ── Agent Autorun (10–12h owner work session) ────────────────────────
+    if name == "agent_autorun_start":
+        hrs       = float(intent.args.get("hours")     or 12.0)
+        max_tasks = int(intent.args.get("max_tasks")   or 20)
+        objective = (intent.args.get("objective") or raw_text)[:300]
+        return await handle_agent_autorun_start(
+            f"{hrs} {max_tasks} {objective}".strip(),
+        )
+    if name == "agent_autorun_stop":
+        return handle_agent_autorun_stop()
+    if name == "agent_autorun_status":
+        return handle_agent_autorun_status()
+    if name == "agent_progress":
+        return await handle_agent_progress()
+
+    # ── EsimAccess intents ───────────────────────────────────────────────
+    if name == "esim_docs":
+        return handle_esim_docs()
+    if name == "esim_curl_dry":
+        return handle_esim_curl_dry(raw_text)
+    if name == "esim_order_real":
+        spec = handle_esim_order_real_pending(raw_text, chat_id)
+        return await _ask_confirm_action(
+            chat_id,
+            action=spec["action"],
+            goal=spec["goal"],
+            pretty=spec["pretty"],
+            payload=spec["payload"],
+        )
+
+    # ── Web search / browser ─────────────────────────────────────────────
+    if name == "web_search_nl":
+        return await handle_web_search_nl(intent.args.get("query") or raw_text)
+    if name == "browser_task":
+        return handle_browser_task(intent.args.get("raw") or raw_text)
+
+    # ── System action intents (apt/restart/git/secret/network) ───────────
+    if name == "system_network_action":
+        # Always confirm — owner must approve public/network change.
+        return await _ask_confirm_action(
+            chat_id,
+            action="system_network_action",
+            goal=(intent.args.get("raw") or raw_text)[:300],
+            pretty=("Việc này thuộc <b>high-risk public/network</b> "
+                    "(mở port / firewall / expose internet). "
+                    "Em chỉ chạy sau khi anh bấm ✅ Đồng ý."),
+            payload={"system_action": True,
+                     "raw": intent.args.get("raw") or raw_text},
+        )
+    if name == "system_secret_dump":
+        return handle_system_secret_dump(
+            intent.args.get("raw") or raw_text,
+        )
+    if name == "system_pkg_install":
+        return handle_system_pkg_install(
+            intent.args.get("raw") or raw_text,
+        )
+    if name == "system_restart":
+        return handle_system_restart(
+            intent.args.get("raw") or raw_text,
+        )
+    if name == "system_git_push":
+        return handle_system_git_push(
+            intent.args.get("raw") or raw_text,
+        )
 
     # ── Memory NL ────────────────────────────────────────────────────────
     if name == "memory_add":
@@ -3945,12 +4479,26 @@ async def bot_loop() -> None:
                     await send_chat_reply(chat_id, fallback)
             except Exception as e:
                 # Last-resort safety net — must not crash the polling loop.
+                # Owner Command Agent rule: never silent. Reply Vietnamese,
+                # redacted summary, point at /agent_diag.
                 import traceback as _tb
+                tb = _tb.format_exc()
                 log(f"error handler=outer text={text[:30]!r} message={e}\n"
-                    f"{_tb.format_exc()[:500]}")
+                    f"{tb[:500]}")
+                # Redact common secret tokens from the summary
+                summary = str(e)
+                for pat in (r"ghp_[A-Za-z0-9]+",
+                             r"sk-[A-Za-z0-9_-]+",
+                             r"Bearer [A-Za-z0-9._-]+"):
+                    import re as _re
+                    summary = _re.sub(pat, "<redacted>", summary)
                 try:
                     await send_chat_reply(
-                        chat_id, f"⚠️ Telegram handler error: {e}",
+                        chat_id,
+                        f"⚠️ Agent lỗi khi xử lý lệnh: "
+                        f"<code>{_esc(summary[:200])}</code>.\n"
+                        f"Dùng /agent_diag để xem trạng thái hoặc "
+                        f"<i>“đang làm tới đâu rồi”</i> để xem tiến độ.",
                     )
                 except Exception:
                     pass

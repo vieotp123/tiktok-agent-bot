@@ -678,6 +678,34 @@ def _on_due() -> None:
         send_telegram_message("\n".join(msg_lines))
         return
 
+    # ── Agent autorun: resume long-horizon owner work loop ───────────
+    # If an `agent_autorun` session is enabled, pump tasks until either
+    # max_tasks reached, stop_at arrived, or another quota hit.
+    try:
+        from bot.agent import agent_autorun as _aa
+        if _aa.is_enabled():
+            should_stop, stop_reason = _aa.is_due_to_stop()
+            if should_stop:
+                _aa.stop(user="autorun_scheduler", reason=stop_reason)
+                msg_lines.append(
+                    f"⏹ Agent autorun stopped (reason={stop_reason}).")
+            else:
+                # Resume — clear pause, run one cycle.
+                _aa.resume()
+                msg_lines.append("▶ Agent autorun: resuming via "
+                                 "claude_quota scheduler tick.")
+                try:
+                    import asyncio as _asy
+                    res = _asy.run(_aa.advance_one(user="autorun_scheduler"))
+                    msg_lines.append(
+                        f"  • result: <code>"
+                        f"{res.get('status', '?')}</code> "
+                        f"task=<code>{res.get('task_id', '?')}</code>")
+                except Exception as e:
+                    msg_lines.append(f"  ⚠ autorun advance error: {e}")
+    except Exception:
+        pass
+
     # Available — fire bridge if autorun is on
     if autorun_ok:
         try:

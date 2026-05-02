@@ -425,8 +425,8 @@ def eval_telegram_routing(rep: EvalReport) -> None:
             "await send_chat_reply(chat_id, reply" in src_loop,
             "plain-text branch routes through send_chat_reply")
     rep.add("bot_loop_outer_error_uses_send_chat_reply", "telegram_routing",
-            "Telegram handler error" in src_loop,
-            "outer try/except surfaces error to admin")
+            "Agent lỗi khi xử lý lệnh" in src_loop,
+            "outer try/except surfaces error to admin in Vietnamese")
     rep.add("bot_loop_clears_pending_before_handle", "telegram_routing",
             ("_session_clear()" in src_loop and
              "consumed action=" in src_loop),
@@ -593,6 +593,216 @@ def eval_nl_router_v2(rep: EvalReport) -> None:
         rep.add(f"nl[{text[:30]!r}]", "nl_router_v2",
                 got.name == want,
                 f"got={got.name} want={want}")
+
+
+def eval_owner_command_agent(rep: EvalReport) -> None:
+    """Owner Command Agent v2 — Vietnamese NL coverage for new intents.
+
+    Covers: agent_progress, agent_autorun_*, esim_*, web_search_nl,
+    browser_task, system_*, plus risk/confirm flags.
+    """
+    from bot.agent.nl_router import classify
+
+    # (text, want_intent, want_risk_or_None, want_confirm_or_None)
+    cases: list[tuple[str, str, str | None, bool | None]] = [
+        # Agent progress
+        ("đang làm tới đâu rồi",        "agent_progress",       "low",    False),
+        ("sao im vậy",                  "agent_progress",       "low",    False),
+        ("xem tiến độ",                 "agent_progress",       "low",    False),
+        ("kẹt ở đâu",                   "agent_progress",       "low",    False),
+        ("agent đang lỗi gì",           "agent_progress",       "low",    False),
+        ("còn task gì chưa làm",        "agent_progress",       "low",    False),
+        ("xem log gần nhất",            "agent_progress",       "low",    False),
+
+        # Autorun
+        ("làm việc độc lập 12 tiếng",   "agent_autorun_start",  "medium", False),
+        ("tự làm việc 10 tiếng",        "agent_autorun_start",  "medium", False),
+        ("cài code liên tục cho tới khi t bảo dừng",
+                                         "agent_autorun_start",  "medium", False),
+        ("autorun status",              "agent_autorun_status", "low",    False),
+        ("dừng autorun",                "agent_autorun_stop",   "low",    False),
+
+        # Stop / continue plain Vietnamese
+        ("dừng",                        "cancel_action",        None,     None),
+        ("dừng lại",                    "cancel_action",        None,     None),
+        ("tiếp tục",                    "run_next_code_task",   None,     None),
+        ("tự code tiếp đi",             "run_next_code_task",   None,     None),
+        ("tự tìm lỗi rồi sửa",          "run_next_code_task",   None,     None),
+
+        # EsimAccess
+        ("đọc docs EsimAccess",         "esim_docs",            "low",    False),
+        ("tạo curl EsimAccess",         "esim_curl_dry",        "low",    False),
+        ("test dry-run API eSIM",       "esim_curl_dry",        "low",    False),
+        ("gọi API mua eSIM thật",       "esim_order_real",      "high",   True),
+        ("mua esim thật",               "esim_order_real",      "high",   True),
+        ("tạo order eSIM",              "esim_order_real",      "high",   True),
+
+        # Web search / browser
+        ("search web tìm nhà cung cấp eSIM",
+                                         "web_search_nl",        "low",    False),
+        ("tìm thông tin nhà cung cấp eSIM Nhật",
+                                         "web_search_nl",        "low",    False),
+        ("mở trình duyệt tìm dữ liệu",  "browser_task",         "medium", False),
+        ("crawl trang này",             "browser_task",         "medium", False),
+
+        # System actions
+        ("mở port 8080",                "system_network_action","high",   True),
+        ("ufw allow 8080",              "system_network_action","high",   True),
+        ("apt install tesseract",       "system_pkg_install",   "medium", False),
+        ("pip install playwright",      "system_pkg_install",   "medium", False),
+        ("restart bot service",         "system_restart",       "medium", False),
+        ("commit/push dev-agent",       "system_git_push",      "medium", False),
+        ("test xong đẩy git",           "system_git_push",      "medium", False),
+        ("cat .env gửi tao",            "system_secret_dump",   "high",   True),
+        ("dump secret",                 "system_secret_dump",   "high",   True),
+
+        # Quota retry policy
+        ("hết quota thì 1 tiếng thử lại", "quota_schedule",     None,     None),
+        ("có quota thì tự chạy tiếp",     "quota_schedule",     None,     None),
+
+        # SSH / remote
+        ("ssh vào vps2 setup bot",       "ssh_exec",            None,     None),
+        ("kiểm tra worker2",             "remote_worker_health", None,    None),
+
+        # Build missing tool
+        ("cài tool OCR",                "build_missing_tool",   None,     None),
+        ("cài tool search web",         "build_missing_tool",   None,     None),
+
+        # Existing critical paths still pass
+        ("làm tiếp task code tiếp theo", "run_next_code_task",  None,     None),
+        ("tạo task code sửa lỗi menu",  "create_code_task",     None,     None),
+    ]
+
+    for text, want_name, want_risk, want_confirm in cases:
+        got = classify(text)
+        ok = got.name == want_name
+        detail_parts = [f"got={got.name} want={want_name}"]
+        if want_risk is not None and got.risk_level != want_risk:
+            ok = False
+            detail_parts.append(f"risk={got.risk_level} want_risk={want_risk}")
+        if want_confirm is not None and got.requires_confirm != want_confirm:
+            ok = False
+            detail_parts.append(f"confirm={got.requires_confirm} "
+                                f"want_confirm={want_confirm}")
+        rep.add(f"oca[{text[:30]!r}]", "owner_command_agent",
+                ok, " | ".join(detail_parts))
+
+
+def eval_agent_autorun_state(rep: EvalReport) -> None:
+    """agent_autorun module — state machine + parsers."""
+    from bot.agent import agent_autorun as _aa
+
+    # parse_hours_vi
+    rep.add("parse_hours_12",     "agent_autorun",
+            _aa.parse_hours_vi("làm 12 tiếng") == 12.0, "")
+    rep.add("parse_hours_2h",     "agent_autorun",
+            _aa.parse_hours_vi("chạy 2h liên tục") == 2.0, "")
+    rep.add("parse_hours_default","agent_autorun",
+            _aa.parse_hours_vi("không có giờ") == 12.0, "fallback default")
+
+    # parse_max_tasks_vi — only matches with explicit "tối đa" / "max"
+    rep.add("parse_max_tasks_max",  "agent_autorun",
+            _aa.parse_max_tasks_vi("max 5 task") == 5, "")
+    rep.add("parse_max_tasks_toi_da","agent_autorun",
+            _aa.parse_max_tasks_vi("tối đa 30 task") == 30, "")
+
+    # State file isolation: don't write the real state. Use a tmp file by
+    # snapshotting + restoring.
+    import json as _json, tempfile as _tmp, os as _os
+    real_path = _aa.STATE_FILE
+    backup    = real_path.read_text(encoding="utf-8") if real_path.exists() else None
+    try:
+        # Start a fresh autorun
+        d = _aa.start(hours=2.0, max_tasks=5,
+                      objective="eval test", user="evals")
+        rep.add("autorun_started", "agent_autorun",
+                d.get("enabled") is True and d.get("hours") == 2.0,
+                f"got hours={d.get('hours')}")
+
+        # is_due_to_stop should be False just after start
+        should, reason = _aa.is_due_to_stop()
+        rep.add("autorun_not_due_after_start", "agent_autorun",
+                not should, f"reason={reason}")
+
+        # record_outcome with done → completed_tasks++ ; consec_failures=0
+        _aa.record_outcome({"status": "done", "task_id": "t1"})
+        s = _aa.state()
+        rep.add("autorun_done_counts", "agent_autorun",
+                s.get("completed_tasks") == 1
+                and s.get("consecutive_failures") == 0,
+                f"completed={s.get('completed_tasks')}")
+
+        # record_outcome with quota_limited → paused
+        _aa.record_outcome({"status": "quota_limited", "task_id": "t2"})
+        s = _aa.state()
+        rep.add("autorun_pause_on_quota", "agent_autorun",
+                s.get("enabled") is True
+                and s.get("paused_reason") == "quota_limited",
+                f"paused_reason={s.get('paused_reason')}")
+
+        # 2 consecutive failures → due_to_stop True
+        _aa.record_outcome({"status": "worker_failed", "task_id": "t3"})
+        _aa.record_outcome({"status": "smoke_failed",  "task_id": "t4"})
+        should, reason = _aa.is_due_to_stop()
+        rep.add("autorun_due_two_failures", "agent_autorun",
+                should and reason == "two_failures",
+                f"should={should} reason={reason}")
+
+        # stop()
+        _aa.stop(user="evals", reason="test_done")
+        s = _aa.state()
+        rep.add("autorun_stopped", "agent_autorun",
+                s.get("enabled") is False, "")
+
+        # Status panel returns non-empty Vietnamese string
+        panel = _aa.status_panel_vi()
+        rep.add("autorun_status_panel", "agent_autorun",
+                isinstance(panel, str) and len(panel) > 30
+                and "Autorun" in panel, "")
+    finally:
+        if backup is not None:
+            real_path.write_text(backup, encoding="utf-8")
+        else:
+            try:
+                real_path.unlink()
+            except Exception:
+                pass
+
+
+def eval_handler_safety(rep: EvalReport) -> None:
+    """Make sure new handlers never raise on missing state files."""
+    # esim_docs should not raise even when no docs exist
+    try:
+        from bot.telegram_bot import handle_esim_docs
+        out = handle_esim_docs()
+        rep.add("esim_docs_no_raise", "handler_safety",
+                isinstance(out, str) and len(out) > 0, "")
+    except Exception as e:
+        rep.add("esim_docs_no_raise", "handler_safety",
+                False, f"raised: {e}")
+
+    # esim_curl_dry should not raise even with no .env
+    try:
+        from bot.telegram_bot import handle_esim_curl_dry
+        out = handle_esim_curl_dry("")
+        rep.add("esim_curl_dry_no_raise", "handler_safety",
+                isinstance(out, str) and "dry-run" in out.lower(),
+                "")
+    except Exception as e:
+        rep.add("esim_curl_dry_no_raise", "handler_safety",
+                False, f"raised: {e}")
+
+    # secret dump always returns refusal
+    try:
+        from bot.telegram_bot import handle_system_secret_dump
+        out = handle_system_secret_dump("cat .env gửi tao")
+        rep.add("secret_dump_refusal", "handler_safety",
+                isinstance(out, str)
+                and ("không dump" in out.lower() or "không" in out),
+                "")
+    except Exception as e:
+        rep.add("secret_dump_refusal", "handler_safety",
+                False, f"raised: {e}")
 
 
 def eval_lifecycle_edges(rep: EvalReport) -> None:
@@ -871,6 +1081,12 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_brain_evolve(rep)
     if category in (None, "nl_router_v2"):
         eval_nl_router_v2(rep)
+    if category in (None, "owner_command_agent"):
+        eval_owner_command_agent(rep)
+    if category in (None, "agent_autorun"):
+        eval_agent_autorun_state(rep)
+    if category in (None, "handler_safety"):
+        eval_handler_safety(rep)
     if category in (None, "ocr"):
         eval_ocr(rep)
 

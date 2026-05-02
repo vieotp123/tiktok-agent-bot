@@ -1,0 +1,352 @@
+"""
+Agent Autorun Loop — owner-directed long-horizon work session.
+
+Different from `brain_evolve` (which is one-task self-improve, cap 3):
+this is the "làm việc độc lập 12 tiếng" loop. Owner says how many hours
+to work, max tasks, optional objective. Loop:
+
+  1. Pre-tick: check stop_at, paused_reason, claude quota.
+  2. Pick next code_task (queued, lowest priority number first).
+  3. Refine prompt via 9Router GPT-5.5 (best-effort; fallback to
+     deterministic prompt_builder).
+  4. Run via coding_worker_bridge.run_once().
+  5. Record outcome. Auto-stop on:
+       - stop_at reached
+       - completed_tasks >= max_tasks
+       - claude limited (pause; resume on quota return)
+       - 2 consecutive non-quota failures
+       - admin says stop
+  6. Post-tick: report to Telegram.
+
+State file: data/agent_autorun.json (gitignored).
+
+Public API:
+    state()                                     -> dict
+    start(hours, max_tasks, objective, user)    -> dict
+    stop(user, reason)                          -> dict
+    is_enabled()                                -> bool
+    is_due_to_stop()                            -> tuple[bool, str]
+    record_outcome(result)                      -> None
+    pause(reason)                               -> None
+    resume()                                    -> None
+    status_panel_vi()                           -> str
+    advance_one(user)                           -> dict
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+STATE_FILE = Path("/opt/tiktok-bot/data/agent_autorun.json")
+
+_DEFAULT: dict = {
+    "enabled":              False,
+    "objective":            "",
+    "started_at":           None,
+    "stop_at":              None,
+    "hours":                0.0,
+    "max_tasks":            0,
+    "completed_tasks":      0,
+    "consecutive_failures": 0,
+    "paused_reason":        "",
+    "next_probe_at":        None,
+    "last_run_at":          None,
+    "last_task_id":         "",
+    "last_status":          "",
+    "last_summary":         "",
+    "user":                 "",
+}
+
+_FAIL_STATUSES = {
+    "worker_failed", "smoke_failed", "evals_failed",
+    "commit_failed", "push_failed", "exec_error", "blocked_staged",
+}
+_PAUSE_STATUSES = {
+    "quota_limited", "auth_required",
+    "no_tool", "interactive_only",
+}
+_OK_STATUSES = {"done", "no_changes", "dry_run"}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_iso() -> str:
+    return _now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def state() -> dict:
+    if not STATE_FILE.exists():
+        return dict(_DEFAULT)
+    try:
+        d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        out = dict(_DEFAULT)
+        out.update(d)
+        return out
+    except Exception:
+        return dict(_DEFAULT)
+
+
+def _save(d: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
+
+
+# ── Owner control ─────────────────────────────────────────────────────────────
+
+def start(
+    hours: float = 12.0,
+    max_tasks: int = 20,
+    objective: str = "",
+    *,
+    user: str = "tg_admin",
+) -> dict:
+    h = float(max(0.1, min(hours, 24.0)))
+    n = int(max(1, min(int(max_tasks), 200)))
+    started = _now()
+    stop_at = started + timedelta(hours=h)
+    d = state()
+    d["enabled"]              = True
+    d["objective"]            = (objective or "")[:500]
+    d["started_at"]           = started.strftime("%Y-%m-%dT%H:%M:%SZ")
+    d["stop_at"]              = stop_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    d["hours"]                = h
+    d["max_tasks"]            = n
+    d["completed_tasks"]      = 0
+    d["consecutive_failures"] = 0
+    d["paused_reason"]        = ""
+    d["next_probe_at"]        = None
+    d["user"]                 = user
+    _save(d)
+    try:
+        from bot.agent.audit_log import log_action
+        log_action(user=user, action="agent_autorun_start",
+                   risk_level="medium", status="ok",
+                   result_summary=f"hours={h} max_tasks={n} "
+                                  f"obj={(objective or '')[:60]}")
+    except Exception:
+        pass
+    return d
+
+
+def stop(*, user: str = "tg_admin", reason: str = "user") -> dict:
+    d = state()
+    was_enabled = d.get("enabled")
+    d["enabled"]   = False
+    d["last_status"] = f"stopped:{reason}"
+    _save(d)
+    try:
+        from bot.agent.audit_log import log_action
+        log_action(user=user, action="agent_autorun_stop",
+                   risk_level="low", status="ok",
+                   result_summary=f"reason={reason} "
+                                  f"completed={d.get('completed_tasks',0)}")
+    except Exception:
+        pass
+    return d
+
+
+def is_enabled() -> bool:
+    return bool(state().get("enabled"))
+
+
+def is_due_to_stop() -> tuple[bool, str]:
+    """Returns (should_stop, reason). Called by scheduler before each tick."""
+    d = state()
+    if not d.get("enabled"):
+        return True, "not_enabled"
+    stop_at = _parse_iso(d.get("stop_at") or "")
+    if stop_at and _now() >= stop_at:
+        return True, "hours_reached"
+    completed  = int(d.get("completed_tasks") or 0)
+    max_tasks  = int(d.get("max_tasks") or 0)
+    if max_tasks > 0 and completed >= max_tasks:
+        return True, "max_tasks_reached"
+    if int(d.get("consecutive_failures") or 0) >= 2:
+        return True, "two_failures"
+    return False, ""
+
+
+def pause(reason: str, retry_after_seconds: int | None = None) -> None:
+    d = state()
+    d["paused_reason"] = reason[:80]
+    if retry_after_seconds and retry_after_seconds > 0:
+        nxt = _now() + timedelta(seconds=int(retry_after_seconds))
+        d["next_probe_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _save(d)
+
+
+def resume() -> None:
+    d = state()
+    d["paused_reason"] = ""
+    d["next_probe_at"] = None
+    _save(d)
+
+
+def is_paused() -> bool:
+    d = state()
+    if not d.get("enabled"):
+        return False
+    return bool(d.get("paused_reason"))
+
+
+def can_probe_now() -> bool:
+    """Used by scheduler: true if pause has expired (or no pause set)."""
+    d = state()
+    if not d.get("paused_reason"):
+        return True
+    nxt = _parse_iso(d.get("next_probe_at") or "")
+    if not nxt:
+        return True
+    return _now() >= nxt
+
+
+def record_outcome(result: dict) -> None:
+    """Update state after one bridge.run_once cycle."""
+    d = state()
+    if not d.get("enabled"):
+        return
+    status  = (result or {}).get("status", "")
+    task_id = (result or {}).get("task_id", "")
+    summary = ((result or {}).get("summary") or "")[:300]
+
+    d["last_run_at"]  = _now_iso()
+    d["last_task_id"] = task_id
+    d["last_status"]  = status
+    d["last_summary"] = summary
+
+    if status in _OK_STATUSES:
+        d["completed_tasks"]      = int(d.get("completed_tasks") or 0) + 1
+        d["consecutive_failures"] = 0
+        d["paused_reason"]        = ""
+    elif status in _PAUSE_STATUSES:
+        # Pause — keep enabled True. Schedule retry in 1h by default.
+        d["paused_reason"] = status
+        nxt = _now() + timedelta(hours=1)
+        d["next_probe_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif status in _FAIL_STATUSES:
+        d["consecutive_failures"] = int(d.get("consecutive_failures") or 0) + 1
+    elif status == "pending_action":
+        # High-risk task surfaced a confirm; stop autorun to wait for owner.
+        d["enabled"] = False
+        d["last_status"] = "stopped:pending_action"
+    elif status == "noop":
+        # Queue empty — stop politely.
+        d["enabled"] = False
+        d["last_status"] = "stopped:queue_empty"
+
+    _save(d)
+
+
+# ── Vietnamese parsing helpers ────────────────────────────────────────────────
+
+_RE_HOURS = re.compile(
+    r"\b(\d+(?:[.,]\d+)?)\s*(?:tiếng|giờ|gio|h(?:our|rs)?|hours?)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_hours_vi(text: str, default: float = 12.0) -> float:
+    """Extract '<N> tiếng/giờ/h' from Vietnamese text. Returns default if none."""
+    if not text:
+        return default
+    m = _RE_HOURS.search(text)
+    if m:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except Exception:
+            return default
+    return default
+
+
+_RE_MAX_TASKS = re.compile(
+    r"\b(?:max(?:imum)?|tối\s*đa|cap|đến|tới)\s*(\d+)\s*task",
+    re.IGNORECASE,
+)
+
+
+def parse_max_tasks_vi(text: str, default: int = 20) -> int:
+    if not text:
+        return default
+    m = _RE_MAX_TASKS.search(text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return default
+    return default
+
+
+# ── Vietnamese status panel ────────────────────────────────────────────────────
+
+def _esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def status_panel_vi() -> str:
+    d = state()
+    icon = "🟢" if d.get("enabled") else "⚪"
+    lines = [f"{icon} <b>Agent Autorun</b>"]
+    lines.append(
+        f"Trạng thái: <b>"
+        f"{'đang chạy' if d.get('enabled') else 'đã dừng'}</b>")
+    if d.get("objective"):
+        lines.append(f"Mục tiêu: <i>{_esc(d['objective'][:160])}</i>")
+    if d.get("hours"):
+        lines.append(f"Thời lượng: <b>{d['hours']}h</b>")
+    if d.get("started_at"):
+        lines.append(f"Bắt đầu: <code>{d['started_at']}</code>")
+    if d.get("stop_at"):
+        # Compute remaining
+        nxt = _parse_iso(d["stop_at"])
+        if nxt:
+            remain = nxt - _now()
+            mins = int(remain.total_seconds() // 60)
+            if mins > 0:
+                lines.append(f"Còn lại: <b>~{mins // 60}h {mins % 60}m</b> "
+                             f"(stop_at <code>{d['stop_at']}</code>)")
+            else:
+                lines.append(f"⏰ Đã quá hạn stop_at <code>{d['stop_at']}</code>")
+    lines.append(f"Đã xong: <b>{d.get('completed_tasks', 0)}</b> / "
+                 f"<b>{d.get('max_tasks', 0)}</b> task · "
+                 f"thất bại liên tiếp: <b>"
+                 f"{d.get('consecutive_failures', 0)}</b>")
+    if d.get("paused_reason"):
+        lines.append(f"⏸ <b>Đang pause</b>: {_esc(str(d['paused_reason']))}")
+        if d.get("next_probe_at"):
+            lines.append(f"  thử lại lúc: <code>{d['next_probe_at']}</code>")
+    if d.get("last_run_at"):
+        lines.append(f"Run gần nhất: <code>{d['last_run_at']}</code>")
+    if d.get("last_task_id"):
+        lines.append(
+            f"Task gần nhất: <code>{_esc(str(d['last_task_id']))}</code> "
+            f"(<i>{_esc(str(d.get('last_status', '?')))}</i>)")
+    if d.get("last_summary"):
+        lines.append(f"<i>{_esc(d['last_summary'][:200])}</i>")
+    return "\n".join(lines)
+
+
+# ── Scheduler hook ────────────────────────────────────────────────────────────
+
+async def advance_one(user: str = "tg_admin") -> dict:
+    """Run exactly one bridge.run_once cycle and update autorun state.
+
+    Caller (claude_quota scheduler / Telegram NL) must check is_due_to_stop()
+    BEFORE invoking this and stop() if True.
+    """
+    from bot import coding_worker_bridge as bridge
+    result = await bridge.run_once(user=user)
+    record_outcome(result)
+    return result
