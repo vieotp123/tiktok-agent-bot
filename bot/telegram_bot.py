@@ -40,11 +40,13 @@ from bot.memory_store import (
 from bot.business_store import (
     init_business_db, seed_products_if_empty,
     list_products, add_product, update_product, get_product,
-    detect_esim_intent, build_consult_reply,
-    upsert_lead, get_lead, list_leads, add_conversation,
+    verify_product, disable_product,
+    detect_esim_intent, build_consult_reply, compute_lead_score,
+    upsert_lead, get_lead, get_lead_by_sender, list_leads, add_conversation,
     add_consulting_log, list_consulting_logs,
     add_followup, list_followups,
-    format_products_list, format_leads_list, format_lead_detail,
+    format_products_list, format_product_detail,
+    format_leads_list, format_lead_detail,
     format_followups_list,
 )
 
@@ -63,8 +65,11 @@ TG_BASE    = f"https://api.telegram.org/bot{TG_TOKEN}"
 POLL_TIMEOUT  = 30
 MAX_REPLY_LEN = 4000
 
-SESSION_FILE = Path("/opt/tiktok-bot/data/telegram/session_state.json")
-SESSION_TTL  = 600  # 10 minutes
+SESSION_FILE     = Path("/opt/tiktok-bot/data/telegram/session_state.json")
+MENU_STATE_FILE  = Path("/opt/tiktok-bot/data/telegram/menu_state.json")
+SESSION_TTL      = 600   # 10 minutes
+MENU_EDIT_TTL    = 86400 # 24h — older menu messages can no longer be edited reliably
+SHORT_RESULT_MAX = 1500  # chars — under this, edit menu in place; above, send + refresh menu
 
 # Task intent patterns for smart routing
 _TASK_PATTERNS = [
@@ -120,6 +125,49 @@ def _session_clear() -> None:
     SESSION_FILE.unlink(missing_ok=True)
 
 
+# ── Menu state (active menu message_id per chat) ──────────────────────────────
+
+def _menu_state_save(chat_id: str | int, message_id: int, view: str = "main") -> None:
+    """Remember the active menu message_id so we can edit instead of resend."""
+    MENU_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(MENU_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    data[str(chat_id)] = {
+        "message_id": int(message_id),
+        "view":       view,
+        "ts":         datetime.now(timezone.utc).timestamp(),
+    }
+    MENU_STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _menu_state_get(chat_id: str | int) -> Optional[dict]:
+    if not MENU_STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(MENU_STATE_FILE.read_text(encoding="utf-8"))
+        st = data.get(str(chat_id))
+        if not st:
+            return None
+        if datetime.now(timezone.utc).timestamp() - st.get("ts", 0) > MENU_EDIT_TTL:
+            return None
+        return st
+    except Exception:
+        return None
+
+
+def _menu_state_clear(chat_id: str | int) -> None:
+    try:
+        if not MENU_STATE_FILE.exists():
+            return
+        data = json.loads(MENU_STATE_FILE.read_text(encoding="utf-8"))
+        data.pop(str(chat_id), None)
+        MENU_STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ── Low-level Telegram API ────────────────────────────────────────────────────
 
 async def tg_call(method: str, payload: dict) -> dict:
@@ -156,7 +204,8 @@ async def send(chat_id: str | int, text: str,
 
 
 async def edit_msg(chat_id: str | int, message_id: int, text: str,
-                   reply_markup: Optional[dict] = None) -> None:
+                   reply_markup: Optional[dict] = None) -> bool:
+    """Edit a message; return True on success."""
     payload: dict = {
         "chat_id":    chat_id,
         "message_id": message_id,
@@ -165,7 +214,15 @@ async def edit_msg(chat_id: str | int, message_id: int, text: str,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    await tg_call("editMessageText", payload)
+    r = await tg_call("editMessageText", payload)
+    if not r.get("ok"):
+        desc = (r.get("description") or "")[:120]
+        # "message is not modified" is a benign no-op — counts as success
+        if "not modified" in desc.lower():
+            return True
+        log(f"menu edit failed reason={desc!r} message_id={message_id}")
+        return False
+    return True
 
 
 async def answer_cb(callback_query_id: str, text: str = "") -> None:
@@ -220,6 +277,76 @@ def make_keyboard(rows: list[list[tuple[str, str]]]) -> dict:
 
 
 BACK_ROW = [("◀ Back", "menu:main")]
+RESULT_KB = make_keyboard([[("◀ Back to Menu", "menu:main")]])
+
+
+# ── High-level menu rendering (edit-in-place; resend only when needed) ────────
+
+async def show_menu(chat_id: str | int, text: str, kb: dict, *,
+                    msg_id: Optional[int] = None, view: str = "") -> int:
+    """
+    Render a menu in place if possible, otherwise send a fresh menu.
+    Updates the persisted active-menu-message-id state.
+
+    msg_id: if provided (e.g. from a callback), edit that message first.
+            Otherwise read the persisted active menu id and edit that.
+            On any edit failure, send a new message and update state.
+    """
+    target_id = msg_id or (_menu_state_get(chat_id) or {}).get("message_id")
+    if target_id:
+        ok = await edit_msg(chat_id, int(target_id), text, kb)
+        if ok:
+            log(f"menu mode=edit message_id={target_id} view={view!r}")
+            _menu_state_save(chat_id, int(target_id), view=view or "menu")
+            return int(target_id)
+        # edit failed (message gone, too old, etc.) — fall through to send
+
+    new_id = await send(chat_id, text, kb)
+    if new_id:
+        log(f"menu mode=send message_id={new_id} view={view!r}")
+        _menu_state_save(chat_id, int(new_id), view=view or "menu")
+        return int(new_id)
+    return 0
+
+
+async def show_result(chat_id: str | int, result: str, *,
+                      msg_id: Optional[int] = None,
+                      back_kb: dict = RESULT_KB,
+                      view: str = "result") -> None:
+    """
+    Render a command/action result.
+
+    Short results (≤ SHORT_RESULT_MAX) → edit the active menu in place with
+    the result + Back-to-Menu keyboard. No new message is sent.
+
+    Long results → send the result as a separate message (no buttons), then
+    re-render the active menu (edit if possible) so navigation stays at the
+    bottom of the chat.
+    """
+    if not result:
+        result = "(no result)"
+    text = result.strip()
+
+    if len(text) <= SHORT_RESULT_MAX:
+        target_id = msg_id or (_menu_state_get(chat_id) or {}).get("message_id")
+        if target_id:
+            ok = await edit_msg(chat_id, int(target_id), text, back_kb)
+            if ok:
+                log(f"menu mode=edit message_id={target_id} view={view!r} (result)")
+                _menu_state_save(chat_id, int(target_id), view=view)
+                return
+        # No menu to edit or edit failed → send result as a fresh menu-style msg
+        new_id = await send(chat_id, text, back_kb)
+        if new_id:
+            log(f"menu mode=send message_id={new_id} view={view!r} (result)")
+            _menu_state_save(chat_id, int(new_id), view=view)
+        return
+
+    # Long result: send as a plain message, then refresh the menu underneath.
+    await send(chat_id, text)
+    log(f"result long len={len(text)} view={view!r} — sent + refreshing menu")
+    text_m, kb = menu_main()
+    await show_menu(chat_id, text_m, kb, view="main")
 
 
 def menu_main() -> tuple[str, dict]:
@@ -231,7 +358,7 @@ def menu_main() -> tuple[str, dict]:
         [("📊 Status", "nav:status"), ("🤖 Router/Models", "nav:router")],
         [("🧠 Tasks",  "nav:tasks"),  ("🔎 Search",        "nav:search")],
         [("📁 Files",  "nav:files"),  ("🧩 Skills",        "nav:skills")],
-        [("💾 Memory", "nav:memory"), ("🛒 Sales/CRM",      "nav:sales")],
+        [("💾 Memory", "nav:memory"), ("💼 Sales/CRM",      "nav:sales")],
         [("⚙️ Admin",  "nav:admin")],
     ])
     return text, kb
@@ -306,22 +433,28 @@ def menu_admin() -> tuple[str, dict]:
 
 
 def menu_sales() -> tuple[str, dict]:
-    text = "<b>🛒 Sales / CRM</b>"
+    text = "<b>💼 Sales / CRM</b>"
     kb = make_keyboard([
-        [("📦 Products", "do:products"), ("✏ Add Product", "input:product_add")],
-        [("💬 Consult", "input:consult"), ("👥 Leads", "do:leads")],
-        [("⏰ Followups", "do:followups"), ("➕ Lead Add", "input:lead_add")],
+        [("📦 All Products",  "do:products"),
+         ("✅ Active",         "do:products_active")],
+        [("⚠ Needs Update",   "do:products_needs_update"),
+         ("💬 Consult",        "input:consult")],
+        [("👥 Leads",          "do:leads"),
+         ("⏰ Followups",      "do:followups")],
+        [("➕ Add Product",    "input:product_add"),
+         ("✏ Update Product", "input:product_update")],
         BACK_ROW,
     ])
     return text, kb
 
 
 def menu_memory() -> tuple[str, dict]:
-    text = "<b>🧠 Memory</b>"
+    text = "<b>💾 Memory</b>"
     kb = make_keyboard([
-        [("🔍 Search Memory", "input:memory_search"), ("➕ Add Memory", "input:memory_add")],
-        [("📚 Lessons", "do:memory_lessons"), ("🗑 Forget", "input:memory_forget")],
-        [("🗜 Compact", "do:memory_compact"), ("🔎 Context", "input:memory_context")],
+        [("🔍 Search Memory", "input:memory_search"),
+         ("➕ Add Memory",    "input:memory_add")],
+        [("📚 Lessons",       "do:memory_lessons"),
+         ("🔎 Context",       "input:memory_context")],
         BACK_ROW,
     ])
     return text, kb
@@ -795,8 +928,107 @@ def handle_memory_context(query: str) -> str:
 
 # ── Sales / CRM handlers ──────────────────────────────────────────────────────
 
-def handle_products() -> str:
-    return format_products_list()
+_PRODUCT_STATUS_ALIAS = {
+    "active": "active", "verified": "active", "ok": "active",
+    "needs_update": "needs_update", "needs": "needs_update",
+    "pending": "needs_update", "unverified": "needs_update",
+    "disabled": "disabled", "off": "disabled",
+}
+
+
+def handle_products(status_filter: str | None = None) -> str:
+    """List products. status_filter ∈ {active, needs_update, disabled, None}."""
+    s = None
+    if status_filter:
+        s = _PRODUCT_STATUS_ALIAS.get(status_filter.lower().strip())
+        if s is None and status_filter.strip():
+            return (f"Unknown status filter: <code>{_esc(status_filter)}</code>. "
+                    "Try: active | needs_update | disabled.")
+    return format_products_list(status=s)
+
+
+def handle_product_detail(product_id: str) -> str:
+    pid = product_id.strip()
+    if not pid:
+        return "Usage: /product &lt;product_id&gt;"
+    return format_product_detail(pid)
+
+
+def handle_product_verify(arg: str) -> str:
+    pid = arg.strip()
+    if not pid:
+        return "Usage: /product_verify &lt;product_id&gt;"
+    if not get_product(pid):
+        return f"❌ Product <code>{_esc(pid)}</code> không tồn tại."
+    if verify_product(pid):
+        log_action(user="tg_admin", action="product_verify", risk_level="medium",
+                   status="ok", result_summary=f"id={pid} -> active")
+        return f"✅ <code>{pid}</code> đã được verify (status=active). Có thể quote khách."
+    return f"❌ Verify failed for <code>{_esc(pid)}</code>."
+
+
+def handle_product_disable(arg: str) -> str:
+    pid = arg.strip()
+    if not pid:
+        return "Usage: /product_disable &lt;product_id&gt;"
+    if not get_product(pid):
+        return f"❌ Product <code>{_esc(pid)}</code> không tồn tại."
+    if disable_product(pid):
+        log_action(user="tg_admin", action="product_disable", risk_level="medium",
+                   status="ok", result_summary=f"id={pid} -> disabled")
+        return f"🚫 <code>{pid}</code> disabled — sẽ không suggest khách."
+    return f"❌ Disable failed for <code>{_esc(pid)}</code>."
+
+
+def handle_lead_by_sender(arg: str) -> str:
+    """Lookup lead by sender_key (any platform). Format: [platform:]sender_key"""
+    arg = arg.strip()
+    if not arg:
+        return "Usage: /lead_by_sender [platform:]&lt;sender_key&gt;"
+    if ":" in arg:
+        platform, sk = arg.split(":", 1)
+        l = get_lead_by_sender(platform.strip(), sk.strip())
+    else:
+        # Try common platforms in order
+        l = (get_lead_by_sender("tiktok", arg)
+             or get_lead_by_sender("telegram", arg)
+             or get_lead(arg))
+    if not l:
+        return f"Không tìm thấy lead cho <code>{_esc(arg)}</code>."
+    return format_lead_detail(l["id"])
+
+
+def handle_consulting_logs(arg: str = "") -> str:
+    sk = arg.strip() or None
+    logs = list_consulting_logs(sender_key=sk, limit=10)
+    if not logs:
+        target = f" cho sender_key={sk}" if sk else ""
+        return f"Không có consulting log nào{target}."
+    lines = [f"<b>Consulting logs</b>" + (f" — {sk}" if sk else "") + f" ({len(logs)})"]
+    for l in logs:
+        bar = "💎" * min(int(l.get("confidence", 0) * 4), 4) or "·"
+        lines.append(
+            f"{bar} [{l.get('platform', '?')}/{(l.get('sender_key') or '?')[:20]}]\n"
+            f"   Q: {l.get('user_message', '')[:80]}\n"
+            f"   A: {l.get('bot_reply', '')[:80]}\n"
+            f"   <i>{l.get('created_at', '')[:16]}</i>"
+        )
+    return "\n\n".join(lines)
+
+
+def handle_followup_add(spec: str) -> str:
+    """Format: lead_id | remind_at_iso | note"""
+    parts = [p.strip() for p in spec.split("|")]
+    if len(parts) < 2:
+        return "Usage: /followup_add &lt;lead_id&gt; | &lt;remind_at_iso&gt; | [note]"
+    pad = parts + [""] * (3 - len(parts))
+    lead_id, remind_at, note = pad[:3]
+    if not get_lead(lead_id):
+        return f"❌ Lead <code>{_esc(lead_id)}</code> không tồn tại."
+    fid = add_followup(lead_id=lead_id, remind_at=remind_at, note=note)
+    log_action(user="tg_admin", action="followup_add", risk_level="low",
+               status="ok", result_summary=f"id={fid} lead={lead_id}")
+    return f"✅ Followup <code>{fid}</code> created for lead <code>{lead_id}</code>."
 
 
 def handle_product_add(spec: str) -> str:
@@ -860,16 +1092,14 @@ def handle_product_update(spec: str) -> str:
 
 
 async def handle_consult(text: str) -> str:
-    """Run sales consult for an admin-provided customer question."""
+    """Run sales consult for an admin-provided customer question.
+    Uses admin tone (direct, with warnings, no mày/tao softening)."""
     text = text.strip()
     if not text:
-        return "Usage: /consult <customer message>"
-    if not detect_esim_intent(text):
-        # Still allow it, but warn
-        prefix = "⚠️ Không detect intent eSIM rõ ràng, vẫn thử lookup:\n\n"
-    else:
-        prefix = ""
-    reply, ids, confidence = build_consult_reply(text)
+        return "Usage: /consult &lt;customer message&gt;"
+    prefix = "" if detect_esim_intent(text) else "⚠️ Không detect intent eSIM rõ ràng, vẫn thử lookup:\n\n"
+    reply, ids, confidence = build_consult_reply(text, audience="admin")
+    score = compute_lead_score(text)
 
     # Log as Telegram-admin consult
     add_consulting_log(
@@ -881,19 +1111,20 @@ async def handle_consult(text: str) -> str:
         from bot.memory_store import add_raw_event
         add_raw_event(
             source="telegram", action="sales_consult",
-            summary=f"admin consult q={text[:50]!r} conf={confidence:.2f}",
+            summary=f"admin consult q={text[:50]!r} conf={confidence:.2f} score={score}",
             actor="telegram_admin", event_type="consulting",
             tags=["sales", "esim", "admin"],
         )
     except Exception:
         pass
     log_action(user="tg_admin", action="consult", risk_level="low",
-               status="ok", result_summary=f"conf={confidence:.2f} products={len(ids)}",
+               status="ok", result_summary=f"conf={confidence:.2f} score={score} products={len(ids)}",
                goal=text[:120])
     return (
-        f"{prefix}<b>Consult result</b> (confidence={confidence:.2f})\n"
-        f"Products considered: {', '.join(ids) if ids else '(none)'}\n\n"
-        f"<b>Reply:</b>\n{_esc(reply)}"
+        f"{prefix}<b>Consult result</b> "
+        f"(confidence={confidence:.2f} · lead_score={score})\n"
+        f"Products: {', '.join(ids) if ids else '(none)'}\n\n"
+        f"<b>Reply (admin tone):</b>\n{_esc(reply)}"
     )
 
 
@@ -1082,18 +1313,23 @@ _CONFIRM_PENDING: dict[str, str] = {}  # callback_id -> action
 
 
 async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
-    """Handle an inline keyboard button press."""
+    """Handle an inline keyboard button press. Always answerCallbackQuery first.
+    Navigation = edit existing menu in place.
+    Action  = edit menu with result (short) OR send result + refresh menu (long).
+    Input   = edit menu with prompt; pending_input handled when user replies.
+    """
     cb_id   = cb["id"]
     data    = cb.get("data", "")
     msg_id  = (cb.get("message") or {}).get("message_id")
 
     await answer_cb(cb_id)   # always ACK
+    log(f"callback data={data!r} chat_id={chat_id} msg_id={msg_id}")
 
     parts = data.split(":", 1)
     kind  = parts[0]
     val   = parts[1] if len(parts) > 1 else ""
 
-    # ── Navigation: show sub-menu ─────────────────────────────────────────────
+    # ── Navigation: show sub-menu (edit-in-place) ─────────────────────────────
     if kind == "nav":
         menu_fn = {
             "status": menu_status, "router": menu_router, "tasks": menu_tasks,
@@ -1105,27 +1341,24 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             text, kb = menu_fn()
         else:
             text, kb = menu_main()
-        if msg_id:
-            await edit_msg(chat_id, msg_id, text, kb)
-        else:
-            await send(chat_id, text, kb)
+        await show_menu(chat_id, text, kb, msg_id=msg_id, view=val or "main")
         return
 
     if kind == "menu" and val == "main":
         text, kb = menu_main()
-        if msg_id:
-            await edit_msg(chat_id, msg_id, text, kb)
-        else:
-            await send(chat_id, text, kb)
+        await show_menu(chat_id, text, kb, msg_id=msg_id, view="main")
         return
 
     # ── Immediate action ──────────────────────────────────────────────────────
     if kind == "do":
-        result = await _execute_action(val, chat_id)
-        await send(chat_id, result or "(no result)")
+        try:
+            result = await _execute_action(val, chat_id)
+        except Exception as e:
+            result = f"❌ Action error: {e}"
+        await show_result(chat_id, result, msg_id=msg_id, view=f"do:{val}")
         return
 
-    # ── Input required: set session state ─────────────────────────────────────
+    # ── Input required: edit menu with prompt + Cancel button ─────────────────
     if kind == "input":
         prompts = {
             "run_task":      "✏️ Enter the task goal:",
@@ -1134,37 +1367,37 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             "send_file":     "📤 Enter file path or file_id:",
             "skill_detail":  "🧩 Enter skill name:",
             "memory_search": "🔍 Enter memory search query:",
-            "memory_add":    "➕ Enter memory text (format: <b>Title</b> | content | tag1,tag2):",
-            "memory_forget": "🗑 Enter memory ID to delete:",
+            "memory_add":    "➕ Enter memory: Title | content | tag1,tag2",
             "memory_context":"🔎 Enter goal/query for context preview:",
             "consult":       "💬 Enter customer question for sales consult:",
-            "product_add":   ("✏ Enter product (format: name | network | country | "
+            "product_add":   ("✏ Enter product (name | network | country | "
                               "duration_days | data_amount | sms(0/1) | hotspot(0/1) | renew(0/1) | notes):"),
-            "product_update":"🔧 Enter: <product_id> | field=value [| field=value ...]",
-            "lead_add":      "➕ Enter lead (format: platform | sender_key | name | need):",
+            "product_update":"🔧 Enter: &lt;product_id&gt; | field=value | field=value ...",
+            "product_verify":"✅ Enter product_id to mark as <b>active</b> (verified):",
+            "product_disable":"🚫 Enter product_id to <b>disable</b>:",
+            "lead_add":      "➕ Enter lead: platform | sender_key | name | need",
+            "followup_add":  "⏰ Enter followup: lead_id | remind_at (ISO date) | note",
         }
         prompt = prompts.get(val, "✏️ Enter input:")
         _session_save(val, prompt)
-        if msg_id:
-            await edit_msg(chat_id, msg_id,
-                           f"{prompt}\n\n<i>Send /cancel to abort.</i>",
-                           make_keyboard([[("❌ Cancel", "menu:main")]]))
-        else:
-            await send(chat_id, f"{prompt}\n\n<i>Send /cancel to abort.</i>")
+        log(f"pending_input={val} chat_id={chat_id}")
+        cancel_kb = make_keyboard([[("❌ Cancel", "menu:main")]])
+        await show_menu(chat_id,
+                        f"{prompt}\n\n<i>Send /cancel to abort.</i>",
+                        cancel_kb, msg_id=msg_id, view=f"input:{val}")
         return
 
     # ── Confirm dangerous actions ─────────────────────────────────────────────
     if kind == "confirm":
         if val == "restart_bot":
             confirm_kb = make_keyboard([
-                [("✅ Yes, restart", "do:restart_bot"), ("❌ Cancel", "menu:main")],
+                [("✅ Yes, restart", "do:restart_bot"),
+                 ("❌ Cancel",       "menu:main")],
             ])
-            if msg_id:
-                await edit_msg(chat_id, msg_id,
-                               "⚠️ <b>Restart tiktok-bot?</b>\nThis will briefly drop the TikTok session.",
-                               confirm_kb)
-            else:
-                await send(chat_id, "⚠️ Confirm restart?", confirm_kb)
+            await show_menu(chat_id,
+                            "⚠️ <b>Restart tiktok-bot?</b>\n"
+                            "This will briefly drop the TikTok session.",
+                            confirm_kb, msg_id=msg_id, view="confirm:restart_bot")
         return
 
 
@@ -1202,6 +1435,12 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return await handle_memory_compact()
     if action == "products":
         return handle_products()
+    if action == "products_active":
+        return handle_products("active")
+    if action == "products_needs_update":
+        return handle_products("needs_update")
+    if action == "products_disabled":
+        return handle_products("disabled")
     if action == "leads":
         return handle_leads()
     if action == "followups":
@@ -1249,8 +1488,14 @@ async def handle_pending_input(action: str, text: str, chat_id: str | int) -> st
         return handle_product_add(text)
     if action == "product_update":
         return handle_product_update(text)
+    if action == "product_verify":
+        return handle_product_verify(text)
+    if action == "product_disable":
+        return handle_product_disable(text)
     if action == "lead_add":
         return handle_lead_add(text)
+    if action == "followup_add":
+        return handle_followup_add(text)
     return f"Unknown action: {action}"
 
 
@@ -1263,27 +1508,19 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     arg   = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in ("/start", "/help"):
-        _, kb = menu_main()
-        await send(
-            chat_id,
-            "👋 <b>Bot Control Panel</b>\n"
-            "Use /menu for the full inline menu.\n\n"
-            "<b>Agent commands:</b>\n"
-            "/agent_blueprint — architecture overview\n"
-            "/workers — active workers\n"
-            "/memory_search &lt;q&gt; — search memory\n"
-            "/lessons [skill] — past lessons\n"
-            "/audit_recent — last audit entries",
-            kb,
-        )
+        text_m, kb = menu_main()
+        await show_menu(chat_id, text_m, kb, view="main")
         return ""
     if cmd == "/menu":
         text_m, kb = menu_main()
-        await send(chat_id, text_m, kb)
+        await show_menu(chat_id, text_m, kb, view="main")
         return ""
     if cmd == "/cancel":
         _session_clear()
-        return "✅ Cancelled. Session cleared."
+        text_m, kb = menu_main()
+        await show_menu(chat_id, text_m, kb, view="main")
+        log("cancel: pending input cleared, menu refreshed")
+        return ""
 
     if cmd == "/status":       return await handle_status()
     if cmd == "/health":       return await handle_health()
@@ -1306,14 +1543,22 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/tiktok_chat_info": return handle_tiktok_chat_info()
     if cmd == "/agent_blueprint":  return handle_agent_blueprint()
     if cmd == "/workers":          return handle_workers()
-    if cmd == "/products":         return handle_products()
+    if cmd == "/products":
+        # /products [active|needs_update|disabled]
+        return handle_products(arg.strip() or None)
+    if cmd == "/product":          return handle_product_detail(arg)
     if cmd == "/product_add":      return handle_product_add(arg)
     if cmd == "/product_update":   return handle_product_update(arg)
+    if cmd == "/product_verify":   return handle_product_verify(arg)
+    if cmd == "/product_disable":  return handle_product_disable(arg)
     if cmd == "/consult":          return await handle_consult(arg)
     if cmd == "/leads":            return handle_leads()
     if cmd == "/lead":             return handle_lead_detail(arg)
+    if cmd == "/lead_by_sender":   return handle_lead_by_sender(arg)
     if cmd == "/lead_add":         return handle_lead_add(arg)
+    if cmd == "/consulting_logs":  return handle_consulting_logs(arg)
     if cmd == "/followups":        return handle_followups()
+    if cmd == "/followup_add":     return handle_followup_add(arg)
     if cmd == "/memory_search":    return await handle_memory_search(arg)
     if cmd == "/memory_add":       return await handle_memory_add(arg)
     if cmd == "/memory_forget":    return handle_memory_forget(arg)
@@ -1457,22 +1702,26 @@ async def bot_loop() -> None:
                 log(f"pending_input action={pending_action} text={text[:40]!r}")
                 try:
                     reply = await handle_pending_input(pending_action, text, chat_id)
-                    await send(chat_id, reply)
+                    # Show result via menu (edit if short, send + refresh if long)
+                    await show_result(chat_id, reply, view=f"input_done:{pending_action}")
                     log_action(user="tg_admin", action=f"input:{pending_action}",
                                channel="telegram", risk_level="low",
                                status="ok", result_summary=reply[:100])
                 except Exception as e:
                     log(f"pending_input error action={pending_action} err={e}")
-                    await send(chat_id, f"❌ Error: {e}")
+                    await show_result(chat_id, f"❌ Error: {e}",
+                                       view=f"input_error:{pending_action}")
                 continue
 
             # Normal dispatch
             try:
                 reply = await dispatch(text, chat_id)
                 if reply:
-                    mid = await send(chat_id, reply)
+                    # Commands that return content go through show_result (edit menu in place)
+                    await show_result(chat_id, reply,
+                                      view=f"cmd:{text.split()[0]}" if text.startswith("/") else "chat")
                     if text.startswith("/"):
-                        log(f"cmd_reply cmd={text.split()[0]} message_id={mid}")
+                        log(f"cmd_reply cmd={text.split()[0]} via show_result")
                     log_action(
                         user="tg_admin",
                         action=text.split()[0][:30] if text.startswith("/") else "chat",
@@ -1482,12 +1731,12 @@ async def bot_loop() -> None:
                         result_summary=reply[:100],
                     )
                 elif text.startswith("/"):
-                    # menu/start/cancel send their own message inside dispatch
-                    log(f"cmd_done cmd={text.split()[0]} (sent inline)")
+                    # /menu /start /cancel render menus directly via show_menu
+                    log(f"cmd_done cmd={text.split()[0]} (rendered via show_menu)")
             except Exception as e:
                 log(f"dispatch error cmd={text[:30]!r} err={e}")
                 try:
-                    await send(chat_id, f"❌ Error: {e}")
+                    await show_result(chat_id, f"❌ Error: {e}", view="error")
                 except Exception:
                     pass
 

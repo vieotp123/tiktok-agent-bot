@@ -22,7 +22,7 @@ from bot.tools import (
     search_web, format_search_results, is_search_query, extract_search_query,
 )
 from bot.business_store import (
-    detect_esim_intent, build_consult_reply,
+    detect_esim_intent, build_consult_reply, compute_lead_score,
     add_consulting_log, upsert_lead, add_conversation,
 )
 from bot.memory_store import add_raw_event
@@ -286,13 +286,24 @@ async def handle_message(req: MessageRequest):
 
     # eSIM / sales consulting (DB-grounded, never invents prices)
     if detect_esim_intent(content):
-        reply, product_ids, confidence = build_consult_reply(content)
-        # Determine platform from source
+        # Determine platform from source first → drives tone selection
         platform = "tiktok" if source in ("tiktok", "") else (
             "telegram" if source.startswith("telegram") else (source or "internal")
         )
+        # Customer-facing tone for TikTok DMs; admin tone elsewhere
+        audience = "customer" if platform == "tiktok" else "admin"
+        reply, product_ids, confidence = build_consult_reply(content, audience=audience)
+        score = compute_lead_score(content)
         sender_key  = username
         sender_name = username
+
+        # Choose lead status by intent strength
+        if score >= 50:
+            lead_status = "interested"
+        elif score >= 20:
+            lead_status = "needs_followup"
+        else:
+            lead_status = "new"
 
         # Upsert lead
         try:
@@ -300,8 +311,7 @@ async def handle_message(req: MessageRequest):
                 platform=platform, sender_key=sender_key,
                 username=username, display_name=username,
                 source=source, need_summary=content[:120],
-                lead_score=max(1, int(confidence * 10)),
-                status="consulting",
+                lead_score=score, status=lead_status,
             )
         except Exception as e:
             print(f"[consult] upsert_lead error: {e}", flush=True)
@@ -340,7 +350,8 @@ async def handle_message(req: MessageRequest):
         try:
             add_raw_event(
                 source=platform, action="sales_consult",
-                summary=f"consult q={content[:60]!r} conf={confidence:.2f} prods={len(product_ids)}",
+                summary=(f"consult q={content[:60]!r} conf={confidence:.2f} "
+                         f"score={score} status={lead_status} prods={len(product_ids)}"),
                 actor=sender_key, event_type="consulting",
                 tags=["sales", "esim"],
             )

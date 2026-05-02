@@ -113,15 +113,17 @@ Skills are the atomic capabilities the Brain can invoke. Each skill has:
 | `models` | low | ✅ live | Show active LLM model per role |
 | `task_runner` | medium | ✅ live | Run task via agent/runner.py |
 | `tiktok_chat_info` | medium | ✅ live | Read chat context from TikTok |
+| `memory_search` | low | ✅ live | Search/retrieve semantic memory |
+| `telegram_file_hub` | low | ✅ live | Receive + summarize files via Telegram |
+| `product_lookup` | low | ✅ live | Search Product DB (`bot/business_store.py`) |
+| `sales_consult` | low | ✅ live | DB-grounded eSIM consult; never invents prices |
 | `send_tiktok_dm` | high | ⚠️ guarded | Requires /confirm_action |
 | `restart_service` | high | ⚠️ guarded | Requires /confirm_action |
 
-### Future Skills (not implemented — placeholders only)
+### Future Skills (placeholders only, disabled in registry)
 
 | Skill | Risk | Notes |
 |-------|------|-------|
-| `product_lookup` | low | Search product catalog or price |
-| `sales_consult` | medium | Draft sales reply based on context |
 | `seo_research` | medium | Keyword + competitor research |
 | `content_factory` | medium | Draft post/caption/content |
 | `browser_search` | medium | Playwright-based web automation |

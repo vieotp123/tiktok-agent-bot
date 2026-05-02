@@ -190,16 +190,32 @@ def update_product(product_id: str, **fields) -> bool:
         return cur.rowcount > 0
 
 
-def list_products(status: str | None = None, limit: int = 50) -> list[dict]:
+def list_products(status: str | None = None, limit: int = 50,
+                   exclude_disabled: bool = False) -> list[dict]:
     sql = "SELECT * FROM products"
     params: list = []
+    where: list[str] = []
     if status:
-        sql += " WHERE status=?"
-        params.append(status)
-    sql += " ORDER BY status='active' DESC, name ASC LIMIT ?"
+        where.append("status=?"); params.append(status)
+    elif exclude_disabled:
+        where.append("status!='disabled'")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += (" ORDER BY (status='active') DESC, "
+            "(status='needs_update') DESC, name ASC LIMIT ?")
     params.append(limit)
     with _conn() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def verify_product(product_id: str) -> bool:
+    """Mark product as active (verified for customer-facing replies)."""
+    return update_product(product_id, status="active")
+
+
+def disable_product(product_id: str) -> bool:
+    """Disable product so it is never suggested."""
+    return update_product(product_id, status="disabled")
 
 
 def get_product(product_id: str) -> dict | None:
@@ -480,9 +496,11 @@ def consult_lookup(query: str) -> tuple[list[dict], list[dict]]:
     """
     filters = _extract_query_filters(query)
 
-    # Pull all products, then filter in-memory (small table)
+    # Pull all non-disabled products, then filter in-memory (small table)
     with _conn() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM products").fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM products WHERE status != 'disabled'"
+        ).fetchall()]
 
     # Keyword fallback hits
     q_low = query.lower()
@@ -550,46 +568,117 @@ def format_product_short(p: dict) -> str:
     return " · ".join(bits)
 
 
-def build_consult_reply(query: str) -> tuple[str, list[str], float]:
+def _format_product_for_customer(p: dict) -> str:
+    """Customer-facing one-line product summary (no admin terms, no warnings)."""
+    bits = [p["name"]]
+    if p.get("data_amount"):
+        bits.append(p["data_amount"])
+    if p.get("duration_days"):
+        bits.append(f"{p['duration_days']} ngày")
+    feats: list[str] = []
+    if p.get("supports_sms"):     feats.append("nhận SMS")
+    if p.get("supports_hotspot"): feats.append("phát WiFi")
+    if p.get("renewable"):        feats.append("gia hạn được")
+    if feats:
+        bits.append(", ".join(feats))
+    if p.get("price_vnd"):
+        bits.append(f"{int(p['price_vnd']):,}đ")
+    elif p.get("price_jpy"):
+        bits.append(f"¥{int(p['price_jpy']):,}")
+    return " · ".join(bits)
+
+
+def compute_lead_score(query: str) -> int:
+    """Naive lead-scoring based on keyword signals in the query."""
+    q = query.lower()
+    score = 0
+    if any(k in q for k in ("giá", "gia ", "bao nhiêu", "price", "cost")):
+        score += 30
+    if any(k in q for k in ("sms", "otp", "nhận tin")):
+        score += 30
+    if any(k in q for k in ("hotspot", "phát wifi", "phat wifi", "tethering")):
+        score += 20
+    if any(k in q for k in ("gia hạn", "gia han", "renew")):
+        score += 20
+    if any(k in q for k in ("ngày", "ngay", "duration", "gb", "data")):
+        score += 10
+    return min(100, score)
+
+
+def build_consult_reply(query: str, *, audience: str = "customer"
+                        ) -> tuple[str, list[str], float]:
     """
     Build a grounded consult reply.
+
+    audience:
+      "customer" — TikTok customer-facing tone (polite, no mày/tao,
+                   never quotes needs_update as confirmed).
+      "admin"    — Telegram-admin tone (direct, shows warnings + ids).
+
     Returns (reply_text, product_ids_used, confidence).
-    NEVER invents prices. If no active product matches, says info missing.
+    NEVER invents prices. If no active product matches, says so clearly.
     """
     active, pending = consult_lookup(query)
+    q = query.lower()
+
+    if audience == "admin":
+        # Admin tone: short, technical, with warnings.
+        if active:
+            lines = ["Active matches:"]
+            for p in active[:4]:
+                lines.append("• " + format_product_short(p).replace("<b>", "").replace("</b>", ""))
+            if pending:
+                lines.append(f"\n⚠ {len(pending)} needs_update candidates ignored: "
+                             + ", ".join(p["name"] for p in pending[:3]))
+            reply = "\n".join(lines)
+            return reply, [p["id"] for p in active[:4]], 0.85
+
+        if pending:
+            names = ", ".join(p["name"] for p in pending[:3])
+            reply = (
+                f"⚠ Chỉ có needs_update candidates: {names}\n"
+                "Verify giá/feature trước khi quote khách. "
+                "Dùng /product_verify <id> sau khi xác nhận."
+            )
+            return reply, [p["id"] for p in pending[:3]], 0.25
+
+        reply = ("Chưa có gói đã verify trong database khớp. "
+                 "Dùng /product_add hoặc /product_verify để cập nhật catalog.")
+        return reply, [], 0.0
+
+    # ── Customer-facing (TikTok DM, polite, no mày/tao, never quotes
+    #    needs_update as confirmed) ─────────────────────────────────────────
     if active:
-        lines = ["Tao có mấy gói khớp đây:"]
+        lines = ["Bên mình có mấy gói phù hợp nè:"]
         for p in active[:3]:
-            lines.append("• " + format_product_short(p).replace("<b>", "").replace("</b>", ""))
-        # Add specific feature notes if asked
-        q = query.lower()
-        sms_hits = [p for p in active if p.get("supports_sms")]
+            lines.append("• " + _format_product_for_customer(p))
+        sms_hits     = [p for p in active if p.get("supports_sms")]
         hotspot_hits = [p for p in active if p.get("supports_hotspot")]
-        if "sms" in q:
+        renew_hits   = [p for p in active if p.get("renewable")]
+        if any(k in q for k in ("sms", "otp", "nhận tin")):
             if sms_hits:
-                lines.append(f"\nNhận SMS thì lấy: {sms_hits[0]['name']}")
+                lines.append(f"Nhận SMS được nha: {sms_hits[0]['name']}")
             else:
-                lines.append("\nÀ gói nhận SMS thì DB chưa có, m hỏi admin verify.")
+                lines.append("Mấy gói trên chưa hỗ trợ SMS — bạn cần SMS thì để mình check kỹ rồi rep lại.")
         if any(k in q for k in ("hotspot", "phát wifi", "phat wifi", "tethering")):
             if hotspot_hits:
-                lines.append(f"Phát wifi được hết — đa số gói trong DB hỗ trợ hotspot.")
-        reply = "\n".join(lines)
-        ids = [p["id"] for p in active[:3]]
-        return reply, ids, 0.8
+                lines.append("Phát WiFi được hết bạn nhé.")
+        if any(k in q for k in ("gia hạn", "gia han", "renew")) and renew_hits:
+            lines.append(f"Gia hạn được: {renew_hits[0]['name']}")
+        return "\n".join(lines), [p["id"] for p in active[:3]], 0.85
 
+    # Customer side: have unverified candidates but DO NOT quote them.
     if pending:
-        # Have rough match but unverified
-        names = ", ".join(p["name"] for p in pending[:3])
         reply = (
-            f"Tao thấy DB có nhắc đến: {names}, "
-            "nhưng giá/thông số chưa verify nên tao chưa quote chắc được. "
-            "Để tao báo admin update rồi rep mày sau."
+            "Bên mình có gói tương tự đang được cập nhật lại thông số/giá. "
+            "Bạn để mình kiểm tra với admin rồi báo lại nha — "
+            "mình không muốn báo sai số liệu."
         )
-        return reply, [p["id"] for p in pending[:3]], 0.3
+        return reply, [p["id"] for p in pending[:3]], 0.2
 
     reply = (
-        "Cái này DB sản phẩm bên tao chưa có info verify. "
-        "Tao k bịa giá, để tao note lại admin verify rồi rep mày."
+        "Hiện gói khớp với yêu cầu của bạn chưa có trong danh mục đã xác nhận. "
+        "Mình note lại để admin bổ sung và sẽ rep bạn ngay khi có info chính xác nha."
     )
     return reply, [], 0.0
 
@@ -599,15 +688,47 @@ def build_consult_reply(query: str) -> tuple[str, list[str], float]:
 def format_products_list(status: str | None = None) -> str:
     items = list_products(status=status, limit=30)
     if not items:
-        return "No products yet."
-    lines = ["<b>Products</b>" + (f" (status={status})" if status else "")]
+        if status == "active":
+            return "Chưa có gói đã verify trong database."
+        if status == "needs_update":
+            return "Không có sản phẩm nào ở trạng thái needs_update."
+        if status == "disabled":
+            return "Không có sản phẩm nào bị disable."
+        return "Chưa có sản phẩm nào trong database."
+    lines = ["<b>Products</b>" + (f" — status={status}" if status else "")]
+    icons = {"active": "✅", "needs_update": "⚠️", "disabled": "🚫"}
     for p in items:
-        icon = "✅" if p["status"] == "active" else "⚠️"
+        icon = icons.get(p["status"], "•")
         lines.append(f"{icon} <code>{p['id']}</code> — {format_product_short(p)}")
     active_count = sum(1 for p in items if p["status"] == "active")
+    needs_update = sum(1 for p in items if p["status"] == "needs_update")
+    disabled     = sum(1 for p in items if p["status"] == "disabled")
     lines.append(
-        f"\n<i>{active_count}/{len(items)} verified · others need update</i>"
+        f"\n<i>active={active_count} · needs_update={needs_update} · disabled={disabled}</i>"
     )
+    return "\n".join(lines)
+
+
+def format_product_detail(product_id: str) -> str:
+    p = get_product(product_id)
+    if not p:
+        return f"Product <code>{product_id}</code> không tồn tại."
+    icons = {"active": "✅", "needs_update": "⚠️", "disabled": "🚫"}
+    flags: list[str] = []
+    if p.get("supports_sms"):     flags.append("SMS")
+    if p.get("supports_hotspot"): flags.append("Hotspot")
+    if p.get("renewable"):        flags.append("Renewable")
+    lines = [
+        f"<b>{p['name']}</b> {icons.get(p['status'], '')}",
+        f"id: <code>{p['id']}</code>",
+        f"status: <b>{p['status']}</b>",
+        f"network: {p.get('network', '?')} | country: {p.get('country', '?')}",
+        f"duration: {p.get('duration_days', 0)}d | data: {p.get('data_amount', '?')}",
+        f"price: ¥{int(p.get('price_jpy', 0)):,} / {int(p.get('price_vnd', 0)):,}đ",
+        f"features: {', '.join(flags) or '(none)'}",
+        f"notes: {p.get('notes', '') or '(none)'}",
+        f"updated: {p.get('updated_at', '')[:16]}",
+    ]
     return "\n".join(lines)
 
 

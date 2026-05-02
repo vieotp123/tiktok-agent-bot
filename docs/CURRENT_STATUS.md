@@ -1,99 +1,108 @@
-# Current Status — Agent Platform
+# Current Status — Business Agent Platform
 
-_Last updated: 2026-05-02 (dev-agent branch)._
+_Last updated: 2026-05-02 (dev-agent branch — Business Agent v1)._
 
 ## Stable foundations
 
-- **TikTok Chatgibiti worker** — Playwright-based DM bot in production.
+- **TikTok Chatgibiti worker** — Playwright-based DM bot.
   - Sender identification via `make_sender_key(name, avatar, side, idx)`.
   - JS extractor + baseline + js_items=0 visibility logging.
   - Boot marker + scroll-to-bottom on first poll.
   - Fallback phrase stripper (`_strip_banned`) in backend defense in depth.
 - **Telegram command center** — long-poll bot with inline keyboard.
-  - `/menu` shows 5 categories: Status, Router/Models, Tasks, Search,
-    Files, Skills, Memory, Sales/CRM, Admin.
-  - All commands HTML-escaped to avoid parse errors.
-- **9Router LLM Gateway** with policy:
+  - **Edit-in-place UX** (Business Agent v1): `/menu` reuses one menu
+    message; navigation calls `editMessageText` instead of resending.
+  - Active menu message_id persisted in `data/telegram/menu_state.json`
+    (24h TTL). Edit failure → automatic fallback to send + state update.
+  - Categories: Status, Router/Models, Tasks, Search, Files, Skills,
+    Memory, Sales/CRM, Admin.
+  - Logs every transition: `menu mode=edit`, `menu mode=send`,
+    `callback data=…`, `pending_input=…`, `menu edit failed reason=…`.
+- **9Router LLM Gateway**:
   - chat / tiktok_chat / telegram_chat / search_summary → `cx/gpt-5.5`
-  - reasoning / coding → `cc/claude-sonnet-4-6`
+  - reasoning / coding → `cc/claude-sonnet-4-6` (Sonnet 4.7 not yet
+    available on 9Router; preference chain auto-upgrades when listed)
   - critic → `cx/gpt-5.3-codex`
+  - vision → `openai/gpt-4o`
   - cheap / fallback → `openai/gpt-4o-mini`
   - 5-minute model cache; ENV overrides validated against `/models`.
-- **Task queue / Skills / Audit log** — SQLite + JSONL, all working.
+- **Task queue / Skills / Audit log** — SQLite + JSONL.
 - **Search web (DuckDuckGo + LLM summary)** — works.
 - **File handling** — Telegram inbox, summarisation via backend.
 
-## Memory foundation (commit `5500b00`)
+## Memory foundation
 
-- SQLite `data/agent_memory.db` with 5 tables:
-  `raw_events`, `memories`, `lessons`, `task_state`, `memory_usage`.
+- SQLite `data/agent_memory.db` — 5 tables (raw_events, memories, lessons,
+  task_state, memory_usage).
 - API: `add_memory`, `search_memory`, `add_lesson`, `list_lessons`,
   `update_task_state`, `get_task_state`, `build_memory_context`,
   `get_context_for_task`, `add_raw_event`, `compact_memories`.
-- **Prompt hygiene**: max 8 items, max 6000 chars, never inject raw payloads.
-- 5 seeded global memories (business context, TikTok fragility,
-  AWS duplicate risk, model policy, architecture).
-- 2 seeded lessons (DuckDuckGo VN fallback, TikTok DM silent failure).
-- Telegram commands: `/memory_search`, `/memory_add`, `/memory_forget`,
-  `/memory_compact`, `/memory_context`, `/lessons`.
+- Hard prompt-context limits: 8 items / 6000 chars / no raw payload.
+- 5 seeded global memories, 2 seeded lessons.
 - Auto-lesson hook in `bot/agent/runner.py` (success → importance 3,
   failure → importance 6).
 
-## Product DB + CRM foundation (current commit)
+## Product DB + CRM (Business Agent v1)
 
-- SQLite `data/business.db` with 5 tables:
-  `products`, `leads`, `conversations`, `consulting_logs`, `followups`.
-- File: `bot/business_store.py`.
-- Functions: `init_business_db`, CRUD for products / leads / conversations
-  / consulting_logs / followups, `detect_esim_intent`, `consult_lookup`,
-  `build_consult_reply`, `_extract_query_filters`,
-  format helpers for Telegram output.
-- **Sales consult engine**:
-  - Detects eSIM intent on TikTok / Telegram backend `/message` flow.
-  - Looks up products by structured filters (country / SMS / hotspot /
-    renewable) **and** keyword match.
-  - Active products with verified prices → quoted.
-  - `needs_update` products → mentioned but flagged as unverified.
-  - **Never invents prices.** If nothing matches, says info missing.
-- Logs every consulting call to `consulting_logs` (sender_key, products_used,
-  confidence) and emits a `raw_event` to `agent_memory.db` (no PII).
-- Auto-upserts a lead per (platform, sender_key) at the first eSIM
-  question; logs every inbound + outbound message into `conversations`.
-- **Skill registry** — `sales_consult` and `product_lookup` enabled.
-- **Telegram commands**: `/products`, `/product_add`, `/product_update`,
-  `/consult <q>`, `/leads`, `/lead <id>`, `/lead_add`, `/followups`.
-- **Sales/CRM submenu** in main menu.
+- SQLite `data/business.db` with 5 tables.
+- Status values: **active** (verified, OK to quote), **needs_update**
+  (admin sees warning, customer never sees as confirmed), **disabled**
+  (never suggested).
+- Telegram commands:
+  `/products [active|needs_update|disabled]`, `/product <id>`,
+  `/product_add`, `/product_update`, `/product_verify`, `/product_disable`,
+  `/consult <q>`, `/leads`, `/lead <id>`, `/lead_by_sender`, `/lead_add`,
+  `/consulting_logs [sender_key]`, `/followups`, `/followup_add`.
+- Sales/CRM submenu: All Products · Active · Needs Update · Consult ·
+  Leads · Followups · Add Product · Update Product.
+- **Sales consult engine** (`build_consult_reply(query, audience=…)`):
+  - `audience="customer"` (TikTok DM) — polite tone, no mày/tao,
+    never quotes needs_update as confirmed.
+  - `audience="admin"` (Telegram) — direct, with warnings + product ids.
+  - Filters by structured features (country / SMS / hotspot / renewable)
+    AND keyword match. Excludes disabled products.
+  - **Never invents prices.** No active match → "no verified info".
+- **Lead scoring** (cap 100): price +30, SMS/OTP +30, hotspot +20,
+  renew +20, duration/data +10. Status auto-set: ≥50 → interested;
+  ≥20 → needs_followup; otherwise new.
+- Every consulting call logs to `consulting_logs` (sender_key,
+  products_used JSON, confidence) and emits a `raw_event` to
+  `agent_memory.db` (no PII / prices).
+- Auto-upserts a lead per (platform, sender_key) at first eSIM intent;
+  logs every inbound + outbound message into `conversations`.
 
 ### Known limitations
 
-- **All seeded products are `status="needs_update"`** with sample data.
-  Prices and feature flags MUST be verified before they can be quoted to
-  customers as confirmed. The consult engine surfaces these but always
-  attaches the "chưa verify" disclaimer.
-- No automatic outreach. Send actions require `/confirm_action` (high risk).
+- **Catalog needs real data**: 5 sample products are seeded, 2 marked
+  active for test (Softbank 30d/50GB · 850k VND · ¥4500; Docomo+SMS
+  30d/20GB · 1.1M VND · ¥5800). Replace with real verified prices via
+  `/product_update` + `/product_verify` before showing to real customers.
+- No automatic outreach. Send actions still require `/confirm_action`.
 - No public posting / scheduled DMs from the agent yet.
-- Lead scoring is naïve (`max(1, confidence*10)`) — future LLM-based scoring.
+- Lead scoring is naïve (keyword-based) — future: LLM intent classifier.
 - `consulting_logs` is local SQLite; not yet replicated.
 
 ## Next priorities
 
-1. **Verify product catalog** — admin replaces seeded `needs_update` rows
-   with real prices and feature flags via `/product_update`.
-2. **SEO / Marketing engine** — keyword research worker, competitor lookup,
+1. **Verify real product catalog** — replace sample seed data with the
+   actual price list from muaesim.vn.
+2. **SEO / Marketing engine** — keyword research, competitor lookup,
    landing-page brief generator.
-3. **Content / image campaign factory** — caption writer skill,
-   image-gen pipeline (currently disabled in skill registry).
-4. **Worker manager expansion** — register browser, OCR, image-gen workers
-   so they show up in `/workers`.
-5. **Lead intelligence** — LLM-based lead scoring, intent classification,
-   automatic followup scheduling (still requiring confirm_action for sends).
+3. **Content / image campaign factory** — caption writer + image-gen
+   pipeline (currently placeholder skills in registry).
+4. **Browser / OCR worker** — Playwright research worker that can read
+   competitor sites; OCR on customer-uploaded screenshots.
+5. **Worker manager expansion** — register browser, OCR, image-gen
+   workers so they appear in `/workers`.
+6. **Scheduler / daily jobs** — daily catalog freshness check, daily
+   lead-followup digest, daily SEO crawl.
 
 ## Branch / commit policy
 
 - Active branch: `dev-agent`.
-- Runtime DBs (`data/agent_memory.db`, `data/business.db`,
-  `data/memory.json`, `data/reminders.json`,
-  `data/telegram/files.jsonl`, `data/telegram/session_state.json`)
+- Runtime DBs (`data/agent_memory.db`, `data/business.db`, `data/memory.json`,
+  `data/reminders.json`, `data/telegram/files.jsonl`,
+  `data/telegram/session_state.json`, `data/telegram/menu_state.json`)
   are **never** committed.
 - `.env`, `tiktok_storage_state.json`, `storage_state.json`, backups,
   `*.log` — never committed.
