@@ -2,6 +2,12 @@
 
 _Last updated: 2026-05-02 (dev-agent branch — Self-Improving Agent v1)._
 
+> **Worker validation:** Code worker CLI loop verified end-to-end with
+> task `ctk_a65f61badc` — smoke test, commit, push, finish, and
+> Telegram report all run cleanly via `python -m bot.code_tasks` +
+> `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
+> contract this task exercised.
+
 ## Self-Improving Agent v1 changes
 
 - **Task lifecycle state machine** at `bot/agent/task_lifecycle.py`.
