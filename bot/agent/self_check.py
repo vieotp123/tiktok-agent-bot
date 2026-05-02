@@ -131,27 +131,117 @@ def _memory_counts() -> dict:
     return out
 
 
+def _last_smoke_test_status() -> str:
+    """Tail recent journal for the last smoke_test outcome line."""
+    try:
+        out = subprocess.check_output(
+            ["sudo", "journalctl", "-n", "500", "--no-pager",
+             "--output=cat"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        return "(journal unavailable)"
+    candidates = [ln for ln in out.splitlines()
+                  if "SMOKE TEST" in ln]
+    if not candidates:
+        return "(no smoke_test in last 500 journal lines)"
+    last = candidates[-1]
+    return last[-160:]
+
+
+def _top_queued_code_tasks(n: int = 3) -> list[dict]:
+    try:
+        from bot.code_tasks import list_tasks as code_list
+        return code_list(status="queued", limit=n)
+    except Exception:
+        return []
+
+
+def _top_unchecked_roadmap(n: int = 3) -> tuple[list[str], int, int]:
+    """Return (top-N unchecked items, done_count, pending_count)."""
+    p = Path("/opt/tiktok-bot/docs/ROADMAP.md")
+    if not p.exists():
+        return [], 0, 0
+    txt = p.read_text(encoding="utf-8")
+    import re as _re
+    done    = len(_re.findall(r"^- \[x\] ", txt, _re.MULTILINE))
+    pending = _re.findall(r"^- \[ \] (.+)$", txt, _re.MULTILINE)
+    return pending[:n], done, len(pending)
+
+
+async def _live_role_models() -> dict:
+    """Pull current 9Router role-model assignments."""
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            r = await c.get(f"{BACKEND}/router_status")
+        if r.status_code == 200:
+            return r.json().get("role_models", {})
+    except Exception:
+        pass
+    return {}
+
+
 async def run_agent_status() -> str:
     """Extended dashboard for /agent_status."""
-    base = await run_self_check()  # existing health probe
-    # Add: pending counts, memory counts, last audit, last deploy
+    base = await run_self_check()  # services + backend + git
     pc  = _pending_counts()
     mc  = _memory_counts()
     aud = _last_audit_lines(3)
     dep = _last_deploy_status()
+    smoke = _last_smoke_test_status()
+    rms = await _live_role_models()
 
-    extra = ["", "<b>Pending:</b>",
+    # Roadmap snapshot
+    top, done, pending = _top_unchecked_roadmap(3)
+    roadmap_lines = [f"<b>Roadmap:</b> {done} done · {pending} pending"]
+    for i, item in enumerate(top, 1):
+        # HTML-escape the roadmap text
+        safe = (item.replace("&", "&amp;")
+                     .replace("<", "&lt;")
+                     .replace(">", "&gt;"))[:120]
+        roadmap_lines.append(f"  {i}. {safe}")
+
+    # Code task snapshot (top 3 queued)
+    code_lines = [f"<b>Code Worker:</b> "
+                  f"queued={pc['code_tasks_queued']} · "
+                  f"running={pc['code_tasks_running']} · "
+                  f"waiting={pc['code_tasks_waiting_confirm']}"]
+    for t in _top_queued_code_tasks(3):
+        title = (t.get("title") or "")[:48]
+        title = (title.replace("&", "&amp;").replace("<", "&lt;")
+                       .replace(">", "&gt;"))
+        risk_icon = {"low": "🟢", "medium": "🟡",
+                      "high": "🔴"}.get(t.get("risk_level", "low"), "⚪")
+        code_lines.append(f"  {risk_icon} <code>{t['id']}</code> "
+                          f"p{t['priority']} {title}")
+
+    # Active model roles (live)
+    role_lines = ["<b>Live model roles:</b>"]
+    if rms:
+        for role in ("chat", "tiktok_chat", "telegram_chat",
+                     "search_summary", "reasoning", "coding", "critic",
+                     "vision", "cheap"):
+            v = rms.get(role, "?")
+            role_lines.append(f"  {role}: <code>{v}</code>")
+    else:
+        role_lines.append("  (router_status unreachable)")
+
+    extra = ["",
+             *role_lines,
+             "",
+             "<b>Pending:</b>",
              f"  pending_actions={pc['pending_actions']} · "
-             f"code_queued={pc['code_tasks_queued']} · "
-             f"code_running={pc['code_tasks_running']} · "
-             f"code_waiting={pc['code_tasks_waiting_confirm']}",
-             f"  tasks_queued={pc['tasks_queued']} · "
+             f"tasks_queued={pc['tasks_queued']} · "
              f"tasks_running={pc['tasks_running']}",
+             "",
+             *code_lines,
+             "",
+             *roadmap_lines,
              "",
              "<b>Memory:</b>",
              f"  memories={mc['memories']} · lessons={mc['lessons']} · "
              f"raw_events={mc['raw_events']}",
              "",
+             f"<b>Last smoke:</b> <code>{smoke[:140]}</code>",
              f"<b>Last deploy:</b> {dep[:160]}"]
 
     if aud:

@@ -1555,19 +1555,46 @@ def handle_agent_workers() -> str:
 
 
 def handle_agent_next() -> str:
-    """Suggest the next 3 missions based on the roadmap."""
+    """Suggest the next 3 missions based on the roadmap, plus the top
+    queued code_tasks the worker would pick up."""
+    lines: list[str] = []
+
+    # ── Roadmap (top-3 unchecked) ─────────────────────────────────────
     p = Path("/opt/tiktok-bot/docs/ROADMAP.md")
-    if not p.exists():
-        return ("<b>➡ Next mission</b>\n"
-                "Roadmap not available. See docs/CURRENT_STATUS.md.")
-    txt = p.read_text(encoding="utf-8")
-    import re
-    items = re.findall(r"^- \[ \] (.+)$", txt, re.MULTILINE)
-    if not items:
-        return "<b>➡ Next mission</b>\nNo unchecked items in ROADMAP.md."
-    lines = ["<b>➡ Next missions</b>"]
-    for i, it in enumerate(items[:3], 1):
-        lines.append(f"{i}. {_esc(it)}")
+    if p.exists():
+        txt = p.read_text(encoding="utf-8")
+        import re
+        done    = len(re.findall(r"^- \[x\] ", txt, re.MULTILINE))
+        pending = re.findall(r"^- \[ \] (.+)$", txt, re.MULTILINE)
+        lines.append(f"<b>➡ Next missions</b> "
+                     f"<i>({done} done · {len(pending)} pending)</i>")
+        if pending:
+            for i, it in enumerate(pending[:3], 1):
+                lines.append(f"{i}. {_esc(it)}")
+        else:
+            lines.append("<i>No unchecked items in ROADMAP.md.</i>")
+    else:
+        lines.append("<b>➡ Next missions</b>")
+        lines.append("<i>ROADMAP.md not available.</i>")
+
+    # ── Top queued code_tasks (worker pickup order) ───────────────────
+    try:
+        queued = code_list_tasks(status="queued", limit=3)
+    except Exception:
+        queued = []
+    if queued:
+        lines.append("")
+        lines.append("<b>🛠 Worker queue (top 3)</b>")
+        risk_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+        for t in queued:
+            ic = risk_icon.get(t.get("risk_level", "low"), "⚪")
+            title = _esc((t.get("title") or "")[:48])
+            lines.append(f"  {ic} <code>{t['id']}</code> "
+                         f"p{t['priority']} {title}")
+    else:
+        lines.append("")
+        lines.append("<i>(No queued code_tasks. Use /code_task to add one.)</i>")
+
     return "\n".join(lines)
 
 
