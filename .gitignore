@@ -16,6 +16,8 @@ data/tasks.db
 data/agent_memory.db
 data/business.db
 data/memory_store.db
+data/code_tasks.db
+data/code_tasks.paused
 data/pending_actions.json
 data/chat_info.json
 data/audit/

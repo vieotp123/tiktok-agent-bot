@@ -37,6 +37,23 @@ from bot.memory_store import (
     add_memory, delete_memory, compact_memories,
     build_memory_context, list_memories,
 )
+from bot.code_tasks import (
+    init_db as init_code_tasks_db,
+    add_task as code_add_task,
+    cancel_task as code_cancel_task,
+    list_tasks as code_list_tasks,
+    next_queued_task as code_next_task,
+    format_tasks_list as code_format_list,
+    format_task_detail as code_format_detail,
+    format_status_summary as code_format_status,
+    is_paused as code_is_paused,
+    pause as code_pause, resume as code_resume,
+)
+try:
+    init_code_tasks_db()
+except Exception as _e:
+    print(f"[tg] code_tasks init warning: {_e}", flush=True)
+
 from bot.business_store import (
     init_business_db, seed_products_if_empty,
     list_products, add_product, update_product, get_product,
@@ -514,11 +531,12 @@ def menu_main() -> tuple[str, dict]:
         footer="Type a message to chat with the agent · /help for commands",
     )
     kb = make_keyboard([
-        [("📊 Status",   "nav:status"), ("🤖 Models",     "nav:router")],
-        [("🧠 Tasks",    "nav:tasks"),  ("🔎 Search",     "nav:search")],
-        [("📁 Files",    "nav:files"),  ("🧩 Skills",     "nav:skills")],
-        [("💾 Memory",   "nav:memory"), ("💼 Sales CRM",  "nav:sales")],
-        [("⚙️ Admin",    "nav:admin"),  ("❓ Help",       "do:help")],
+        [("📊 Status",   "nav:status"),  ("🤖 Models",     "nav:router")],
+        [("🧠 Tasks",    "nav:tasks"),   ("🔎 Search",     "nav:search")],
+        [("📁 Files",    "nav:files"),   ("🧩 Skills",     "nav:skills")],
+        [("💾 Memory",   "nav:memory"),  ("💼 Sales CRM",  "nav:sales")],
+        [("🛠 Code Worker", "nav:code"), ("🤖 Agent",      "nav:agent")],
+        [("⚙️ Admin",    "nav:admin"),   ("❓ Help",       "do:help")],
     ])
     return text, kb
 
@@ -623,6 +641,38 @@ def menu_sales() -> tuple[str, dict]:
          ("👥 Leads",           "do:leads")],
         [("⏰ Followups",       "do:followups"),
          ("➕ Add Lead",        "input:lead_add")],
+        _nav_row("main"),
+    ])
+    return text, kb
+
+
+def menu_code() -> tuple[str, dict]:
+    text = _panel("🛠", "Code Worker",
+                  body="Queue coding tasks for the Claude/Codex worker. "
+                       "Low-risk auto-runs after tests; high-risk waits for confirm.")
+    kb = make_keyboard([
+        [("📋 Code Tasks",    "do:code_tasks"),
+         ("➕ New Code Task", "input:code_task")],
+        [("▶ Run Once",       "do:code_run_once"),
+         ("📡 Worker Status", "do:code_status")],
+        [("⏸ Pause",          "do:code_pause"),
+         ("▶ Resume",         "do:code_resume")],
+        _nav_row("main"),
+    ])
+    return text, kb
+
+
+def menu_agent() -> tuple[str, dict]:
+    text = _panel("🤖", "Self-Operating Agent",
+                  body="Plan/execute goals via the planner-executor loop. "
+                       "Low-risk auto-runs; medium/high-risk → pending_action.")
+    kb = make_keyboard([
+        [("🩺 Agent Health",   "do:agent_health"),
+         ("📜 Policy",         "do:agent_policy")],
+        [("👥 Workers",        "do:agent_workers"),
+         ("➡ Next Mission",    "do:agent_next")],
+        [("🧭 Plan Goal",      "input:agent_plan"),
+         ("▶ Run Goal",        "input:agent_run")],
         _nav_row("main"),
     ])
     return text, kb
@@ -1355,6 +1405,135 @@ def handle_followups() -> str:
     return format_followups_list()
 
 
+# ── Code Worker handlers ──────────────────────────────────────────────────────
+
+def handle_code_task_add(spec: str) -> str:
+    """Parse: title | description | risk | priority"""
+    spec = spec.strip()
+    if not spec:
+        return ("Usage: /code_task &lt;title&gt; | [description] | "
+                "[risk=low|medium|high] | [priority 1-9]")
+    parts = [p.strip() for p in spec.split("|")]
+    pad = parts + [""] * (4 - len(parts))
+    title, desc, risk, prio = pad[:4]
+    risk = (risk or "low").lower()
+    if risk not in ("low", "medium", "high"):
+        risk = "low"
+    try:
+        priority = int(prio) if prio else 5
+    except ValueError:
+        priority = 5
+    if not title:
+        return "❌ Title required."
+    tid = code_add_task(title=title, description=desc,
+                        risk_level=risk, priority=priority,
+                        created_by="tg_admin")
+    log_action(user="tg_admin", action="code_task_add", risk_level="low",
+               status="ok", result_summary=f"id={tid} risk={risk}")
+    return (f"✅ Code task <code>{tid}</code> queued\n"
+            f"<b>{_esc(title)}</b>\n"
+            f"risk={risk} priority={priority}\n"
+            f"<i>Worker picks up next pass; high-risk waits for confirm.</i>")
+
+
+async def handle_code_run_once() -> str:
+    """Surface the next queued task for the worker. The actual coding work
+    is performed by a separate Claude/Codex CLI session — see
+    docs/CLAUDE_CODE_WORKER.md. This command shows what the worker would
+    pick up next, without running the model in the Telegram process."""
+    if code_is_paused():
+        return "⏸ Code worker is paused. /code_worker_resume to enable."
+    nxt = code_next_task()
+    if not nxt:
+        return "📭 No queued code tasks."
+    return ("<b>🛠 Next code task</b>\n"
+            f"<code>{nxt['id']}</code> — {_esc(nxt['title'])}\n"
+            f"risk={nxt['risk_level']} priority={nxt['priority']}\n\n"
+            "<i>To run: open a Claude/Codex CLI session in /opt/tiktok-bot\n"
+            "and read docs/CLAUDE_CODE_WORKER.md.</i>")
+
+
+# ── Self-operating agent handlers ─────────────────────────────────────────────
+
+async def handle_agent_plan(goal: str) -> str:
+    goal = goal.strip()
+    if not goal:
+        return "Usage: /agent_plan &lt;goal&gt;"
+    from bot.agent.planner import plan_goal
+    plan = plan_goal(goal)
+    return _format_plan(goal, plan)
+
+
+async def handle_agent_run(goal: str) -> str:
+    goal = goal.strip()
+    if not goal:
+        return "Usage: /agent_run &lt;goal&gt;"
+    from bot.agent.executor import execute_goal
+    result = await execute_goal(goal, user="tg_admin")
+    return _format_run_result(goal, result)
+
+
+def _format_plan(goal: str, plan: dict) -> str:
+    lines = [f"<b>🧭 Plan</b> — <i>{_esc(goal[:80])}</i>",
+             f"Risk: <b>{plan.get('risk', '?')}</b>"]
+    for i, step in enumerate(plan.get("steps", []), 1):
+        lines.append(f"{i}. {_esc(step.get('action', ''))} "
+                     f"<i>(risk={step.get('risk', 'low')})</i>")
+        if step.get("note"):
+            lines.append(f"   <i>{_esc(step['note'])}</i>")
+    if plan.get("rationale"):
+        lines.append(f"\n<i>{_esc(plan['rationale'][:200])}</i>")
+    return "\n".join(lines)
+
+
+def _format_run_result(goal: str, result: dict) -> str:
+    icon = {"done":"✅", "pending_action":"⏸", "rejected":"🚫",
+            "failed":"❌", "partial":"⚠"}.get(result.get("status",""), "•")
+    lines = [f"{icon} <b>Agent run</b> — {_esc(goal[:80])}",
+             f"Status: <b>{result.get('status','?')}</b>"]
+    if result.get("risk"):
+        lines.append(f"Risk: {result['risk']}")
+    if result.get("pending_action_id"):
+        lines.append(f"Pending action: <code>{result['pending_action_id']}</code>")
+        lines.append(f"<i>Use /confirm_action {result['pending_action_id']} to approve.</i>")
+    if result.get("output"):
+        lines.append(f"\n{_esc(str(result['output'])[:1500])}")
+    if result.get("error"):
+        lines.append(f"\n<i>Error: {_esc(result['error'][:200])}</i>")
+    return "\n".join(lines)
+
+
+async def handle_agent_health() -> str:
+    """Quick agent platform health check."""
+    from bot.agent.self_check import run_self_check
+    return await run_self_check()
+
+
+def handle_agent_policy() -> str:
+    from bot.agent.risk import POLICY_SUMMARY
+    return POLICY_SUMMARY
+
+
+def handle_agent_workers() -> str:
+    from bot.agent.worker_roles import format_worker_roles
+    return format_worker_roles()
+
+
+def handle_agent_next() -> str:
+    """Suggest the next mission based on roadmap."""
+    p = Path("/opt/tiktok-bot/docs/ROADMAP.md")
+    if not p.exists():
+        return ("<b>➡ Next mission</b>\n"
+                "Roadmap not available. See docs/CURRENT_STATUS.md.")
+    txt = p.read_text(encoding="utf-8")
+    # Find first un-checked item
+    import re
+    m = re.search(r"^- \[ \] (.+)$", txt, re.MULTILINE)
+    if not m:
+        return "<b>➡ Next mission</b>\nNo unchecked items in ROADMAP.md."
+    return f"<b>➡ Next mission</b>\n• {_esc(m.group(1))}"
+
+
 async def handle_run_task(goal: str) -> str:
     if not goal:
         return "Usage: /run_task <goal>"
@@ -1531,7 +1710,8 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             "status": menu_status, "router": menu_router, "tasks": menu_tasks,
             "search": menu_search, "files":  menu_files,  "skills": menu_skills,
             "admin":  menu_admin,  "memory": menu_memory,
-            "sales":  menu_sales,
+            "sales":  menu_sales,  "code":   menu_code,
+            "agent":  menu_agent,
         }.get(val)
         if menu_fn:
             text, kb = menu_fn()
@@ -1583,6 +1763,12 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
             "product_disable":"🚫 Enter product_id to <b>disable</b>:",
             "lead_add":      "➕ Enter lead: platform | sender_key | name | need",
             "followup_add":  "⏰ Enter followup: lead_id | remind_at (ISO date) | note",
+            "code_task":     ("🛠 New code task — format:\n"
+                              "<code>title | description | risk(low|medium|high) | priority(1-9)</code>\n"
+                              "Example: <code>fix btc cache | reuse cached price within 30s | low | 6</code>"),
+            "agent_plan":    "🧭 Enter goal to PLAN (planner only, no execution):",
+            "agent_run":     ("▶ Enter goal to RUN (low-risk auto-runs; "
+                              "medium/high creates pending_action):"),
         }
         prompt = prompts.get(val, "✏️ Enter input:")
         _session_save(val, prompt)
@@ -1649,6 +1835,26 @@ async def _execute_action(action: str, chat_id: str | int) -> str:
         return await handle_memory_compact()
     if action == "help":
         return handle_help_panel()
+    if action == "code_tasks":
+        return code_format_list(limit=15)
+    if action == "code_status":
+        return code_format_status()
+    if action == "code_run_once":
+        return await handle_code_run_once()
+    if action == "code_pause":
+        code_pause()
+        return "⏸ Code worker paused. New tasks queue but won't auto-run."
+    if action == "code_resume":
+        code_resume()
+        return "▶ Code worker resumed."
+    if action == "agent_health":
+        return await handle_agent_health()
+    if action == "agent_policy":
+        return handle_agent_policy()
+    if action == "agent_workers":
+        return handle_agent_workers()
+    if action == "agent_next":
+        return handle_agent_next()
     if action == "products":
         return handle_products()
     if action == "products_active":
@@ -1712,6 +1918,12 @@ async def handle_pending_input(action: str, text: str, chat_id: str | int) -> st
         return handle_lead_add(text)
     if action == "followup_add":
         return handle_followup_add(text)
+    if action == "code_task":
+        return handle_code_task_add(text)
+    if action == "agent_plan":
+        return await handle_agent_plan(text)
+    if action == "agent_run":
+        return await handle_agent_run(text)
     return f"Unknown action: {action}"
 
 
@@ -1777,6 +1989,27 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/consulting_logs":  return handle_consulting_logs(arg)
     if cmd == "/followups":        return handle_followups()
     if cmd == "/followup_add":     return handle_followup_add(arg)
+    # ── Code Worker ───────────────────────────────────────────────────────
+    if cmd == "/code_task":        return handle_code_task_add(arg)
+    if cmd == "/code_tasks":       return code_format_list(limit=20)
+    if cmd == "/code_task_info":   return code_format_detail(arg.strip())
+    if cmd == "/code_cancel":
+        ok = code_cancel_task(arg.strip())
+        return f"🚫 Code task <code>{arg.strip()}</code> cancelled." if ok \
+               else f"❌ Code task <code>{arg.strip()}</code> not found."
+    if cmd == "/code_status":      return code_format_status()
+    if cmd == "/code_worker_run_once": return await handle_code_run_once()
+    if cmd == "/code_worker_pause":
+        code_pause(); return "⏸ Code worker paused."
+    if cmd == "/code_worker_resume":
+        code_resume(); return "▶ Code worker resumed."
+    # ── Self-operating agent ──────────────────────────────────────────────
+    if cmd == "/agent_plan":   return await handle_agent_plan(arg)
+    if cmd == "/agent_run":    return await handle_agent_run(arg)
+    if cmd == "/agent_health": return await handle_agent_health()
+    if cmd == "/agent_policy": return handle_agent_policy()
+    if cmd == "/agent_workers":return handle_agent_workers()
+    if cmd == "/agent_next":   return handle_agent_next()
     if cmd == "/memory_search":    return await handle_memory_search(arg)
     if cmd == "/memory_add":       return await handle_memory_add(arg)
     if cmd == "/memory_forget":    return handle_memory_forget(arg)

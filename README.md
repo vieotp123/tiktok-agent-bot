@@ -50,6 +50,15 @@ registry, persistent memory, and a Product DB + CRM.
   Hard prompt-context limits: 8 items, 6000 chars.
 - **Product DB + CRM** (`bot/business_store.py`) — `data/business.db`.
   Five tables: products, leads, conversations, consulting_logs, followups.
+- **Code Task Queue** (`bot/code_tasks.py`) — `data/code_tasks.db`.
+  Durable queue picked up by Claude/Codex CLI worker sessions; see
+  `docs/CLAUDE_CODE_WORKER.md`.
+- **Self-operating agent** (`bot/agent/{planner,executor,risk,
+  self_check,worker_roles}.py`) — deterministic planner, risk-gated
+  executor, health probe, role registry.  See `docs/SELF_OPERATING_AGENT.md`
+  for the full blueprint.
+- **Deploy / safety scripts** (`scripts/`) — `backup_prod.sh`,
+  `smoke_test.sh`, `deploy_prod.sh`, `rollback_prod.sh`.
 - **Audit log** (`bot/agent/audit_log.py`) — append-only JSONL, no secrets.
 
 ## Model policy
@@ -120,6 +129,16 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 /leads /lead <id> /lead_by_sender [platform:]<sender_key> /lead_add
 /consulting_logs [sender_key]
 /followups /followup_add <lead_id> | <iso_time> | <note>
+
+# Code Worker (Claude/Codex CLI sessions)
+/code_task <title> | [description] | [low|medium|high] | [priority]
+/code_tasks /code_task_info <id> /code_cancel <id>
+/code_status /code_worker_run_once /code_worker_pause /code_worker_resume
+
+# Self-operating agent
+/agent_plan <goal>     # planner only, no execution
+/agent_run <goal>      # low-risk auto-runs; medium/high → pending_action
+/agent_health /agent_policy /agent_workers /agent_next
 
 # Audit / agent
 /audit_recent /agent_blueprint /workers
