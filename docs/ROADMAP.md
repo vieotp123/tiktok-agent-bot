@@ -41,11 +41,13 @@ attempted in this session.
 > features. The agent should be able to receive ANY admin instruction
 > in natural Vietnamese and route it correctly.
 
-- [ ] Memory v2 — importance scoring auto-decay, embedding-based
-      semantic search via the existing Sonnet-4.6 path (no new key),
-      per-skill lesson injection on retry, dedup by content-hash.
+- [x] Memory v2 v0 — content-hash dedup (`memories.content_hash`),
+      `decay_unused_memories()` half-life decay, `lessons_for_retry()`
+      failure-only recall wired into runner + `build_memory_context`
+      (`skill_hint`, `is_retry`). Embedding-based semantic re-rank still
+      pending — current search remains keyword-based.
       Touch `bot/memory_store.py`, `bot/memory.py`, `bot/agent/runner.py`.
-      Add evals: memory dedup, importance decay, lesson injection.
+      Evals: 13 new in `memory_v2` category (dedup, decay, retry recall).
 
 - [ ] Tool registry v2 — auto-discover registered skills at startup,
       surface them in `/skills` with risk/last-used/success-rate, allow

@@ -17,7 +17,9 @@ from bot.tools import (
 )
 from bot.agent.task_queue import create_task, update_task
 from bot.agent.audit_log import log_action
-from bot.memory_store import add_raw_event, add_lesson, update_task_state
+from bot.memory_store import (
+    add_raw_event, add_lesson, update_task_state, lessons_for_retry,
+)
 
 BACKEND = os.getenv("BACKEND_URL", "http://localhost:8000")
 
@@ -68,6 +70,20 @@ async def run_task(goal: str, user: str = "tg_admin") -> dict:
         event_type="task_start",
         task_id=str(task_id),
     )
+
+    # ── Retry detection: surface prior failure lessons for this skill ────────
+    prior_failures = lessons_for_retry(task_type, limit=3)
+    if prior_failures:
+        add_raw_event(
+            source=user,
+            action=f"run_task:{task_type}",
+            summary=f"Retry detected: {len(prior_failures)} prior "
+                    f"failure(s) for skill {task_type}",
+            actor=user,
+            event_type="task_retry",
+            task_id=str(task_id),
+            metadata={"prior_failure_ids": [l["id"] for l in prior_failures]},
+        )
 
     try:
         if task_type == "btc_price":

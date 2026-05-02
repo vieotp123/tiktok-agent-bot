@@ -61,8 +61,9 @@ def add_fact(username: str, fact: str) -> None:
     data = _load()
     user = data.get(username, {"facts": [], "preferences": [], "plans": [], "recent_messages": []})
     facts = user.get("facts", [])
-    if fact not in facts:
-        facts.append(fact)
+    norm = fact.strip().lower()
+    if norm and not any(f.strip().lower() == norm for f in facts):
+        facts.append(fact.strip())
     user["facts"] = facts[-30:]
     data[username] = user
     _save(data)

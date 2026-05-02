@@ -213,6 +213,101 @@ def eval_memory(rep: EvalReport) -> None:
             len(ctx2) < 4000, f"len={len(ctx2)}")
 
 
+def eval_memory_v2(rep: EvalReport) -> None:
+    """Memory v2 — content-hash dedup, importance auto-decay, lesson retry recall."""
+    import sqlite3 as _sqlite3
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from bot import memory_store as _ms
+
+    ns = "eval_memory_v2"
+
+    # Clean slate so the eval is repeatable on the live DB.
+    with _ms._conn() as _c:
+        _c.execute("DELETE FROM memories WHERE namespace=?", (ns,))
+        _c.execute("DELETE FROM lessons  WHERE namespace=? AND skill='eval_skill_v2'", (ns,))
+
+    # 1. Dedup: identical content → single row, importance bumped on re-add.
+    id1 = _ms.add_memory("Title A", "Body A", namespace=ns, importance=4)
+    id2 = _ms.add_memory("Title A", "Body A", namespace=ns, importance=4)
+    rep.add("memory_v2_dedup_same_id", "memory_v2",
+            id1 == id2, f"id1={id1} id2={id2}")
+    with _ms._conn() as _c:
+        n = _c.execute("SELECT COUNT(*) FROM memories WHERE namespace=?", (ns,)).fetchone()[0]
+        imp = _c.execute("SELECT importance FROM memories WHERE id=?", (id1,)).fetchone()[0]
+    rep.add("memory_v2_dedup_one_row", "memory_v2",
+            n == 1, f"rows={n}")
+    rep.add("memory_v2_dedup_bumps_importance", "memory_v2",
+            imp == 5, f"importance={imp} (4 → 5 expected)")
+
+    # Whitespace + case differ but normalize to same hash → still dedup.
+    id3 = _ms.add_memory("  TITLE A  ", "  body a  ", namespace=ns)
+    rep.add("memory_v2_dedup_normalized", "memory_v2",
+            id3 == id1, f"id3={id3}")
+
+    # Distinct content → distinct row.
+    id4 = _ms.add_memory("Title B", "Body B", namespace=ns, importance=2)
+    rep.add("memory_v2_distinct_inserts", "memory_v2",
+            id4 != id1, f"id4={id4}")
+
+    # 2. Decay: simulate a memory created 95 days ago, no last_used.
+    old_ts = (_dt.now(_tz.utc) - _td(days=95)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _ms._conn() as _c:
+        _c.execute(
+            "UPDATE memories SET created_at=?, last_used_at='', importance=8 WHERE id=?",
+            (old_ts, id4),
+        )
+    n_changed = _ms.decay_unused_memories(namespace=ns, half_life_days=30, floor=1)
+    with _ms._conn() as _c:
+        new_imp = _c.execute("SELECT importance FROM memories WHERE id=?", (id4,)).fetchone()[0]
+    rep.add("memory_v2_decay_runs", "memory_v2",
+            n_changed >= 1, f"changed={n_changed}")
+    rep.add("memory_v2_decay_drops_importance", "memory_v2",
+            new_imp == 5, f"importance={new_imp} (8 - floor(95/30)=3 → 5)")
+
+    # Floor respected: re-running decay on a maxed-out floor row is a no-op.
+    with _ms._conn() as _c:
+        _c.execute("UPDATE memories SET importance=1 WHERE id=?", (id4,))
+    n2 = _ms.decay_unused_memories(namespace=ns, half_life_days=30, floor=1)
+    with _ms._conn() as _c:
+        floor_imp = _c.execute("SELECT importance FROM memories WHERE id=?", (id4,)).fetchone()[0]
+    rep.add("memory_v2_decay_respects_floor", "memory_v2",
+            floor_imp == 1 and n2 == 0,
+            f"floor_imp={floor_imp} changed={n2}")
+
+    # 3. Lesson retry recall: only failures/partials surface, in importance order.
+    _ms.add_lesson(skill="eval_skill_v2", outcome="success",
+                   lesson_text="all green",   namespace=ns, importance=5)
+    _ms.add_lesson(skill="eval_skill_v2", outcome="failure",
+                   lesson_text="db locked",   namespace=ns, importance=7)
+    _ms.add_lesson(skill="eval_skill_v2", outcome="partial",
+                   lesson_text="timeout",     namespace=ns, importance=4)
+    retry = _ms.lessons_for_retry("eval_skill_v2", namespace=ns, limit=5)
+    outcomes = [l["outcome"] for l in retry]
+    rep.add("memory_v2_retry_excludes_success", "memory_v2",
+            "success" not in outcomes, f"outcomes={outcomes}")
+    rep.add("memory_v2_retry_orders_by_importance", "memory_v2",
+            len(retry) == 2 and retry[0]["lesson"] == "db locked",
+            f"first={retry[0]['lesson'] if retry else None}")
+    rep.add("memory_v2_retry_empty_skill_safe", "memory_v2",
+            _ms.lessons_for_retry("", namespace=ns) == [], "")
+
+    # 4. build_memory_context honours skill_hint + is_retry (cap raises to 5).
+    ctx = _ms.build_memory_context(
+        "anything", namespace=ns,
+        skill_hint="eval_skill_v2", is_retry=True,
+    )
+    rep.add("memory_v2_context_uses_retry_lessons", "memory_v2",
+            "db locked" in ctx and "timeout" in ctx,
+            f"ctx_len={len(ctx)}")
+    rep.add("memory_v2_context_excludes_success_on_retry", "memory_v2",
+            "all green" not in ctx, "")
+
+    # Cleanup
+    with _ms._conn() as _c:
+        _c.execute("DELETE FROM memories WHERE namespace=?", (ns,))
+        _c.execute("DELETE FROM lessons  WHERE namespace=? AND skill='eval_skill_v2'", (ns,))
+
+
 async def eval_bridge(rep: EvalReport) -> None:
     """Coding-worker bridge dirty-tree gate.
 
@@ -1228,6 +1323,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_menu(rep)
     if category in (None, "memory"):
         eval_memory(rep)
+    if category in (None, "memory_v2"):
+        eval_memory_v2(rep)
     if category in (None, "files"):
         eval_files_safety(rep)
     if category in (None, "bridge"):

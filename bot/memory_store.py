@@ -17,10 +17,16 @@ Design rules:
   - Hard limits: max 8 items, max 6000 chars per context injection.
   - payload_json from raw_events is NEVER included in prompt context.
   - Namespaces isolate memory across users / contexts.
+
+v2 additions:
+  - memories.content_hash    — dedup key (sha256 of normalized title+content).
+  - decay_unused_memories()  — importance auto-decay for stale entries.
+  - lessons_for_retry()      — per-skill failure recall for retry injection.
 """
+import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -54,7 +60,8 @@ CREATE TABLE IF NOT EXISTS memories (
     confidence   REAL    NOT NULL DEFAULT 1.0,
     created_at   TEXT    NOT NULL,
     updated_at   TEXT    NOT NULL,
-    last_used_at TEXT    NOT NULL DEFAULT ''
+    last_used_at TEXT    NOT NULL DEFAULT '',
+    content_hash TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS lessons (
@@ -104,12 +111,44 @@ def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _migrate_v2(conn)
     conn.commit()
     return conn
 
 
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """Idempotent: add content_hash column + index to pre-v2 memories tables."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(memories)")}
+    if "content_hash" not in cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+        # Backfill hashes for existing rows so dedup works retroactively.
+        rows = conn.execute("SELECT id, title, content FROM memories").fetchall()
+        for r in rows:
+            h = _content_hash(r["title"] or "", r["content"] or "")
+            conn.execute("UPDATE memories SET content_hash=? WHERE id=?", (h, r["id"]))
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_hash "
+        "ON memories(namespace, content_hash)"
+    )
+
+
+def _content_hash(title: str, content: str) -> str:
+    """Stable hash for dedup. Normalises whitespace + case."""
+    norm = (title.strip().lower() + "\x1f" + content.strip().lower())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_ts(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 # ── Raw events (SQLite) ────────────────────────────────────────────────────────
@@ -178,28 +217,48 @@ def add_memory(
     tags: list[str] | None = None,
     importance: int = 5,
     confidence: float = 1.0,
+    dedup: bool = True,
     # legacy compat: accept username as alias for namespace
     username: str = "",
 ) -> int:
     """
-    Add a memory entry.  Returns new row id.
+    Add a memory entry.  Returns row id.
 
     memory_type: "semantic" | "episodic" | "procedural"
     importance:  1 (trivial) – 10 (critical)
     confidence:  0.0 – 1.0
+    dedup:       if True (default), an existing row in the same namespace
+                 with the same (title+content) hash is reused — its
+                 importance is bumped (+1, capped at 10) and updated_at
+                 refreshed instead of inserting a new row.
     """
     if username and namespace == "global":
         namespace = username          # legacy caller compatibility
-    now = _now()
+    now  = _now()
+    imp  = max(1, min(10, importance))
+    conf = max(0.0, min(1.0, confidence))
+    chash = _content_hash(title, content)
     with _conn() as conn:
+        if dedup:
+            existing = conn.execute(
+                "SELECT id, importance FROM memories "
+                "WHERE namespace=? AND content_hash=? LIMIT 1",
+                (namespace, chash),
+            ).fetchone()
+            if existing:
+                new_imp = min(10, max(existing["importance"], imp) + 1)
+                conn.execute(
+                    "UPDATE memories SET importance=?, updated_at=? WHERE id=?",
+                    (new_imp, now, existing["id"]),
+                )
+                return existing["id"]
         cur = conn.execute(
             "INSERT INTO memories "
             "(namespace, memory_type, title, summary, content, tags, importance, confidence, "
-            " created_at, updated_at, last_used_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " created_at, updated_at, last_used_at, content_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (namespace, memory_type, title[:200], summary[:400], content[:2000],
-             json.dumps(tags or []), max(1, min(10, importance)),
-             max(0.0, min(1.0, confidence)), now, now, ""),
+             json.dumps(tags or []), imp, conf, now, now, "", chash),
         )
         return cur.lastrowid
 
@@ -294,6 +353,48 @@ def compact_memories(namespace: str = "global", keep_top: int = 50) -> int:
         return cur.rowcount
 
 
+def decay_unused_memories(
+    namespace: str = "global",
+    *,
+    half_life_days: int = 30,
+    floor: int = 1,
+    now: Optional[datetime] = None,
+) -> int:
+    """
+    Decay importance of memories not recently used.
+
+    Drops importance by 1 per `half_life_days` elapsed since last_used_at
+    (or created_at if never used). Importance never drops below `floor`.
+    Returns the number of rows whose importance changed.
+    """
+    if half_life_days < 1:
+        return 0
+    cutoff_now = now or datetime.now(timezone.utc)
+    changed = 0
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, importance, last_used_at, created_at "
+            "FROM memories WHERE namespace=? AND importance>?",
+            (namespace, floor),
+        ).fetchall()
+        for r in rows:
+            ref = _parse_ts(r["last_used_at"]) or _parse_ts(r["created_at"])
+            if ref is None:
+                continue
+            elapsed = (cutoff_now - ref).total_seconds() / 86400.0
+            steps = int(elapsed // half_life_days)
+            if steps <= 0:
+                continue
+            new_imp = max(floor, r["importance"] - steps)
+            if new_imp != r["importance"]:
+                conn.execute(
+                    "UPDATE memories SET importance=? WHERE id=?",
+                    (new_imp, r["id"]),
+                )
+                changed += 1
+    return changed
+
+
 # ── Episodic lessons ───────────────────────────────────────────────────────────
 
 def add_lesson(
@@ -326,6 +427,30 @@ def add_lesson(
              json.dumps(tags or []), max(1, min(10, importance)), task_id, now),
         )
         return cur.lastrowid
+
+
+def lessons_for_retry(
+    skill: str,
+    *,
+    namespace: str = "global",
+    limit: int = 3,
+) -> list[dict]:
+    """
+    Recent failure/partial lessons for a skill — for retry-time injection.
+
+    Successful lessons are excluded: when re-running the same skill the
+    agent only needs to be reminded of what previously went wrong.
+    """
+    if not skill:
+        return []
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM lessons "
+            "WHERE skill=? AND namespace=? AND outcome IN ('failure','partial') "
+            "ORDER BY importance DESC, created_at DESC LIMIT ?",
+            (skill, namespace, max(1, limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def list_lessons(
@@ -411,20 +536,28 @@ def build_memory_context(
     max_chars: int = _CONTEXT_MAX_CHARS,
     include_lessons: bool = True,
     task_id: str = "",
+    skill_hint: str | None = None,
+    is_retry: bool = False,
 ) -> str:
     """
     Build a compact memory context string for LLM injection.
 
     Hard limits:
-      - max_items: cap at 8 memories + 3 lessons
+      - max_items: cap at 8 memories + 3 lessons (5 on retry)
       - max_chars: cap at 6000 total characters
       - NEVER include payload_json from raw_events
       - NEVER include full content if summary is available
 
+    skill_hint / is_retry:
+      - If `skill_hint` is given, lesson injection uses that skill directly
+        (callers like the runner know the exact skill).
+      - If `is_retry=True`, prior failure/partial lessons for the skill are
+        prioritised over generic recent lessons, and the cap rises to 5.
+
     Returns formatted string (empty string if nothing relevant found).
     """
     mem_limit    = min(max_items, _CONTEXT_MAX_ITEMS)
-    lesson_limit = min(3, max_items)
+    lesson_limit = min(5 if is_retry else 3, max_items)
 
     # 1. Search memories
     memories = search_memory(query, namespace=namespace, limit=mem_limit)
@@ -443,17 +576,22 @@ def build_memory_context(
     # 3. Get relevant lessons
     lessons = []
     if include_lessons:
-        # Try to infer skill from query
-        skill_hint = None
-        for keyword, skill in [
-            ("btc", "btc_price"), ("bitcoin", "btc_price"),
-            ("search", "search_web"), ("tìm", "search_web"),
-            ("chat", "chat"), ("tin nhắn", "send_tiktok_dm"),
-        ]:
-            if keyword in query.lower():
-                skill_hint = skill
-                break
-        lessons = list_lessons(skill=skill_hint, limit=lesson_limit)
+        # Prefer caller-supplied skill; otherwise infer from query keywords.
+        skill = skill_hint
+        if not skill:
+            for keyword, skill_name in [
+                ("btc", "btc_price"), ("bitcoin", "btc_price"),
+                ("search", "search_web"), ("tìm", "search_web"),
+                ("chat", "chat"), ("tin nhắn", "send_tiktok_dm"),
+            ]:
+                if keyword in query.lower():
+                    skill = skill_name
+                    break
+        if is_retry and skill:
+            # On retry: failures + partials only — successes don't help.
+            lessons = lessons_for_retry(skill, namespace=namespace, limit=lesson_limit)
+        else:
+            lessons = list_lessons(skill=skill, limit=lesson_limit)
 
     if not memories and not lessons:
         return ""
