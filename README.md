@@ -153,6 +153,18 @@ Lead status: `new` → `needs_followup` (≥20) → `interested` (≥50) →
 /code_task_from_file <id> <description>
 /run_task_with_file <id> <goal>
 
+# Vietnamese natural-language commands (no slash needed)
+# The bot understands plain Vietnamese in admin DMs:
+#   "làm tiếp task code tiếp theo"   → runs the worker bridge
+#   "tạo task code sửa lỗi menu"     → queues a new code_task
+#   "sửa file .env giúp t"           → asks ✅ Đồng ý / ❌ Hủy first
+#   "claude hết quota, 3 tiếng nữa chạy 1 task" → schedules autorun
+#   "đồng ý" / "hủy"                 → confirms / cancels latest pending
+#   "cấp quyền low_medium 2 tiếng"   → grant_session
+#   "xem file gần đây"               → inbox
+#   "quota claude sao rồi"           → quota status
+# See bot/agent/nl_router.classify for the full intent set.
+
 # Self-operating agent
 /agent_plan <goal>          # planner only (text), no execution
 /agent_plan_json <goal>     # structured plan v2 (plan_id, steps, tests)

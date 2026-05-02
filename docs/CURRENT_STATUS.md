@@ -8,6 +8,51 @@ _Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
 > `bot.telegram_report`. See `docs/CLAUDE_CODE_WORKER.md` for the
 > contract this task exercised.
 
+## Vietnamese Natural Language v1 changes
+
+- **`bot/agent/nl_router.classify(text)`** — deterministic Vietnamese
+  intent classifier. No LLM calls. Recognises:
+  `chat / search / status / list_tasks / create_code_task /
+  run_next_code_task / run_code_batch / show_files / send_file /
+  receive_file_context / make_prompt / refine_prompt /
+  grant_permission / revoke_permission / confirm_action /
+  cancel_action / quota_schedule / quota_status / self_improve`.
+  19/19 representative cases pass.
+- **Telegram plain-text path** (`bot/telegram_bot.py`):
+    1. legacy `detect_intent` (precision file picker)
+    2. **new** `classify` → `_handle_nl_intent`
+    3. legacy `_looks_like_task` task router
+    4. backend chat fallback
+  All NL replies use `send_chat_reply` (NEW message), never edit the
+  menu panel.
+- **Inline confirm buttons** — `confirm:<action_id>` and
+  `cancel:<action_id>` callback patterns. The classifier marks
+  `.env` / `storage_state` / `restart` / `merge main` etc. as
+  `requires_confirm=True`; a Yes/No keyboard is sent and the action
+  only runs after the admin taps ✅ Đồng ý.
+- **Vietnamese plain-text shortcuts** — `đồng ý / ok làm đi / cho phép`
+  confirms the latest pending_action; `hủy / không / đừng` cancels it.
+- **Auto-run via NL** — "làm tiếp task code tiếp theo" calls
+  `coding_worker_bridge.run_once()` directly; "chạy 2 task tiếp theo"
+  calls `run_batch(2)`. No /code_worker_run_once needed.
+- **Vietnamese run-result formatter** (`_vi_format_run_result`) —
+  status dictionary maps each bridge state into VN text.
+
+Examples (admin types in Telegram):
+
+| Câu thường | Bot làm |
+|---|---|
+| `làm tiếp task code tiếp theo` | gọi bridge `run_once()`, báo VN |
+| `tạo task code sửa lỗi menu` | tạo code_task + dựng prompt sẵn |
+| `sửa file .env giúp t` | gửi nút ✅ Đồng ý / ❌ Hủy trước khi làm |
+| `claude hết quota, 3 tiếng nữa chạy 1 task` | hẹn quota + autorun=1 |
+| `quota claude sao rồi` | trả về `claude_quota.status_summary()` |
+| `cấp quyền low_medium 2 tiếng` | `grant_session low_medium 120` |
+| `đồng ý` | duyệt pending_action mới nhất |
+| `hủy` | hủy pending_action mới nhất |
+| `xem file gần đây` | inbox listing |
+| `xem agent đang lỗi gì` | `/agent_status` dashboard VN |
+
 ## Autonomous Control Bridge v1 changes
 
 - **`bot/coding_worker_bridge.py`** — detects `claude` / `codex` CLI on

@@ -43,6 +43,7 @@ from bot.code_tasks import (
     cancel_task as code_cancel_task,
     list_tasks as code_list_tasks,
     next_queued_task as code_next_task,
+    get_task as code_get_task,
     format_tasks_list as code_format_list,
     format_task_detail as code_format_detail,
     format_status_summary as code_format_status,
@@ -2173,6 +2174,49 @@ async def dispatch_callback(cb: dict, chat_id: str | int) -> None:
                 menu_name="confirm:restart_bot",
                 preferred_message_id=msg_id,
             )
+            return
+        # Any other confirm:<id> → treat as pending-action confirm.
+        from bot.agent.permissions import confirm_pending, get_pending
+        action_id = val
+        rec = get_pending(action_id)
+        if not rec:
+            await send_chat_reply(
+                chat_id,
+                f"❌ Hành động <code>{action_id}</code> không tồn tại "
+                "hoặc đã hết hạn.",
+            )
+            return
+        confirm_pending(action_id)
+        log_action(user="tg_admin", action="nl_confirm_action",
+                   risk_level="high", status="confirmed",
+                   result_summary=f"action_id={action_id}")
+        await send_chat_reply(
+            chat_id,
+            f"✅ Đã duyệt <code>{action_id}</code> "
+            f"({rec.get('action','?')}). Sẽ thực thi nếu đủ điều kiện.",
+        )
+        return
+
+    if kind == "cancel":
+        # cancel:<action_id> from inline button.
+        from bot.agent.permissions import cancel_pending, get_pending
+        action_id = val
+        rec = get_pending(action_id)
+        if not rec:
+            await send_chat_reply(
+                chat_id,
+                f"❌ Hành động <code>{action_id}</code> không tồn tại.",
+            )
+            return
+        cancel_pending(action_id)
+        log_action(user="tg_admin", action="nl_cancel_action",
+                   risk_level="low", status="cancelled",
+                   result_summary=f"action_id={action_id}")
+        await send_chat_reply(
+            chat_id,
+            f"🚫 Đã hủy <code>{action_id}</code> "
+            f"({rec.get('action','?')}).",
+        )
         return
 
 
@@ -2434,9 +2478,291 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
         )
 
     # Smart routing for plain text
+    # 1) Vietnamese natural-language file send: "gửi ROADMAP cho t".
+    #    Deterministic match — no LLM round-trip; falls through to
+    #    chat if no pattern hits.
+    # ── Vietnamese natural-language router ──────────────────────────────
+    # Step 1: Legacy file-send picker (high-precision for "gửi file X").
+    try:
+        from bot.agent.nl_router import detect_intent, handle_send_file_intent
+        nl = detect_intent(text)
+        if nl and nl.get("intent") == "send_file":
+            return await handle_send_file_intent(nl, chat_id)
+    except Exception as e:
+        log(f"nl_router send-file error: {e}")
+
+    # Step 2: Full classifier (run/create/quota/permissions/status/list/...)
+    try:
+        from bot.agent.nl_router import classify
+        intent = classify(text)
+        log(f"nl_intent={intent.name} conf={intent.confidence:.2f} "
+            f"risk={intent.risk_level} req_confirm={intent.requires_confirm}")
+        if intent.name not in ("chat", "unknown"):
+            handled = await _handle_nl_intent(intent, chat_id, text)
+            if handled is not None:
+                return handled
+    except Exception as e:
+        import traceback as _tb
+        log(f"nl_router classify error: {e}\n{_tb.format_exc()[:300]}")
+
+    # Step 3: legacy task-shaped trigger (long imperative sentences)
     if _looks_like_task(text):
         return await handle_run_task(text)
+
+    # Step 4: default — backend chat
     return await handle_message_backend(text)
+
+
+async def _handle_nl_intent(intent, chat_id, raw_text: str):
+    """Dispatch a v2 nl_router.Intent into the right action.
+
+    Returns a Vietnamese reply string, or None to fall through to chat.
+    All replies go via send_chat_reply (NEW message), never edit the
+    menu panel.
+    """
+    name = intent.name
+
+    # ── Run / batch via the bridge ────────────────────────────────────────
+    if name == "run_next_code_task":
+        # Surface immediate ack, let bridge do the heavy work.
+        await send_chat_reply(
+            chat_id,
+            "🛠 Đã nhận lệnh. Đang gọi bridge để chạy task code tiếp theo…",
+        )
+        result = await _cwb.run_once(user="tg_admin")
+        return _vi_format_run_result(result)
+
+    if name == "run_code_batch":
+        n = int(intent.args.get("n") or 1)
+        await send_chat_reply(
+            chat_id,
+            f"🛠 Bắt đầu batch {n} task code…",
+        )
+        results = await _cwb.run_batch(n, user="tg_admin")
+        if not results:
+            return "💤 Không có task nào để chạy."
+        parts = [f"<b>Kết quả batch ({len(results)})</b>"]
+        for r in results:
+            parts.append(_vi_format_run_result(r))
+            parts.append("———")
+        return "\n\n".join(parts).rstrip("———\n").rstrip()
+
+    # ── Create code task from a Vietnamese description ────────────────────
+    if name == "create_code_task":
+        desc = (intent.args.get("description") or raw_text)[:1000]
+        if intent.requires_confirm:
+            return await _ask_confirm_action(
+                chat_id,
+                action="create_code_task_high_risk",
+                goal=desc,
+                pretty=(f"Tạo task code có yếu tố rủi ro cao "
+                        f"(.env / storage / public). Cho phép?"),
+            )
+        title = desc.split("\n", 1)[0][:80] or "Coding task"
+        tid = code_add_task(title=title, description=desc,
+                            risk_level=intent.risk_level,
+                            priority=5, created_by="tg_admin_nl")
+        # Best-effort prompt build now (so the worker has something
+        # ready immediately if admin says "chạy luôn").
+        try:
+            from bot.agent.prompt_builder import (build_coding_prompt,
+                save_prompt_for_task)
+            t = code_get_task(tid)
+            if t:
+                prompt = build_coding_prompt(t)
+                save_prompt_for_task(tid, prompt)
+        except Exception as e:
+            log(f"prompt build warning: {e}")
+        return (f"✅ Đã tạo task code <code>{tid}</code> "
+                f"(risk={intent.risk_level})\n"
+                f"<b>{_esc(title)}</b>\n\n"
+                f"Bridge sẽ chạy khi mình ra lệnh "
+                f"<i>“làm tiếp task code tiếp theo”</i>, hoặc gõ "
+                f"<code>/code_worker_run_once</code>.")
+
+    # ── Self-improve once ────────────────────────────────────────────────
+    if name == "self_improve":
+        return await handle_self_improve_once()
+
+    # ── Show files ────────────────────────────────────────────────────────
+    if name == "show_files":
+        return handle_files_list()
+
+    # ── Quota schedule ───────────────────────────────────────────────────
+    if name == "quota_schedule":
+        mins      = int(intent.args.get("minutes") or 0)
+        max_tasks = int(intent.args.get("max_tasks") or 0)
+        replies = []
+        if mins > 0:
+            try:
+                _cq.set_reset_in(f"{mins}m")
+                replies.append(f"🕒 Đã hẹn Claude reset sau <b>{mins} phút</b>.")
+            except Exception as e:
+                replies.append(f"❌ Không hẹn được: {e}")
+        else:
+            try:
+                _cq.set_limited(True)
+                replies.append("🚫 Đã đánh dấu Claude đang hết quota "
+                               "(chưa biết lúc reset — gửi /claude_quota_in nếu biết).")
+            except Exception as e:
+                replies.append(f"❌ {e}")
+        if max_tasks > 0:
+            try:
+                _cq.set_autorun(True, max_tasks=max_tasks)
+                replies.append(f"▶ Bật autorun: chạy tối đa "
+                               f"<b>{max_tasks}</b> task khi quota về.")
+            except Exception as e:
+                replies.append(f"❌ autorun: {e}")
+        replies.append("")
+        replies.append(_cq.status_summary())
+        return "\n".join(replies)
+
+    if name == "quota_status":
+        return _cq.status_summary()
+
+    # ── Permission grant / revoke ────────────────────────────────────────
+    if name == "grant_permission":
+        scope = intent.args.get("scope") or "low_medium"
+        mins  = int(intent.args.get("minutes") or 30)
+        return handle_grant_session(f"{scope} {mins}")
+
+    if name == "revoke_permission":
+        return handle_revoke_session()
+
+    # ── Confirm / cancel via plain Vietnamese ────────────────────────────
+    if name == "confirm_action":
+        return await _confirm_latest_pending(chat_id)
+    if name == "cancel_action":
+        return await _cancel_latest_pending(chat_id)
+
+    # ── Status / list / search / receive_file_context ────────────────────
+    if name == "status":
+        return await handle_agent_status()
+    if name == "list_tasks":
+        return code_format_list(limit=15)
+    if name == "search":
+        # Reuse run_task search routing
+        return await handle_run_task(intent.args.get("query") or raw_text)
+
+    return None
+
+
+def _vi_format_run_result(r: dict) -> str:
+    """Vietnamese version of coding_worker_bridge.format_run_result."""
+    icon = {
+        "done":             "✅",
+        "pending_action":   "⏸",
+        "no_tool":          "❌",
+        "interactive_only": "⚠",
+        "paused":           "⏯",
+        "rejected":         "🚫",
+        "worker_failed":    "💥",
+        "smoke_failed":     "🚫",
+        "evals_failed":     "🚫",
+        "no_changes":       "💤",
+        "noop":             "💤",
+        "exec_error":       "💥",
+        "commit_failed":    "💥",
+        "push_failed":      "💥",
+        "no_push_token":    "🔒",
+        "blocked_staged":   "🚫",
+        "dry_run":          "🔍",
+    }.get(r.get("status", ""), "•")
+    status_vi = {
+        "done":             "Xong",
+        "pending_action":   "Cần xác nhận",
+        "no_tool":          "Chưa cài Claude/Codex CLI",
+        "interactive_only": "CLI cần TTY (chạy thủ công)",
+        "paused":           "Bridge/worker đang pause",
+        "rejected":         "Bị từ chối",
+        "worker_failed":    "Worker lỗi",
+        "smoke_failed":     "Smoke test fail",
+        "evals_failed":     "Evals fail",
+        "no_changes":       "Worker không thay đổi gì",
+        "noop":             "Không có task nào để chạy",
+        "exec_error":       "Lỗi exec",
+        "commit_failed":    "Commit fail",
+        "push_failed":      "Push fail",
+        "no_push_token":    "Thiếu GITHUB_TOKEN",
+        "blocked_staged":   "Có file cấm staged",
+        "dry_run":          "Dry run",
+    }.get(r.get("status", ""), r.get("status", "?"))
+    parts = [f"{icon} <b>{status_vi}</b>"]
+    if r.get("task_id"):
+        parts.append(f"task: <code>{r['task_id']}</code>")
+    if r.get("tool"):
+        parts.append(f"tool: <code>{r['tool']}</code>")
+    if r.get("commit"):
+        parts.append(f"📦 commit: <code>{r['commit']}</code> đẩy lên dev-agent")
+    if r.get("pending_action_id"):
+        parts.append(f"⏸ pending: <code>{r['pending_action_id']}</code> "
+                     "<i>(gõ “đồng ý” để duyệt)</i>")
+    if r.get("log_path"):
+        from pathlib import Path as _P
+        parts.append(f"log: <code>{_P(r['log_path']).name}</code>")
+    if r.get("duration_sec") is not None:
+        parts.append(f"thời gian: {r['duration_sec']}s")
+    if r.get("summary"):
+        parts.append("")
+        parts.append(_esc(r["summary"]))
+    return "\n".join(parts)
+
+
+# ── Vietnamese inline-confirm helper ──────────────────────────────────────────
+
+async def _ask_confirm_action(chat_id, *, action: str, goal: str,
+                                pretty: str) -> str:
+    """Create a pending_action and send Yes/No buttons in Vietnamese."""
+    from bot.agent.permissions import create_pending
+    pid = create_pending(action=action, goal=goal[:300],
+                          risk_level="high", user="tg_admin",
+                          metadata={"source": "nl_router"})
+    kb = make_keyboard([
+        [("✅ Đồng ý", f"confirm:{pid}"),
+         ("❌ Hủy",     f"cancel:{pid}")],
+    ])
+    text_html = (f"⚠️ <b>Hành động rủi ro cao</b>\n"
+                 f"{_esc(pretty)}\n\n"
+                 f"id: <code>{pid}</code>")
+    # Use raw send (it's a separate chat message with keyboard)
+    await send(chat_id, text_html, kb)
+    return ""  # already sent — caller's send_chat_reply would duplicate
+
+
+async def _confirm_latest_pending(chat_id) -> str:
+    from bot.agent.permissions import list_pending, confirm_pending
+    items = list_pending(only_pending=True)
+    if not items:
+        return "(Không có hành động nào đang chờ xác nhận.)"
+    if len(items) > 1:
+        ids = ", ".join(f"<code>{p['action_id']}</code>" for p in items[:5])
+        return ("Có nhiều hành động đang chờ:\n" + ids +
+                "\nGõ <code>/confirm_action &lt;id&gt;</code> cho từng cái.")
+    p = items[0]
+    confirm_pending(p["action_id"])
+    log_action(user="tg_admin", action="nl_confirm_action",
+               risk_level="high", status="confirmed",
+               result_summary=f"action_id={p['action_id']}")
+    return (f"✅ Đã duyệt hành động <code>{p['action_id']}</code> "
+            f"({p['action']}). Tự động thực thi nếu đủ điều kiện.")
+
+
+async def _cancel_latest_pending(chat_id) -> str:
+    from bot.agent.permissions import list_pending, cancel_pending
+    items = list_pending(only_pending=True)
+    if not items:
+        return "(Không có hành động nào đang chờ.)"
+    if len(items) > 1:
+        ids = ", ".join(f"<code>{p['action_id']}</code>" for p in items[:5])
+        return ("Có nhiều hành động đang chờ:\n" + ids +
+                "\nGõ <code>/cancel_action &lt;id&gt;</code> cho từng cái.")
+    p = items[0]
+    cancel_pending(p["action_id"])
+    log_action(user="tg_admin", action="nl_cancel_action",
+               risk_level="low", status="cancelled",
+               result_summary=f"action_id={p['action_id']}")
+    return (f"🚫 Đã hủy hành động <code>{p['action_id']}</code> "
+            f"({p['action']}).")
 
 
 # ── Long-poll loop ────────────────────────────────────────────────────────────
