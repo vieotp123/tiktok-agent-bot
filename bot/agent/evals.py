@@ -11,12 +11,16 @@ Categories:
   7. files       — send_file blocks .env / storage_state
   8. tasks       — code_task lifecycle on the live DB
   9. prompt      — prompt_builder produces a usable Claude prompt
+ 10. nl_cohort   — 200+ admin-phrase drift suite for nl_router.classify()
+                   (cohort lives at data/nl_eval_cohort.jsonl; intended
+                   for a weekly digest piped to bot.telegram_report).
 
 Runs in <30s. Safe to run on prod (read-only or transactional).
 
 CLI:
     python -m bot.agent.evals
     python -m bot.agent.evals --category risk
+    python -m bot.agent.evals --category nl_cohort
 
 Telegram:
     /agent_evals
@@ -25,13 +29,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
 BACKEND = "http://localhost:8000"
+NL_COHORT_PATH = Path("/opt/tiktok-bot/data/nl_eval_cohort.jsonl")
 
 
 @dataclass
@@ -1678,6 +1685,144 @@ def eval_brain_context(rep: EvalReport) -> None:
             "call_llm must guard injection by source+username")
 
 
+def eval_daily_jobs(rep: EvalReport) -> None:
+    """Daily-jobs scheduler — catalog freshness + per-day idempotency.
+
+    Locks:
+      - find_stale_active_products only flags `active` products older
+        than the threshold; `needs_update` / `disabled` are ignored.
+      - catalog_freshness_check return shape (job, run_at, total_active,
+        stale_count, stale_after_days, stale_products list).
+      - format_catalog_freshness_html: green when no stale, yellow with
+        product count otherwise, no raw `<` outside HTML tags.
+      - should_run_today / mark_ran_today round-trip via a temp state
+        file so the live `data/daily_jobs_state.json` is untouched.
+      - run_daily_jobs surfaces the catalog_freshness key and respects
+        the per-day skip; `force=True` re-runs.
+    """
+    import tempfile
+    from datetime import datetime, timezone, timedelta
+    from pathlib import Path
+    from bot.agent import daily_jobs as dj
+
+    now  = datetime(2026, 5, 3, 12, 0, 0, tzinfo=timezone.utc)
+    old  = (now - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fresh = (now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    prods = [
+        {"id": "p1", "name": "Old Active",  "status": "active",
+         "updated_at": old},
+        {"id": "p2", "name": "Fresh Active","status": "active",
+         "updated_at": fresh},
+        {"id": "p3", "name": "Old Pending", "status": "needs_update",
+         "updated_at": old},
+        {"id": "p4", "name": "No TS Active","status": "active",
+         "updated_at": ""},
+        {"id": "p5", "name": "Disabled",    "status": "disabled",
+         "updated_at": old},
+    ]
+
+    stale = dj.find_stale_active_products(
+        stale_after_days=14, now=now, products_in=prods,
+    )
+    stale_ids = {p["id"] for p in stale}
+    rep.add("daily_jobs_stale_only_active", "daily_jobs",
+            stale_ids == {"p1", "p4"},
+            f"stale={sorted(stale_ids)}")
+
+    # Fresh active product is not flagged.
+    rep.add("daily_jobs_fresh_excluded", "daily_jobs",
+            "p2" not in stale_ids, "p2 is fresh, must be excluded")
+    # needs_update + disabled are not flagged regardless of age.
+    rep.add("daily_jobs_skip_non_active", "daily_jobs",
+            "p3" not in stale_ids and "p5" not in stale_ids,
+            f"non-active leaked: {stale_ids & {'p3','p5'}}")
+    # days_since_update is monotone with age.
+    by_id = {p["id"]: p for p in stale}
+    rep.add("daily_jobs_days_field", "daily_jobs",
+            by_id.get("p1", {}).get("days_since_update", 0) >= 14,
+            f"p1 days={by_id.get('p1', {}).get('days_since_update')}")
+
+    res = dj.catalog_freshness_check(
+        stale_after_days=14, now=now, products_in=prods,
+    )
+    expected_keys = {"job", "run_at", "stale_after_days", "total_active",
+                     "stale_count", "stale_products"}
+    rep.add("daily_jobs_result_shape", "daily_jobs",
+            expected_keys.issubset(res.keys())
+            and res["job"] == "catalog_freshness",
+            f"keys={sorted(res.keys())}")
+    rep.add("daily_jobs_total_active", "daily_jobs",
+            res["total_active"] == 3,
+            f"total_active={res['total_active']}")
+    rep.add("daily_jobs_stale_count", "daily_jobs",
+            res["stale_count"] == 2,
+            f"stale_count={res['stale_count']}")
+
+    # No stale → green emoji, all-fresh message.
+    fresh_only = [
+        {"id": "f1", "name": "F1", "status": "active", "updated_at": fresh},
+    ]
+    res_ok = dj.catalog_freshness_check(
+        stale_after_days=14, now=now, products_in=fresh_only,
+    )
+    html_ok = dj.format_catalog_freshness_html(res_ok)
+    rep.add("daily_jobs_html_green_when_clean", "daily_jobs",
+            "🟢" in html_ok and "tươi" in html_ok,
+            f"html={html_ok[:80]}")
+    html_warn = dj.format_catalog_freshness_html(res)
+    rep.add("daily_jobs_html_warn_when_stale", "daily_jobs",
+            "🟡" in html_warn and "p1" in html_warn,
+            f"html={html_warn[:80]}")
+
+    # Idempotency state machine via a temp file.
+    tmp_state = Path(tempfile.mkdtemp()) / "daily_state.json"
+    saved = dj.STATE_PATH
+    try:
+        dj.STATE_PATH = tmp_state
+        rep.add("daily_jobs_should_run_when_empty", "daily_jobs",
+                dj.should_run_today("catalog_freshness", now=now) is True,
+                "no state file → should run")
+        dj.mark_ran_today("catalog_freshness", now=now)
+        rep.add("daily_jobs_should_skip_after_mark", "daily_jobs",
+                dj.should_run_today("catalog_freshness", now=now) is False,
+                "after mark → must skip")
+        # Next-day cursor → eligible again.
+        next_day = now + timedelta(days=1)
+        rep.add("daily_jobs_should_run_next_day", "daily_jobs",
+                dj.should_run_today("catalog_freshness", now=next_day) is True,
+                "fresh UTC date → should run again")
+    finally:
+        dj.STATE_PATH = saved
+
+    # run_daily_jobs surfaces both the freshness result and skip semantics.
+    tmp_state2 = Path(tempfile.mkdtemp()) / "daily_state.json"
+    try:
+        dj.STATE_PATH = tmp_state2
+        out = dj.run_daily_jobs(now=now)
+        rep.add("run_daily_jobs_runs_freshness", "daily_jobs",
+                isinstance(out.get("jobs", {}).get("catalog_freshness"), dict),
+                f"jobs={list(out.get('jobs', {}).keys())}")
+        out2 = dj.run_daily_jobs(now=now)
+        rep.add("run_daily_jobs_skips_second_call", "daily_jobs",
+                out2.get("jobs", {}).get("catalog_freshness") == "skipped",
+                f"second jobs={out2.get('jobs')}")
+        out3 = dj.run_daily_jobs(now=now, force=True)
+        rep.add("run_daily_jobs_force_reruns", "daily_jobs",
+                isinstance(out3.get("jobs", {}).get("catalog_freshness"), dict),
+                f"force jobs={out3.get('jobs')}")
+    finally:
+        dj.STATE_PATH = saved
+
+    # Gitignore guard: state file path is under data/ and listed in .gitignore.
+    rep.add("daily_jobs_state_under_data", "daily_jobs",
+            str(dj.STATE_PATH).startswith("/opt/tiktok-bot/data/"),
+            f"path={dj.STATE_PATH}")
+    gi = Path("/opt/tiktok-bot/.gitignore").read_text(encoding="utf-8")
+    rep.add("daily_jobs_state_gitignored", "daily_jobs",
+            "data/daily_jobs_state.json" in gi,
+            "must be in .gitignore")
+
+
 def eval_intent_stats(rep: EvalReport) -> None:
     """Intent stats — log + threshold suggestion API.
 
@@ -1820,6 +1965,80 @@ def eval_intent_stats_wired(rep: EvalReport) -> None:
             "telegram_bot must call intent_stats.record_and_check")
 
 
+def _load_nl_cohort(path: Path = NL_COHORT_PATH) -> list[dict]:
+    """Read the NL eval cohort JSONL. Blank lines and `#` comments allowed."""
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(json.loads(s))
+    return out
+
+
+def eval_nl_cohort(rep: EvalReport) -> None:
+    """NL classifier drift suite — runs every phrase in
+    `data/nl_eval_cohort.jsonl` through `nl_router.classify()` and
+    flags any drift from the recorded expected intent.
+
+    Roadmap contract: 200+ admin phrases, weekly drift digest.
+
+    The cohort is the source of truth; if the classifier intentionally
+    changes behaviour for a phrase, update the cohort entry in the same
+    commit. Each drifted phrase becomes its own row in the digest so
+    `/agent_evals` (or a weekly cron piping to `bot.telegram_report`)
+    surfaces exactly what regressed.
+    """
+    from bot.agent.nl_router import classify
+
+    rep.add("nl_cohort_file_present", "nl_cohort",
+            NL_COHORT_PATH.exists(), f"path={NL_COHORT_PATH}")
+    if not NL_COHORT_PATH.exists():
+        return
+
+    try:
+        cases = _load_nl_cohort()
+    except Exception as e:
+        rep.add("nl_cohort_jsonl_parse", "nl_cohort", False,
+                f"parse error: {e}")
+        return
+    rep.add("nl_cohort_jsonl_parse", "nl_cohort", True,
+            f"loaded={len(cases)}")
+
+    rep.add("nl_cohort_min_size", "nl_cohort",
+            len(cases) >= 200, f"size={len(cases)} (need ≥200)")
+
+    rep.add("nl_cohort_schema", "nl_cohort",
+            all(isinstance(c, dict)
+                and isinstance(c.get("text"), str) and c["text"].strip()
+                and isinstance(c.get("intent"), str) and c["intent"].strip()
+                for c in cases),
+            f"checked={len(cases)} entries")
+
+    drift: list[tuple[str, str, str, float]] = []
+    for c in cases:
+        text = c.get("text", "")
+        want = c.get("intent", "")
+        got = classify(text)
+        if got.name != want:
+            drift.append((text, want, got.name, got.confidence))
+
+    rep.add("nl_cohort_drift", "nl_cohort",
+            len(drift) == 0,
+            f"drift={len(drift)}/{len(cases)}"
+            + (f" sample={drift[0][0][:40]!r}→{drift[0][2]}"
+               if drift else ""))
+
+    # Per-phrase drift rows, capped so a fully-broken classifier does
+    # not flood the digest. Cap at 25; the summary row above carries
+    # the full count.
+    for text, want, got_name, _conf in drift[:25]:
+        rep.add(f"nl_cohort[{text[:40]!r}]", "nl_cohort", False,
+                f"got={got_name} want={want}")
+
+
 async def run_all_evals(category: str | None = None) -> EvalReport:
     rep = EvalReport(started_at=time.time())
 
@@ -1878,6 +2097,10 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
     if category in (None, "intent_stats"):
         eval_intent_stats(rep)
         eval_intent_stats_wired(rep)
+    if category in (None, "daily_jobs"):
+        eval_daily_jobs(rep)
+    if category in (None, "nl_cohort"):
+        eval_nl_cohort(rep)
 
     rep.finished_at = time.time()
     return rep
