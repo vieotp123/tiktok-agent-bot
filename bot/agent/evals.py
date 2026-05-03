@@ -117,6 +117,9 @@ def eval_risk(rep: EvalReport) -> None:
         ("update giá softbank",                    "medium"),
         ("thêm sản phẩm mới",                      "medium"),
         ("verify product 123",                     "medium"),
+        # Regression: roadmap titles tagged "(high risk;" must NOT downgrade.
+        ("Auto-DM follow-up to leads (high risk;", "high"),
+        ("auto-dm leads after /confirm_action",    "high"),
     ]
     for goal, want in cases:
         got = classify_risk(goal)

@@ -37,6 +37,7 @@ import re
 # Hard rules — substring matches → high risk regardless of phrasing.
 _HIGH_RISK_PATTERNS = [
     r"\bdm\s+khách\b", r"\bgửi\s+dm\b", r"\bsend.*dm\b",
+    r"\bauto[\s_-]?dm\b", r"\bfollow[\s_-]?up.*\blead",
     r"\bđăng\s+(bài|post|video)\b", r"\bpublish\b", r"\bpost\b",
     r"\bcomment\s+công\s+khai\b", r"\bauto[\s_-]?follow\b",
     r"\bmass[\s_-]?dm\b", r"\boutreach\b",
@@ -46,6 +47,8 @@ _HIGH_RISK_PATTERNS = [
     r"\bedit\s+\.env\b", r"\bstorage[_\s]state\b",
     r"\btiktok[_\s]bot\.py\b", r"\bplaywright\b.*(reader|extract|selector)",
     r"\bnginx\b", r"\biptables\b", r"\bsudo\b",
+    # Explicit "(high risk)" annotation in a roadmap item or goal — honour it.
+    r"\(\s*high[\s_-]?risk\b",
 ]
 
 # Medium markers

@@ -142,7 +142,9 @@ attempted in this session.
 ## Future / blocked
 
 - [ ] Auto-DM follow-up to leads after `/confirm_action` (high risk;
-  needs explicit approval policy + rate limit).
+  needs explicit approval policy + rate limit). Blocking checklist is
+  codified in `docs/OPERATING_RULES.md` §13 — all 8 prerequisites must
+  ship and be locked in evals before any code_task touches this.
 - [ ] Competitor scrape with login (would need credential vault — out of
   scope until secret management is added).
 - [ ] Cross-channel CRM merge (Telegram + TikTok + email) — needs an

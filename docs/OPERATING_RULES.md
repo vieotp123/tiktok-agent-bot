@@ -171,3 +171,66 @@ Unknown commands default to **high** — admin must confirm.
 - After any service restart, verify `[read] baseline seen=N` appears in
   `tiktok-bot` logs within 10 seconds — silent extractor failure is the
   #1 historical regression.
+
+## 13. Auto-DM follow-up to leads — prerequisites (currently blocked)
+
+Auto-initiating a TikTok DM to a lead — even one we previously talked to
+— is a stated **hard non-goal** today (see
+`docs/SELF_OPERATING_AGENT.md` §1) and a **high-risk** action under the
+risk classifier. `docs/CLAUDE_CODE_WORKER.md` §3 also forbids any code
+task from running a public action (DM, post, comment, follow). The
+roadmap entry ("Auto-DM follow-up to leads after `/confirm_action`") is
+therefore parked in *Future / blocked* until ALL of the following are
+in place. None of these may be skipped, even with admin confirm.
+
+1. **One `/confirm_action` per outgoing DM.** A single confirmation
+   never authorises a batch. Each DM that the agent proposes to send
+   creates its own `pending_action` via
+   `bot.agent.permissions.create_pending` with the recipient's
+   `sender_key`, the exact draft text, and the lead's last-seen
+   timestamp included in `metadata`. The DM only fires after the admin
+   taps ✅ on that specific entry.
+2. **Hard rate limit, enforced server-side.** Maximum 1 follow-up DM
+   per `sender_key` per 14 days, and ≤5 follow-up DMs total per UTC
+   day across all leads. The limiter must live next to the sender (not
+   in the planner) so that even a buggy planner cannot exceed it.
+3. **Quiet-hours window.** No follow-up DM may be queued or sent
+   outside 09:00–21:00 in the lead's local time (default JST when
+   unknown). Pending actions created outside that window must auto-
+   expire after 24h without confirmation.
+4. **Conversation recency requirement.** The lead's most recent
+   inbound message must be within 30 days. Older leads require a fresh
+   inbound before any follow-up can be queued; cold outreach to dormant
+   leads stays a stated non-goal.
+5. **Opt-out tracking.** A lead-level `dm_optout=true` flag (added to
+   `bot/business_store.py::leads`) blocks all future follow-ups. Any
+   inbound message containing `stop`, `unsubscribe`, `huỷ`, `không
+   nhắn nữa` (case-insensitive) sets the flag automatically and is
+   audit-logged.
+6. **Audit trail.** Every confirmed-and-sent follow-up DM writes one
+   entry to `data/audit/actions.jsonl` via `bot.agent.audit_log` with
+   `action="auto_dm_followup_sent"`, `sender_key`, `lead_id`,
+   `pending_action_id`, and a 60-char summary of the draft (NEVER the
+   full text or any PII beyond the sender_key).
+7. **Kill switch.** `data/auto_dm_followup_enabled` (a single-byte
+   file containing `1` or `0`, gitignored) is checked on every send.
+   Default **off**. The admin must flip it to `1` via a Telegram
+   command that itself is risk=high (so it ALSO requires
+   `/confirm_action`).
+8. **Eval coverage.** `bot/agent/evals.py` must include cases that
+   verify (a) the rate limiter rejects the 2nd DM in a 14-day window,
+   (b) the quiet-hours guard rejects out-of-window sends, (c) an
+   opt-out flag blocks send regardless of admin confirm, and (d) the
+   kill switch defaults off after a fresh deploy.
+
+Until §1–8 are all implemented, reviewed, and locked in evals, no
+worker (Telegram, planner_executor, code_worker, content_factory) may
+add code that initiates a TikTok DM. The only sanctioned reply path
+remains the Chatgibiti-only loop in `bot/tiktok_bot.py`, which replies
+inside an active conversation we were DM'd into first (see §3).
+
+The risk classifier in `bot/agent/risk.py` matches `auto-dm`,
+`follow-up.*lead`, and any goal carrying an explicit `(high risk`
+annotation. Any future roadmap item touching this area must therefore
+flow through `bot.agent.permissions.create_pending` — not through a
+queued `code_task`.
