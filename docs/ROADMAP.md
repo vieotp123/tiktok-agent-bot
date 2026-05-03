@@ -154,7 +154,14 @@ attempted in this session.
 
 ## Operating-rule additions to consider
 
-- [ ] Add a "no public action without `/confirm_action`" CI guard that
+- [x] Add a "no public action without `/confirm_action`" CI guard that
   greps source for direct send/post calls in non-bot files.
+  `scripts/ci_public_action_guard.py` flags TikTok-sender imports,
+  qualified `tiktok_bot.send_*` calls, the `dm-message-input` DOM
+  selector, and `tiktok.com/{messages,upload}` URLs anywhere outside
+  the allow-list (`bot/tiktok_bot.py`). Wired into
+  `scripts/smoke_test.sh` (check 1b) and `bot/agent/evals.py`
+  (`public_action_guard` category — clean-tree + sentinel coverage +
+  allow-list + per-line `# ci: public-action ok` escape hatch).
 - [ ] Add per-worker token-budget limits so a runaway loop can't burn
   through the 9Router quota.

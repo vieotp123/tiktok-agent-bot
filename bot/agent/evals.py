@@ -18,6 +18,9 @@ Categories:
  11. weekly_jobs — per-ISO-week scheduler that runs the NL cohort drift
                    digest and ships it to the admin chat. Idempotent
                    via data/weekly_jobs_state.json.
+ 12. public_action_guard — locks scripts/ci_public_action_guard.py:
+                   clean tree, sentinel coverage, allow-list,
+                   per-line escape hatch.
 
 Runs in <30s. Safe to run on prod (read-only or transactional).
 
@@ -2185,6 +2188,88 @@ def eval_lead_score(rep: EvalReport) -> None:
             "telegram_bot.py must call compute_lead_score_llm")
 
 
+def eval_public_action_guard(rep: EvalReport) -> None:
+    """No-public-action-without-/confirm_action CI guard.
+
+    Locks four invariants for `scripts/ci_public_action_guard.py`:
+      1. The current tree is clean (no direct TikTok send/post calls
+         outside the allow-list).
+      2. Each sentinel pattern is caught when planted in a non-allowed
+         file (synthetic backend/server.py text).
+      3. The allow-list works — the same patterns in
+         `bot/tiktok_bot.py` produce zero violations.
+      4. The per-line escape hatch (`# ci: public-action ok`) suppresses
+         a violation.
+    """
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    guard_path = _Path("/opt/tiktok-bot/scripts/ci_public_action_guard.py")
+    rep.add("public_action_guard_module_present", "public_action_guard",
+            guard_path.exists(), f"path={guard_path}")
+    if not guard_path.exists():
+        return
+
+    spec = importlib.util.spec_from_file_location(
+        "ci_public_action_guard", guard_path)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    _sys.modules["ci_public_action_guard"] = mod
+    try:
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    except Exception as e:
+        rep.add("public_action_guard_import", "public_action_guard",
+                False, f"import error: {e}")
+        return
+    rep.add("public_action_guard_import", "public_action_guard", True, "")
+
+    # 1. Clean tree
+    try:
+        violations = mod.scan_paths()
+    except Exception as e:
+        rep.add("public_action_guard_clean_tree", "public_action_guard",
+                False, f"scan error: {e}")
+        return
+    rep.add("public_action_guard_clean_tree", "public_action_guard",
+            len(violations) == 0,
+            f"violations={len(violations)}"
+            + (f" first={violations[0].path}:{violations[0].line}"
+               if violations else ""))
+
+    # 2. Each sentinel fires on a planted line in a non-allowed file.
+    #    Sentinel strings are assembled from fragments so this fixture
+    #    file itself does not trip the guard's static scan.
+    _IMPORT_FRAG    = "from bot." + "tiktok_bot import send_message\n"
+    _QUAL_CALL_FRAG = "await bot.tiktok_" + "bot.send_bubbles(page, msgs)\n"
+    _SELECTOR_FRAG  = "sel = 'data-e2e=\"dm-" + "message-input\"'\n"
+    _URL_FRAG       = "url = 'https://www.tiktok." + "com/messages?id=1'\n"
+    planted = [
+        ("import_tiktok_sender",          _IMPORT_FRAG),
+        ("qualified_tiktok_sender_call",  _QUAL_CALL_FRAG),
+        ("dm_message_input_selector",     _SELECTOR_FRAG),
+        ("tiktok_dm_url",                 _URL_FRAG),
+    ]
+    for sentinel_name, line in planted:
+        vs = mod.scan_text("backend/server.py", line)
+        ok = any(v.sentinel == sentinel_name for v in vs)
+        rep.add(f"public_action_guard_catches[{sentinel_name}]",
+                "public_action_guard", ok,
+                f"hits={[v.sentinel for v in vs]}")
+
+    # 3. Allow-listed file produces no violations
+    vs = mod.scan_text("bot/tiktok_bot.py", _IMPORT_FRAG + _SELECTOR_FRAG)
+    rep.add("public_action_guard_allowlist", "public_action_guard",
+            len(vs) == 0, f"violations={len(vs)}")
+
+    # 4. Escape hatch suppresses an otherwise-flagged line
+    vs = mod.scan_text(
+        "backend/server.py",
+        _IMPORT_FRAG.rstrip("\n") + "  # ci: public-action ok\n",
+    )
+    rep.add("public_action_guard_escape_hatch", "public_action_guard",
+            len(vs) == 0, f"violations={len(vs)}")
+
+
 def _load_nl_cohort(path: Path = NL_COHORT_PATH) -> list[dict]:
     """Read the NL eval cohort JSONL. Blank lines and `#` comments allowed."""
     if not path.exists():
@@ -2325,6 +2410,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_weekly_jobs(rep)
     if category in (None, "nl_cohort"):
         eval_nl_cohort(rep)
+    if category in (None, "public_action_guard"):
+        eval_public_action_guard(rep)
 
     rep.finished_at = time.time()
     return rep

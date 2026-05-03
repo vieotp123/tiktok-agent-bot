@@ -32,6 +32,15 @@ else
     bad "py_compile FAILED"
 fi
 
+# 1b. Public-action CI guard — no TikTok send/post calls outside
+#     bot/tiktok_bot.py without /confirm_action. See
+#     scripts/ci_public_action_guard.py and docs/OPERATING_RULES.md §3.
+if "$PYTHON" "$REPO"/scripts/ci_public_action_guard.py >/dev/null 2>&1; then
+    ok "public-action guard clean"
+else
+    bad "public-action guard FAILED — run scripts/ci_public_action_guard.py"
+fi
+
 # 2. systemd services
 for svc in tiktok-bot tiktok-backend tiktok-telegram; do
     state=$(systemctl is-active "$svc" 2>/dev/null || true)
