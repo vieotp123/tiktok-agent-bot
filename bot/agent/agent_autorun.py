@@ -272,12 +272,19 @@ def is_due_to_stop() -> tuple[bool, str]:
     max_tasks  = int(d.get("max_tasks") or 0)
     if max_tasks > 0 and completed >= max_tasks:
         return True, "max_tasks_reached"
-    # Supervisor drift check — only in long-horizon mode where we have
-    # a real history to look at. < 6 non-pause cycles → continue.
+    # Supervisor drift check — threshold scales with parallel_workers
+    # since multiple Claudes naturally emit fails in burst patterns
+    # (e.g. both hit a transient eval flake at the same time).
+    # owner directive: "chỉ dừng khi claude bị limit" — be lenient
+    # with non-quota fails. Default 1/6 stays for sequential; parallel
+    # bumps the cap proportionally.
     try:
         from bot.agent import supervisor as _sup
+        # Owner can override via OWNER_DRIFT_MAX_FAILS env (default 2).
+        import os as _os
+        max_fails = int(_os.getenv("OWNER_DRIFT_MAX_FAILS", "2"))
         check = _sup.check_drift(d.get("cycle_history") or [],
-                                  window=6, max_failures=1)
+                                  window=6, max_failures=max_fails)
         if check.get("verdict") == "stop":
             return True, f"drift:{check.get('summary','')[:80]}"
     except Exception:

@@ -865,14 +865,15 @@ def eval_agent_autorun_state(rep: EvalReport) -> None:
                 f"paused_reason={s.get('paused_reason')}")
 
         # Owner directive 2026-05-03: stop logic moved from
-        # "2 consecutive failures" → supervisor drift threshold
-        # (>1 critical fail in last 6 non-pause cycles).
-        # Need >= 6 non-pause cycles + 2 critical fails to trip stop.
-        # Replay history with 5 wins + 2 fails → drift verdict=stop.
-        for _ in range(5):
+        # "2 consecutive failures" → supervisor drift threshold.
+        # Threshold loosened to 2/6 for parallel-worker mode (was 1/6
+        # but parallel cycles emit fail bursts naturally).
+        # Need >= 6 non-pause cycles + 3 critical fails to trip stop.
+        for _ in range(3):
             _aa.record_outcome({"status": "done", "task_id": "tw"})
         _aa.record_outcome({"status": "worker_failed", "task_id": "t3"})
         _aa.record_outcome({"status": "smoke_failed",  "task_id": "t4"})
+        _aa.record_outcome({"status": "evals_failed",  "task_id": "t5"})
         should, reason = _aa.is_due_to_stop()
         rep.add("autorun_due_drift", "agent_autorun",
                 should and reason.startswith("drift"),
