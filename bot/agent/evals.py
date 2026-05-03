@@ -2120,6 +2120,68 @@ def eval_intent_stats_wired(rep: EvalReport) -> None:
             "telegram_bot must call intent_stats.record_and_check")
 
 
+def eval_lead_score(rep: EvalReport) -> None:
+    """Lock the LLM lead-score parser + regex baseline.
+
+    The LLM call itself is not exercised here (would hit the network);
+    we lock the parser invariants and confirm both call sites import
+    `compute_lead_score_llm` so the regex baseline never silently
+    re-takes the live path.
+    """
+    try:
+        from bot.business_store import (
+            compute_lead_score, parse_lead_score, compute_lead_score_llm,
+        )
+    except Exception as e:
+        rep.add("lead_score_import", "lead_score", False,
+                f"import failed: {e}")
+        return
+    rep.add("lead_score_import", "lead_score", True, "imports ok")
+
+    parser_cases: list[tuple[str, int | None]] = [
+        ('{"score": 75, "reason": "asks price"}', 75),
+        ('{"score": 999}',                        100),
+        ('{"score": -10}',                          0),
+        ('  82  ',                                 82),
+        ('Score: 90 — clearly buying',             90),
+        ('150',                                   100),
+        ('-5',                                      0),
+        ('',                                     None),
+        ('no number here',                       None),
+    ]
+    for raw, want in parser_cases:
+        got = parse_lead_score(raw)
+        rep.add(f"parse_lead_score[{raw[:24]!r}]", "lead_score",
+                got == want, f"got={got} want={want}")
+
+    rep.add("regex_score_clamps_100", "lead_score",
+            compute_lead_score("giá sms hotspot gia hạn ngày data") == 100,
+            "regex baseline must clamp at 100")
+    rep.add("regex_score_zero_on_chitchat", "lead_score",
+            compute_lead_score("hello bro") == 0,
+            "chitchat must score 0 on regex baseline")
+
+    import asyncio as _aio
+    rep.add("compute_lead_score_llm_is_async", "lead_score",
+            _aio.iscoroutinefunction(compute_lead_score_llm),
+            "LLM scorer must be async")
+
+    import inspect as _inspect
+    try:
+        from backend import server as _srv
+        from bot import telegram_bot as _tb
+    except Exception as e:
+        rep.add("lead_score_call_sites_import", "lead_score", False,
+                f"import failed: {e}")
+        return
+    rep.add("backend_uses_llm_scorer", "lead_score",
+            "compute_lead_score_llm" in _inspect.getsource(_srv),
+            "backend/server.py must call compute_lead_score_llm")
+    rep.add("telegram_uses_llm_scorer", "lead_score",
+            "compute_lead_score_llm" in _inspect.getsource(_tb),
+            "telegram_bot.py must call compute_lead_score_llm")
+
+
 def _load_nl_cohort(path: Path = NL_COHORT_PATH) -> list[dict]:
     """Read the NL eval cohort JSONL. Blank lines and `#` comments allowed."""
     if not path.exists():
@@ -2252,6 +2314,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
     if category in (None, "intent_stats"):
         eval_intent_stats(rep)
         eval_intent_stats_wired(rep)
+    if category in (None, "lead_score"):
+        eval_lead_score(rep)
     if category in (None, "daily_jobs"):
         eval_daily_jobs(rep)
     if category in (None, "weekly_jobs"):

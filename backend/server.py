@@ -22,7 +22,7 @@ from bot.tools import (
     search_web, format_search_results, is_search_query, extract_search_query,
 )
 from bot.business_store import (
-    detect_esim_intent, build_consult_reply, compute_lead_score,
+    detect_esim_intent, build_consult_reply, compute_lead_score_llm,
     add_consulting_log, upsert_lead, add_conversation,
 )
 from bot.memory_store import add_raw_event
@@ -305,7 +305,7 @@ async def handle_message(req: MessageRequest):
         # Customer-facing tone for TikTok DMs; admin tone elsewhere
         audience = "customer" if platform == "tiktok" else "admin"
         reply, product_ids, confidence = build_consult_reply(content, audience=audience)
-        score = compute_lead_score(content)
+        score = await compute_lead_score_llm(content)
         sender_key  = username
         sender_name = username
 

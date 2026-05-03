@@ -156,7 +156,7 @@ from bot.business_store import (
     init_business_db, seed_products_if_empty,
     list_products, add_product, update_product, get_product,
     verify_product, disable_product,
-    detect_esim_intent, build_consult_reply, compute_lead_score,
+    detect_esim_intent, build_consult_reply, compute_lead_score_llm,
     upsert_lead, get_lead, get_lead_by_sender, list_leads, add_conversation,
     add_consulting_log, list_consulting_logs,
     add_followup, list_followups,
@@ -1713,7 +1713,7 @@ async def handle_consult(text: str) -> str:
         return "Usage: /consult &lt;customer message&gt;"
     prefix = "" if detect_esim_intent(text) else "⚠️ Không detect intent eSIM rõ ràng, vẫn thử lookup:\n\n"
     reply, ids, confidence = build_consult_reply(text, audience="admin")
-    score = compute_lead_score(text)
+    score = await compute_lead_score_llm(text)
 
     # Log as Telegram-admin consult
     add_consulting_log(
@@ -2102,7 +2102,7 @@ async def handle_agent_autorun_start(arg: str = "",
                        # Claude Opus 4.7 is fast. 2s gives Telegram
                        # polling enough time to process admin messages
                        # between cycles without burning CPU.
-                       poll_interval_sec=2.0),
+                       poll_interval_sec=0.5),
     )
 
     # Surface the control panel as inline buttons so admin can pause /
@@ -4645,7 +4645,7 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
                 asyncio.create_task(
                     _aa.pump_loop(user="tg_admin",
                                    report_callback=_autorun_report,
-                                   poll_interval_sec=2.0),
+                                   poll_interval_sec=0.5),
                 )
                 # Also flip legacy claude_quota.autorun on so the
                 # _on_due scheduler tick fires bridge.run_batch when
@@ -5023,7 +5023,7 @@ async def bot_loop() -> None:
             asyncio.create_task(
                 _aa.pump_loop(user="tg_admin",
                                report_callback=_autorun_report_boot,
-                               poll_interval_sec=2.0),
+                               poll_interval_sec=0.5),
             )
             try:
                 await send_chat_reply(

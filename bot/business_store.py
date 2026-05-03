@@ -17,6 +17,7 @@ Rules:
   - All identifiers prefer (platform, sender_key) for cross-channel CRM.
 """
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -606,7 +607,8 @@ def _format_product_for_customer(p: dict) -> str:
 
 
 def compute_lead_score(query: str) -> int:
-    """Naive lead-scoring based on keyword signals in the query."""
+    """Naive lead-scoring based on keyword signals in the query.
+    Kept as deterministic baseline + LLM fallback for compute_lead_score_llm."""
     q = query.lower()
     score = 0
     if any(k in q for k in ("giá", "gia ", "bao nhiêu", "price", "cost")):
@@ -620,6 +622,87 @@ def compute_lead_score(query: str) -> int:
     if any(k in q for k in ("ngày", "ngay", "duration", "gb", "data")):
         score += 10
     return min(100, score)
+
+
+def parse_lead_score(text: str) -> Optional[int]:
+    """Extract an integer 0-100 from an LLM lead-scoring response.
+
+    Accepts: bare integer, JSON `{"score": N, ...}`, prefixed text. Returns
+    None if no plausible integer is found so callers can decide to fall
+    back to the regex baseline.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # Try JSON first — structured output is what we ask for.
+    try:
+        m = re.search(r'\{.*?\}', s, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            if isinstance(data, dict) and "score" in data:
+                n = int(float(data["score"]))
+                return max(0, min(100, n))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    # Fall back to first integer token.
+    m = re.search(r'-?\d{1,3}', s)
+    if not m:
+        return None
+    try:
+        return max(0, min(100, int(m.group(0))))
+    except ValueError:
+        return None
+
+
+_LEAD_SCORE_SYSTEM_PROMPT = (
+    "You score Vietnamese eSIM-Japan customer messages for purchase intent on a 0-100 scale.\n"
+    "  0  = no buying signal (chitchat, off-topic).\n"
+    " 25  = browsing / vague curiosity about eSIM.\n"
+    " 50  = asking about features, coverage, duration.\n"
+    " 75  = asking about price, comparing plans, picking one.\n"
+    "100  = ready to buy / asking how to pay or activate.\n"
+    "Respond with ONLY a JSON object: {\"score\": <int 0-100>, \"reason\": \"<≤60 chars>\"}.\n"
+    "No markdown, no extra prose."
+)
+
+
+async def compute_lead_score_llm(query: str, *, timeout: float = 6.0) -> int:
+    """LLM-based lead score 0-100 with regex fallback.
+
+    Replaces the regex baseline for live consult flows; the regex
+    `compute_lead_score` is still used when the LLM call fails, the model
+    is unreachable, or the response can't be parsed. Uses the `cheap`
+    role (gpt-4o-mini) — this runs on every customer DM, cost matters.
+    """
+    query = (query or "").strip()
+    if not query:
+        return 0
+    try:
+        from bot.llm_client import complete  # local import: avoid sync-context import cost
+        result = await complete(
+            messages=[
+                {"role": "system", "content": _LEAD_SCORE_SYSTEM_PROMPT},
+                {"role": "user", "content": query[:1000]},
+            ],
+            role="cheap",
+            temperature=0.0,
+            max_tokens=60,
+            timeout=timeout,
+            source="lead_score",
+        )
+    except Exception as e:
+        print(f"[lead_score] llm call error → regex fallback: {e}", flush=True)
+        return compute_lead_score(query)
+    if result.get("error"):
+        print(f"[lead_score] llm error={result.get('error_detail')} → regex fallback",
+              flush=True)
+        return compute_lead_score(query)
+    parsed = parse_lead_score(result.get("content") or "")
+    if parsed is None:
+        print(f"[lead_score] unparsable llm output → regex fallback: "
+              f"{(result.get('content') or '')[:80]!r}", flush=True)
+        return compute_lead_score(query)
+    return parsed
 
 
 def build_consult_reply(query: str, *, audience: str = "customer"
