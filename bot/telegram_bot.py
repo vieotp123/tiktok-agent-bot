@@ -124,6 +124,7 @@ from bot.memory_store import (
     list_lessons, format_lessons_list,
     add_memory, delete_memory, compact_memories,
     build_memory_context, list_memories,
+    update_memory_tags, add_lesson,
 )
 from bot.code_tasks import (
     init_db as init_code_tasks_db,
@@ -1428,6 +1429,115 @@ def handle_memory_context(query: str) -> str:
     if not ctx:
         return f"No memory context found for: <b>{_esc(query)}</b>"
     return f"<b>Memory context for:</b> {_esc(query)}\n\n<pre>{_esc(ctx[:3000])}</pre>"
+
+
+def handle_memory_tag(memory_id: int, tags: list[str],
+                      mode: str = "add") -> str:
+    """Attach (or replace/remove) tags on an existing memory row."""
+    if memory_id <= 0:
+        return ("Usage: <code>gắn tag &lt;tag&gt; cho memory &lt;id&gt;</code>"
+                " (lấy id từ <i>tìm trong memory ...</i>)")
+    if not tags:
+        return "❌ Cần ít nhất một tag."
+    res = update_memory_tags(memory_id, tags, mode=mode)
+    if res is None:
+        return f"❌ Memory <code>{memory_id}</code> không tồn tại."
+    log_action(user="tg_admin", action="memory_tag", risk_level="low",
+               status="ok",
+               result_summary=f"id={memory_id} mode={mode} "
+                              f"tags={','.join(tags)[:120]}")
+    tag_str = ", ".join(f"#{t}" for t in res["tags"]) or "(không có)"
+    return (f"🏷 Memory <code>{memory_id}</code> tags ({mode}): "
+            f"{_esc(tag_str)}")
+
+
+def handle_memory_related(target: str) -> str:
+    """Build a memory context preview for a task id or topic."""
+    target = (target or "").strip()
+    if not target:
+        return "Usage: <code>xem memory liên quan task &lt;id&gt;</code>"
+    query = target
+    extra: list[str] = []
+    if target.startswith("ctk_") or target.startswith("task_"):
+        try:
+            t = code_get_task(target)
+        except Exception:
+            t = None
+        if t:
+            query = (t.get("title") or "") + " " + (t.get("description") or "")
+            query = query.strip() or target
+            extra.append(f"<b>Task:</b> <code>{target}</code> — "
+                         f"{_esc(t.get('title', '')[:80])}")
+    ctx = build_memory_context(query, namespace="tg_admin")
+    if not ctx:
+        ctx = build_memory_context(query, namespace="global")
+    log_action(user="tg_admin", action="memory_related", risk_level="low",
+               status="ok",
+               result_summary=f"target={target[:80]} hit={bool(ctx)}")
+    head = "\n".join(extra) + ("\n\n" if extra else "")
+    if not ctx:
+        return head + (f"Không tìm thấy memory liên quan tới "
+                       f"<b>{_esc(target)}</b>.")
+    return head + (f"<b>Memory liên quan:</b> {_esc(target)}\n\n"
+                   f"<pre>{_esc(ctx[:3000])}</pre>")
+
+
+def handle_lessons_for_skill(skill: str) -> str:
+    """Vietnamese-NL wrapper around handle_lessons(skill)."""
+    skill = (skill or "").strip()
+    if not skill:
+        return "Usage: <code>lesson cho skill &lt;name&gt;</code>"
+    return handle_lessons(skill)
+
+
+def handle_learn_from_task(task_target: str) -> str:
+    """Record a lesson row from a code_task (by id or 'này' = last one)."""
+    target = (task_target or "").strip().lower()
+    if not target:
+        return "Usage: <code>học từ task &lt;id|này&gt;</code>"
+
+    task: dict | None = None
+    if target in ("này", "nay", "cuối", "gần nhất", "gannhat"):
+        for status in ("done", "running", "failed"):
+            rows = code_list_tasks(status=status, limit=1)
+            if rows:
+                task = rows[0]
+                break
+    else:
+        try:
+            task = code_get_task(target)
+        except Exception:
+            task = None
+
+    if not task:
+        return (f"❌ Không tìm thấy task <code>{_esc(target)}</code>. "
+                f"Gõ <code>/tasks</code> để xem danh sách.")
+
+    tid     = task.get("id", "")
+    title   = (task.get("title") or "")[:200]
+    summary = (task.get("test_summary") or task.get("deploy_summary")
+               or title or "(không có summary)")
+    status  = task.get("status", "")
+    outcome = ("success" if status == "done"
+               else "failure" if status == "failed"
+               else "partial")
+
+    lid = add_lesson(
+        skill="code_task",
+        outcome=outcome,
+        lesson_text=summary[:500],
+        task_id=tid,
+        namespace="tg_admin",
+        title=title,
+        tags=["code_task", outcome],
+        importance=5,
+    )
+    log_action(user="tg_admin", action="learn_from_task", risk_level="low",
+               status="ok",
+               result_summary=f"task={tid} lesson_id={lid} outcome={outcome}")
+    return (f"📚 Lesson <code>{lid}</code> đã ghi cho task "
+            f"<code>{tid}</code> ({outcome}).\n"
+            f"<i>{_esc(summary[:200])}</i>")
 
 
 # ── Sales / CRM handlers ──────────────────────────────────────────────────────
@@ -4442,6 +4552,23 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
             return handle_memory_forget(target)
         return ("Để xóa memory, gõ <code>/memory_forget &lt;id&gt;</code> "
                 "(lấy id từ <i>tìm trong memory ...</i>).")
+    if name == "memory_tag":
+        return handle_memory_tag(
+            int(intent.args.get("memory_id") or 0),
+            list(intent.args.get("tags") or []),
+        )
+    if name == "memory_related":
+        return handle_memory_related(
+            (intent.args.get("target") or raw_text).strip()
+        )
+    if name == "lessons_for_skill":
+        return handle_lessons_for_skill(
+            (intent.args.get("skill") or "").strip()
+        )
+    if name == "learn_from_task":
+        return handle_learn_from_task(
+            (intent.args.get("task_target") or "").strip()
+        )
 
     # ── Self-improve once ────────────────────────────────────────────────
     if name == "self_improve":

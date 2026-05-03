@@ -662,6 +662,47 @@ _PATTERNS_MEMORY_FORGET = (
     _RE(r"\b/?memory_forget\b\s*(.+)?", re.I),
 )
 
+# Memory tag — "gắn tag X cho memory 99" / "tag memory 12 với fragility"
+# Named groups so the dispatcher reads tags / id without index juggling.
+_PATTERNS_MEMORY_TAG = (
+    _RE(r"\b(?:gắn|đánh|set|add)\s+tag\s+(?P<tags>[A-Za-z0-9_,\-\s]+?)"
+        r"\s+(?:cho|for|to)\s+memory\s+(?P<id>\d+)", re.I),
+    _RE(r"\btag\s+memory\s+(?P<id>\d+)\s+(?:với|with|=)\s+"
+        r"(?P<tags>[A-Za-z0-9_,\-\s]+)", re.I),
+    _RE(r"\b/?memory_tag\s+(?P<id>\d+)\s+(?P<tags>.+)$", re.I),
+)
+
+# Memory related — "xem memory liên quan task ctk_xxx" /
+# "memory cho task ctk_xxx" / "memory về task X"
+_PATTERNS_MEMORY_RELATED = (
+    _RE(r"\b(?:xem|tìm|show)\s+memory\s+(?:liên\s+quan|cho|về|"
+        r"related\s+to|for)\s+(?:task\s+)?(.+)$", re.I),
+    _RE(r"^\s*memory\s+(?:liên\s+quan|cho|về|for)\s+(?:task\s+)?(.+)$",
+        re.I),
+    _RE(r"\b/?memory_related\s+(.+)$", re.I),
+)
+
+# Lessons for skill — "lesson cho skill X" / "xem lesson skill X" /
+# "bài học skill X"
+_PATTERNS_LESSONS_SKILL = (
+    _RE(r"\b(?:xem\s+)?lesson(?:s)?\s+(?:cho\s+|của\s+|for\s+)?"
+        r"skill\s+([A-Za-z0-9_\-]+)", re.I),
+    _RE(r"\b(?:xem\s+)?bài\s+học\s+(?:của\s+|cho\s+)?"
+        r"skill\s+([A-Za-z0-9_\-]+)", re.I),
+    _RE(r"\b/?lessons_skill\s+([A-Za-z0-9_\-]+)", re.I),
+)
+
+# Learn from task — "học từ task này" / "ghi lesson cho task ctk_xxx" /
+# "tạo lesson task ctk_xxx"
+_PATTERNS_LEARN_FROM_TASK = (
+    _RE(r"\bhọc\s+(?:từ|tu)\s+task\s+"
+        r"(này|nay|cuối|gần\s*nhất|[A-Za-z0-9_]+)", re.I),
+    _RE(r"\b(?:ghi|tạo|lưu)\s+lesson\s+(?:cho\s+|từ\s+)?task\s+"
+        r"([A-Za-z0-9_]+)", re.I),
+    _RE(r"\blesson\s+từ\s+task\s+"
+        r"(này|cuối|gần\s*nhất|[A-Za-z0-9_]+)", re.I),
+)
+
 _PATTERNS_SHOW_FILES = (
     _RE(r"\b(liệt\s*kê|xem|show|list)\s+(file|files)", re.I),
     _RE(r"\bfile\s+(gần\s*đây|recent|mới\s+nhất)\b", re.I),
@@ -1279,6 +1320,54 @@ def classify(text: str) -> Intent:
 
     # Memory NL — must come BEFORE generic self_improve so "nhớ là …"
     # doesn't get swallowed.
+    #
+    # Order inside this block matters: tag / related / lessons_skill /
+    # learn_from_task all use "memory" or "lesson" + extra keywords and
+    # must run BEFORE the broader add/search/forget patterns (e.g.
+    # "xem memory ..." would otherwise be greedily matched as
+    # memory_search even when a "liên quan task ..." suffix is present).
+    for p in _PATTERNS_MEMORY_TAG:
+        m = p.search(t)
+        if m:
+            gd  = m.groupdict()
+            try:
+                mid = int(gd.get("id") or 0)
+            except (TypeError, ValueError):
+                mid = 0
+            raw = (gd.get("tags") or "").strip()
+            tags = [x.strip().lower()
+                    for x in re.split(r"[,\s]+", raw) if x.strip()]
+            if mid > 0 and tags:
+                return Intent("memory_tag", 0.9,
+                              f"Gắn tag {tags} cho memory {mid}.",
+                              {"memory_id": mid, "tags": tags},
+                              "low", False)
+    for p in _PATTERNS_MEMORY_RELATED:
+        m = p.search(t)
+        if m:
+            target = (m.group(1) or "").strip().rstrip("?.,!")
+            if target:
+                return Intent("memory_related", 0.85,
+                              "Tìm memory liên quan tới task / chủ đề.",
+                              {"target": target}, "low", False)
+    for p in _PATTERNS_LESSONS_SKILL:
+        m = p.search(t)
+        if m:
+            skill = (m.group(1) or "").strip()
+            if skill:
+                return Intent("lessons_for_skill", 0.9,
+                              f"Xem lessons cho skill {skill}.",
+                              {"skill": skill}, "low", False)
+    for p in _PATTERNS_LEARN_FROM_TASK:
+        m = p.search(t)
+        if m:
+            target = (m.group(1) or "").strip()
+            if target:
+                return Intent("learn_from_task", 0.85,
+                              "Ghi lesson từ một task (theo id hoặc "
+                              "task gần nhất).",
+                              {"task_target": target}, "low", False)
+
     for p in _PATTERNS_MEMORY_ADD:
         m = p.search(t)
         if m:

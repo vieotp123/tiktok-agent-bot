@@ -330,6 +330,59 @@ def delete_memory(memory_id: int) -> bool:
     return True
 
 
+def update_memory_tags(
+    memory_id: int,
+    tags: list[str],
+    *,
+    mode: str = "add",
+) -> dict | None:
+    """Update tags for a memory. mode = add | set | remove.
+
+    Returns {"id", "tags"} on success, None if the memory doesn't exist.
+    Tags are normalised: stripped, lowercased, deduped, empties dropped.
+    """
+    norm = []
+    seen: set[str] = set()
+    for t in tags or []:
+        t = (t or "").strip().lower()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        norm.append(t)
+
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, tags FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            current = json.loads(row["tags"] or "[]")
+            if not isinstance(current, list):
+                current = []
+        except Exception:
+            current = []
+
+        if mode == "set":
+            merged = norm
+        elif mode == "remove":
+            drop = set(norm)
+            merged = [t for t in current if t not in drop]
+        else:  # add
+            merged = list(current)
+            existing = set(current)
+            for t in norm:
+                if t not in existing:
+                    merged.append(t)
+                    existing.add(t)
+
+        conn.execute(
+            "UPDATE memories SET tags=?, updated_at=? WHERE id=?",
+            (json.dumps(merged), _now(), memory_id),
+        )
+    return {"id": memory_id, "tags": merged}
+
+
 def compact_memories(namespace: str = "global", keep_top: int = 50) -> int:
     """
     Delete low-importance old memories beyond keep_top.
