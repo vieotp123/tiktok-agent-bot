@@ -4486,6 +4486,13 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     if name == "agent_progress":
         return await handle_agent_progress()
 
+    # ── Show logs — admin asking "Xem log" / "Check log xem" ─────────
+    # Owner saw bot reply "tao k truy cập log" because the chat
+    # fallback hallucinated the limitation. handle_logs() exists and
+    # reads journalctl just fine.
+    if name == "show_logs":
+        return await handle_logs()
+
     # ── EsimAccess intents ───────────────────────────────────────────────
     if name == "esim_docs":
         return handle_esim_docs()

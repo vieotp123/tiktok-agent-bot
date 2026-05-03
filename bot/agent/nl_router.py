@@ -593,6 +593,36 @@ _PATTERNS_AGENT_PROGRESS = (
     _RE(r"^\s*đang\s+sao\s*[\?!\.]*$", re.I),
     _RE(r"^\s*tới\s+đâu\s+(rồi)?\s*[\?!\.]*$", re.I),
     _RE(r"^\s*how\s*'?s\s+it\s+going\s*[\?!\.]*$", re.I),
+    # "Claude có đang chạy ko" / "worker còn sống không" — admin
+    # checking the live worker. Without this, falls to chat → LLM
+    # hallucinates "tao k kiểm tra tiến trình bên máy m" (it CAN —
+    # the progress panel reads `ps` for Claude PID + alive time).
+    _RE(r"\bclaude\s+(có\s+)?(đang\s+)?(còn\s+)?chạy\s+(không|ko|hông)\b",
+        re.I),
+    _RE(r"\bclaude\s+(còn\s+)?sống\s+(không|ko|hông)\b", re.I),
+    _RE(r"\bworker\s+(có\s+)?(còn\s+)?(sống|chạy|alive)\s+"
+        r"(không|ko|hông)\b", re.I),
+    _RE(r"\b(có\s+)?(task|claude|worker)\s+nào\s+đang\s+chạy\s+"
+        r"(không|ko|hông)?\b", re.I),
+    _RE(r"\b(check|kiểm\s*tra)\s+(claude|worker|process)\s+"
+        r"(còn|đang|live)?", re.I),
+)
+
+
+# ── Show logs — admin asking to see recent journal/worker logs ──────────────
+# Owner saw bot reply "tao k truy cập log" when typing "Xem log" / "Check
+# log xem". Bot HAS handle_logs() that reads journalctl. These patterns
+# route the natural-language ask to that handler instead of chat fallback.
+_PATTERNS_SHOW_LOGS = (
+    _RE(r"^\s*(xem|coi|show|check|kiểm\s*tra)\s+log[s]?\s*[\?!\.]*$",
+        re.I),
+    _RE(r"^\s*(check|kiểm\s*tra)\s+log\s+(xem|đi|nha)\s*[\?!\.]*$", re.I),
+    _RE(r"\b(xem|coi|đọc)\s+log\s+(bot|telegram|tiktok|backend|"
+        r"systemd|journalctl|service)\b", re.I),
+    _RE(r"\b(tail|đọc|coi)\s+log\s+(gần\s+)?(nhất|đây|recent)?\b", re.I),
+    _RE(r"\blog\s+(bot|telegram|tiktok|backend|service)\s+(đâu|sao)",
+        re.I),
+    _RE(r"^\s*/?logs?\s*[\?!\.]*$", re.I),
 )
 
 # ── EsimAccess / API integration intents ────────────────────────────────────
@@ -1233,6 +1263,12 @@ def classify(text: str) -> Intent:
         return Intent("agent_progress", 0.95,
                       "Báo cáo tiến độ task hiện tại + "
                       "autorun + claude.",
+                      {}, "low", False)
+
+    # ── Show logs — admin asking to see recent system/worker logs ────
+    if _has_any(t, _PATTERNS_SHOW_LOGS):
+        return Intent("show_logs", 0.95,
+                      "Hiện log gần đây từ journalctl + worker.",
                       {}, "low", False)
 
     # ── System / network high-risk action — needs confirm ───────────
