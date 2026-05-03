@@ -76,11 +76,17 @@ attempted in this session.
       `v3_cross`, `v3_explain_*`, `v3_regress`, `v3_table_*`).
       `/agent_evals` total now 350/350 in ~3s.
 
-- [ ] Brain context builder — when answering a free-form admin
-      question (chat fallback), inject the most relevant 3-5 memories,
-      last 10 audit entries, current autorun state, and current
-      pending_actions into the LLM system prompt. Touch
-      `backend/server.py` chat path. Add evals: context relevance.
+- [x] Brain context builder — `bot/agent/brain_context.py`
+      `build_admin_brain_context(query)` builds a compact 4000-char
+      system block (5 most relevant `tg_admin` memories, last 10 audit
+      entries, current `agent_autorun.state()`, active pending_actions).
+      Wired into `backend/server.py::call_llm` only when
+      `source == "telegram"` and `username.startswith("tg_admin")` so
+      tiktok_chat / file_summary / search paths never see admin
+      internals. Defensive imports + try/except keep chat alive on
+      flaky DB; raw `payload_json` is never inlined. 9 new evals in
+      `brain_context` category (return type, char cap, no payload_json
+      leak, header-if-data, no-raise on empty/odd queries, wiring guard).
 
 - [ ] Skill auto-suggest — on every admin message, log the chosen
       intent and a short reason; surface "Bro hay dùng X" suggestions
