@@ -107,6 +107,11 @@ while not paused and queue not empty:
 - **Never install random packages** outside the existing `venv`.  If
   you need a new dependency, add it to `requirements.txt` only and
   flag it in your task summary.
+- **Never raise a role's `max_tokens` cap** above the values fixed in
+  `docs/OPERATING_RULES.md` §14.1, and never add a `complete()` call
+  without an explicit `max_tokens=` argument. If the work needs more
+  budget, split it across calls or queue a follow-up `code_task` with
+  `(token-budget waiver)` in the description (§14.5).
 
 ## 4. Token handling
 

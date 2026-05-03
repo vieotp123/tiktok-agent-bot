@@ -163,5 +163,9 @@ attempted in this session.
   `scripts/smoke_test.sh` (check 1b) and `bot/agent/evals.py`
   (`public_action_guard` category — clean-tree + sentinel coverage +
   allow-list + per-line `# ci: public-action ok` escape hatch).
-- [ ] Add per-worker token-budget limits so a runaway loop can't burn
-  through the 9Router quota.
+- [x] Add per-worker token-budget limits so a runaway loop can't burn
+  through the 9Router quota. Contract documented in
+  `docs/OPERATING_RULES.md` §14 (per-call caps, per-cycle and per-day
+  budgets, runtime enforcement via `bot/agent/supervisor.py`, escape
+  hatch for legitimate multi-step research goals). Cross-linked from
+  `docs/CLAUDE_CODE_WORKER.md` §3.

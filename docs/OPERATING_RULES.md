@@ -234,3 +234,94 @@ The risk classifier in `bot/agent/risk.py` matches `auto-dm`,
 annotation. Any future roadmap item touching this area must therefore
 flow through `bot.agent.permissions.create_pending` — not through a
 queued `code_task`.
+
+## 14. Per-worker token-budget limits
+
+A *runaway loop* is any worker that keeps emitting LLM calls past its
+intended unit of work — a stuck retry, a planner that re-plans the
+same goal, an autorun cycle that fails to converge. The 9Router quota
+is shared across every worker, so one runaway can starve the TikTok
+responder, the Telegram admin loop, and the code worker at once. To
+prevent that, every worker MUST respect the per-call, per-cycle, and
+per-day budgets below. Cross-references:
+`docs/SELF_OPERATING_AGENT.md` §6 (model policy) and §14 (failure
+handling); `docs/CLAUDE_CODE_WORKER.md` §3 (hard rules).
+
+### 14.1 Per-call ceilings (hard cap)
+
+`bot.llm_client.complete(role=..., max_tokens=N)` — `N` must NEVER
+exceed the role's documented ceiling. The numbers below are the caps
+in force today and the upper bound any new caller must stay under.
+
+| Role             | `max_tokens` cap | Typical use                       |
+|------------------|------------------|-----------------------------------|
+| `chat`           | 600              | Telegram / TikTok normal reply    |
+| `telegram_chat`  | 600              | Telegram admin reply              |
+| `tiktok_chat`    | 600              | TikTok DM reply                   |
+| `search_summary` | 600              | DDG result summarisation          |
+| `reasoning`      | 3500             | planner / supervisor LLM explain  |
+| `coding`         | 3500             | `prompt_builder` LLM refine       |
+| `critic`         | 1500             | code review pass                  |
+| `vision`         | 1000             | OCR / image description           |
+| `cheap`          | 400              | one-shot cheap fallback           |
+
+A caller that needs more MUST either split the work across multiple
+calls or queue a `code_task` with `risk≥medium` so the admin sees it
+in `/audit_recent`. No silent inflation.
+
+### 14.2 Per-cycle budget (soft cap, per autorun cycle)
+
+One autorun cycle = one `coding_worker_bridge` invocation = one
+Claude/Codex CLI session for one `code_task`. The contract:
+
+- chat-grade calls (`chat` / `telegram_chat` / `tiktok_chat` /
+  `search_summary`) — **≤ 8 calls / cycle**.
+- `reasoning` / `coding` calls — **≤ 4 calls / cycle**.
+- `critic` calls — **≤ 2 calls / cycle**.
+
+If a single cycle blows past either ceiling, the bridge MUST record
+the cycle as `budget_exceeded` (a critical status under
+`bot/agent/supervisor.py::CRITICAL_STATUSES`). The existing drift
+halt (>1 critical fail in 6 non-pause cycles) then stops the loop on
+the second consecutive blow-out — see `docs/SELF_OPERATING_AGENT.md`
+§14.
+
+### 14.3 Per-day budget (soft cap, per worker role)
+
+A 24h rolling window per role:
+
+- chat-grade roles combined — **≤ 800 calls / day**.
+- `reasoning` / `coding` combined — **≤ 200 calls / day**.
+- `critic` — **≤ 80 calls / day**.
+
+These numbers track the historical 9Router quota with ~30 % headroom.
+Anything above is by definition a runaway and MUST page the admin via
+`bot.telegram_report` with a summary that fits in 200 chars and never
+includes the request payload.
+
+### 14.4 How to enforce
+
+1. **Static — read this section before adding ANY new `complete()`
+   call.** A reviewer (human or `/ultrareview`) MUST reject a PR that
+   adds an LLM call without an explicit `max_tokens=` argument or
+   that raises a role's cap.
+2. **Runtime — `bot/agent/supervisor.py::check_drift()` already
+   halts an autorun after >1 critical failure in 6 non-pause cycles.**
+   `budget_exceeded` is a critical status, so the existing halt
+   covers the per-cycle ceiling automatically once a worker begins
+   emitting that status.
+3. **External — quota errors from 9Router (HTTP 429 / response field
+   `quota_limited`) are PAUSE statuses, never critical.** Autorun
+   pauses and resumes per the rule in
+   `docs/SELF_OPERATING_AGENT.md` §14, never hard-stops. This
+   protects against legitimate quota throttling without conflating
+   it with a buggy worker.
+
+### 14.5 Escape hatch
+
+A genuine multi-step research goal that needs more than the
+per-cycle ceiling MUST be queued as a `code_task` with `risk=medium`
+and the description MUST contain the literal substring
+`(token-budget waiver)`. The supervisor surfaces such tasks in
+`/audit_recent` so the admin can audit them after the fact. No
+silent overrides; no waiver implies blanket future approval.
