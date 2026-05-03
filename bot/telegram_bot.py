@@ -4167,6 +4167,18 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
         intent = classify(text)
         log(f"nl_intent={intent.name} conf={intent.confidence:.2f} "
             f"risk={intent.risk_level} req_confirm={intent.requires_confirm}")
+        try:
+            from bot.agent.intent_stats import record_and_check
+            tip = record_and_check(intent.name,
+                                   reason=intent.summary_vi or "",
+                                   raw_text=text)
+            if tip:
+                try:
+                    await send_chat_reply(chat_id, tip)
+                except Exception:
+                    pass
+        except Exception as _e:
+            log(f"intent_stats record error: {_e}")
         if intent.name not in ("chat", "unknown"):
             handled = await _handle_nl_intent(intent, chat_id, text)
             if handled is not None:

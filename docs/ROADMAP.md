@@ -88,9 +88,18 @@ attempted in this session.
       `brain_context` category (return type, char cap, no payload_json
       leak, header-if-data, no-raise on empty/odd queries, wiring guard).
 
-- [ ] Skill auto-suggest — on every admin message, log the chosen
-      intent and a short reason; surface "Bro hay dùng X" suggestions
-      after N uses. Build `bot/agent/intent_stats.py`. Add evals.
+- [x] Skill auto-suggest — `bot/agent/intent_stats.py` records every
+      admin NL intent (`record_intent` / `record_and_check`) with the
+      classifier's `summary_vi` reason and last few raw-text samples
+      to `data/intent_stats.json` (gitignored, atomic write). Wired
+      into `bot/telegram_bot.py` next to the existing `nl_intent=...`
+      log line, so every admin message bumps the counter. After N
+      uses (default 5) the next admin message gets a "💡 Bro hay
+      dùng X" tip — fires ONCE per intent (suppressed via
+      `suggested_intents`); chat / unknown / ambiguous are excluded
+      so fall-throughs never get suggested. New `intent_stats` eval
+      category locks counter / threshold-once / no-suggest-for-chat /
+      `top_intents` ordering / wiring presence.
 
 - [ ] Memory NL surface — beyond `nhớ là …` / `quên cái …`, support
       `gắn tag X cho memory Y`, `xem memory liên quan task Z`,

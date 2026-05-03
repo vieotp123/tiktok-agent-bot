@@ -1670,6 +1670,148 @@ def eval_brain_context(rep: EvalReport) -> None:
             "call_llm must guard injection by source+username")
 
 
+def eval_intent_stats(rep: EvalReport) -> None:
+    """Intent stats — log + threshold suggestion API.
+
+    Uses a temp state file so the live `data/intent_stats.json` is not
+    touched by evals. Locks the contract that the roadmap item promised:
+      - record_intent persists count + last_used + reason
+      - record_and_check returns a tip ONCE when threshold is crossed
+      - chat / unknown / ambiguous never get a suggestion
+      - top_intents returns sorted by count desc
+    """
+    import tempfile
+    from pathlib import Path as _Path
+    from bot.agent import intent_stats as _ist
+
+    orig = _ist._STATE_FILE
+    tmpdir = tempfile.mkdtemp(prefix="intent_stats_eval_")
+    _ist._STATE_FILE = _Path(tmpdir) / "intent_stats.json"
+    try:
+        # Empty state: no entries, no total
+        s0 = _ist.stats()
+        rep.add("intent_stats_empty_state", "intent_stats",
+                s0.get("total_messages") == 0
+                and s0.get("by_intent") == {}
+                and s0.get("suggested_intents") == [],
+                f"got={s0}")
+
+        # record_intent persists count + reason + last text
+        for _ in range(3):
+            _ist.record_intent("run_next_code_task",
+                               reason="match run-next stub",
+                               raw_text="chạy task tiếp")
+        s1 = _ist.stats()
+        bucket = s1["by_intent"].get("run_next_code_task") or {}
+        rep.add("intent_stats_count", "intent_stats",
+                bucket.get("count") == 3
+                and s1.get("total_messages") == 3,
+                f"got count={bucket.get('count')} "
+                f"total={s1.get('total_messages')}")
+        rep.add("intent_stats_reason_persisted", "intent_stats",
+                "run-next" in (bucket.get("last_reason") or ""),
+                f"reason={bucket.get('last_reason')}")
+        rep.add("intent_stats_last_used", "intent_stats",
+                bool(bucket.get("last_used_at")),
+                f"last_used_at={bucket.get('last_used_at')}")
+        rep.add("intent_stats_recent_texts_capped", "intent_stats",
+                len(bucket.get("recent_texts") or []) <= _ist.RECENT_TEXT_CAP,
+                f"recent={len(bucket.get('recent_texts') or [])}")
+
+        # threshold suggestion fires exactly ONCE
+        # Records 1..(threshold-1) inside record_and_check should return None,
+        # then the threshold-th call returns a tip; the (threshold+1)-th
+        # call returns None again (suppressed).
+        _ist.reset()
+        T = 4
+        tips = []
+        for i in range(1, T + 2):
+            t = _ist.record_and_check("skill_list",
+                                      reason="match skill-list",
+                                      raw_text=f"xem skills #{i}",
+                                      threshold=T)
+            tips.append(t)
+        # tips[0..T-2] None; tips[T-1] string; tips[T] None
+        non_none = [t for t in tips if t is not None]
+        rep.add("intent_stats_suggest_fires_once", "intent_stats",
+                len(non_none) == 1
+                and "skill_list" in (non_none[0] if non_none else ""),
+                f"non_none={len(non_none)} "
+                f"sample={(non_none[0][:60] if non_none else '')!r}")
+        rep.add("intent_stats_suggest_text_vi", "intent_stats",
+                non_none and "Bro hay dùng" in non_none[0],
+                f"sample={(non_none[0][:80] if non_none else '')!r}")
+
+        # chat / unknown / ambiguous never trigger a suggestion
+        _ist.reset()
+        for name in ("chat", "unknown", "ambiguous"):
+            tip_seen = None
+            for _ in range(_ist.DEFAULT_THRESHOLD + 3):
+                tip = _ist.record_and_check(name,
+                                            reason="fallthrough",
+                                            raw_text="hello?",
+                                            threshold=2)
+                if tip:
+                    tip_seen = tip
+                    break
+            rep.add(f"intent_stats_no_suggest[{name}]", "intent_stats",
+                    tip_seen is None,
+                    f"got={tip_seen!r}")
+
+        # top_intents returns sorted desc by count
+        _ist.reset()
+        for _ in range(7):
+            _ist.record_intent("run_next_code_task",
+                               reason="x", raw_text="r")
+        for _ in range(2):
+            _ist.record_intent("skill_list",
+                               reason="x", raw_text="s")
+        top = _ist.top_intents(5)
+        rep.add("intent_stats_top_sorted", "intent_stats",
+                len(top) == 2
+                and top[0]["name"] == "run_next_code_task"
+                and top[0]["count"] == 7
+                and top[1]["name"] == "skill_list"
+                and top[1]["count"] == 2,
+                f"top={top}")
+
+        # Empty intent name is a no-op (defensive)
+        _ist.reset()
+        _ist.record_intent("", reason="x", raw_text="x")
+        s2 = _ist.stats()
+        rep.add("intent_stats_empty_name_noop", "intent_stats",
+                s2.get("total_messages") == 0
+                and s2.get("by_intent") == {},
+                f"got={s2}")
+    finally:
+        _ist._STATE_FILE = orig
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def eval_intent_stats_wired(rep: EvalReport) -> None:
+    """Confirm telegram_bot wires intent_stats into the NL routing path
+    next to the existing classify() call.
+    """
+    import inspect
+    try:
+        from bot import telegram_bot as _tb
+    except Exception as e:
+        rep.add("intent_stats_telegram_import", "intent_stats",
+                False, f"import failed: {e}")
+        return
+    src = inspect.getsource(_tb)
+    rep.add("intent_stats_telegram_import", "intent_stats",
+            True, "telegram_bot importable")
+    rep.add("intent_stats_wired_in_handler", "intent_stats",
+            "intent_stats" in src
+            and "record_and_check" in src,
+            "telegram_bot must call intent_stats.record_and_check")
+
+
 async def run_all_evals(category: str | None = None) -> EvalReport:
     rep = EvalReport(started_at=time.time())
 
@@ -1725,6 +1867,9 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_nl_router_v3(rep)
     if category in (None, "brain_context"):
         eval_brain_context(rep)
+    if category in (None, "intent_stats"):
+        eval_intent_stats(rep)
+        eval_intent_stats_wired(rep)
 
     rep.finished_at = time.time()
     return rep
