@@ -477,7 +477,10 @@ _PATTERNS_AGENT_AUTORUN_START = (
         r"đến)\s+(khi|lúc)\s+(t|tao|tôi|owner|admin)?\s*(bảo|nói|kêu)?\s*"
         r"(dừng|stop)", re.I),
     _RE(r"\b/?agent_autorun_start\b", re.I),
-    _RE(r"\bautorun\s+(start|on|begin)\b", re.I),
+    _RE(r"\bautorun\s+(start|on|begin|bật)\b", re.I),
+    _RE(r"\bbật\s+autorun\b", re.I),
+    _RE(r"\bauto[\s_]?run\s+on\b", re.I),
+    _RE(r"\bbật\s+(auto[\s_]?run|tự\s*chạy)\b", re.I),
     # ── Self-improve flavour: "tự hoàn thiện agent đi" / "tự cải thiện
     # liên tục" / "làm tới khi hết quota" — same loop, but the start
     # handler will queue self_improve tasks when the queue empties
@@ -996,10 +999,22 @@ def classify(text: str) -> Intent:
         mins = parse_duration_vi(t) or 0
         m2 = re.search(r"\bchạy\s+(\d+)\s+task", t, re.I)
         max_tasks = int(m2.group(1)) if m2 else 0
+        # Owner sometimes appends "Autorun on" / "auto run khi reset"
+        # to the same message — propagate that flag so the handler can
+        # also enable agent_autorun in self-improve mode (resume work
+        # automatically when quota probe says available).
+        enable_autorun = bool(
+            re.search(r"\b(auto[\s_]?run|tự\s*chạy|chạy\s+tiếp)\b",
+                      t, re.I)
+            or re.search(r"\bkhi\s+(có|hồi|về)\s+quota\s+thì",
+                         t, re.I)
+        )
         return Intent("quota_schedule", 0.9,
                       "Hẹn lịch chạy lại Claude khi hồi quota.",
                       {"minutes": mins, "max_tasks": max_tasks,
-                       "raw": t}, "low", False)
+                       "raw": t,
+                       "enable_autorun": enable_autorun},
+                      "low", False)
 
     # 2.5 Tool Registry v2 — skill toggle / list. Checked early so
     # "tắt skill ocr_image" / "bật skill chat" / "xem skills" don't

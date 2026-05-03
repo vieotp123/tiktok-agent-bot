@@ -4432,6 +4432,7 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
     if name == "quota_schedule":
         mins      = int(intent.args.get("minutes") or 0)
         max_tasks = int(intent.args.get("max_tasks") or 0)
+        enable_autorun = bool(intent.args.get("enable_autorun"))
         replies = []
         if mins > 0:
             try:
@@ -4453,6 +4454,43 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
                                f"<b>{max_tasks}</b> task khi quota về.")
             except Exception as e:
                 replies.append(f"❌ autorun: {e}")
+        # Owner-friendly behaviour: "Claude bị limit rồi. 1h thử lại.
+        # Autorun on" — same message contains both the schedule and
+        # the autorun-on directive. Enable agent_autorun in
+        # self-improve mode so when probe says available, the loop
+        # automatically resumes pulling roadmap items.
+        if enable_autorun:
+            try:
+                from bot.agent import agent_autorun as _aa
+                # Default 24h / 999 tasks self-improve — same as
+                # "làm tới khi hết quota". Pump_loop will check
+                # can_probe_now() each tick; while paused, sleep until
+                # claude_quota's reset_at fires.
+                d = _aa.start(hours=24.0, max_tasks=999,
+                               objective="auto-resume after Claude quota reset",
+                               user="tg_admin",
+                               auto_self_improve=True)
+                # Spawn pump in background — survives this dispatch.
+                async def _autorun_report(text: str) -> None:
+                    try:
+                        await send_chat_reply(TG_ADMIN, text)
+                    except Exception:
+                        pass
+                asyncio.create_task(
+                    _aa.pump_loop(user="tg_admin",
+                                   report_callback=_autorun_report,
+                                   poll_interval_sec=2.0),
+                )
+                # Also flip legacy claude_quota.autorun on so the
+                # _on_due scheduler tick fires bridge.run_batch when
+                # the reset arrives (belt-and-braces).
+                _cq.set_autorun(True, max_tasks=max(1, max_tasks))
+                replies.append(
+                    "▶ <b>Agent Autorun bật self-improve mode</b> "
+                    "(24h / 999 task) — sẽ tự resume khi quota về. "
+                    "Pump loop ngủ trong lúc paused, không spam.")
+            except Exception as e:
+                replies.append(f"❌ agent_autorun start: {e}")
         replies.append("")
         replies.append(_cq.status_summary())
         return "\n".join(replies)

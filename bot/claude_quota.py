@@ -414,6 +414,12 @@ _LIMIT_PATTERNS = (
     re.compile(r"\blimit\s+reached",       re.I),
     re.compile(r"try\s+again\s+in",        re.I),
     re.compile(r"please\s+try\s+again",    re.I),
+    # Real Claude CLI wording observed in production rc=1 stderr:
+    # "You're out of extra usage · resets 12am (UTC)"
+    re.compile(r"out\s+of\s+(extra\s+)?usage", re.I),
+    re.compile(r"out\s+of\s+messages",     re.I),
+    re.compile(r"reach(?:ed)?\s+(?:your\s+)?(?:plan|usage)\s+limit", re.I),
+    re.compile(r"approaching\s+usage\s+limit", re.I),
 )
 _AUTH_PATTERNS = (
     re.compile(r"login\s+required",        re.I),
@@ -427,6 +433,29 @@ _RESET_AT_PATTERNS = (
     re.compile(r"resets?\s+at\s+([0-9T:\- ]+ ?(?:UTC|Z|[+\-]\d{2}:?\d{2})?)", re.I),
     re.compile(r"available\s+at\s+([0-9T:\- ]+ ?(?:UTC|Z|[+\-]\d{2}:?\d{2})?)", re.I),
 )
+
+# Wall-clock time-only patterns ("resets 12am (UTC)" / "resets at 5pm").
+# Resolved to the NEXT occurrence of that wall-clock in UTC.
+_RESET_TIME_OF_DAY_PATTERNS = (
+    re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})\s*(am|pm)\s*(?:\(?\s*UTC\s*\)?)?",
+               re.I),
+    re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})\s*(am|pm)?\s*"
+               r"(?:\(?\s*UTC\s*\)?)?",
+               re.I),
+)
+
+
+def _resolve_time_of_day_to_iso(hour12: int, minute: int, ampm: str) -> str:
+    """Convert "12am" (hour12=12, ampm='am') → next-occurrence UTC ISO."""
+    h24 = hour12 % 12
+    if (ampm or "").lower() == "pm":
+        h24 += 12
+    now = _dt.now(_tz.utc)
+    target = now.replace(hour=h24, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        from datetime import timedelta as _td
+        target = target + _td(days=1)
+    return target.strftime("%Y-%m-%dT%H:%M:%SZ")
 _RETRY_AFTER_PATTERNS = (
     re.compile(r"retry[- ]after[:\s]+(\d+)\s*(?:s|sec|seconds)?", re.I),
     re.compile(r"try\s+again\s+in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?(?:\s*(\d+)\s*s)?", re.I),
@@ -475,6 +504,28 @@ def parse_claude_error(text: str) -> dict:
                     continue
             if reset_at:
                 break
+    # Fallback: time-of-day patterns ("resets 12am UTC")
+    if not reset_at:
+        for p in _RESET_TIME_OF_DAY_PATTERNS:
+            m = p.search(text)
+            if not m:
+                continue
+            try:
+                groups = m.groups()
+                if len(groups) == 2:
+                    # hour + ampm
+                    h = int(groups[0])
+                    ampm = groups[1] or "am"
+                    reset_at = _resolve_time_of_day_to_iso(h, 0, ampm)
+                else:
+                    h = int(groups[0])
+                    mm = int(groups[1] or 0)
+                    ampm = groups[2] or "am"
+                    reset_at = _resolve_time_of_day_to_iso(h, mm, ampm)
+                if reset_at:
+                    break
+            except Exception:
+                continue
 
     retry_sec: Optional[int] = None
     # "retry-after: 123" pattern
@@ -707,8 +758,25 @@ def _on_due() -> None:
     # ── Agent autorun: resume long-horizon owner work loop ───────────
     # If an `agent_autorun` session is enabled, pump tasks until either
     # max_tasks reached, stop_at arrived, or another quota hit.
+    #
+    # Owner case: autorun was stopped earlier by `two_failures` (which
+    # was actually two Claude-limit failures the bridge mis-classified
+    # as worker_failed). When quota resets, the legacy `autorun` flag
+    # in claude_quota state is True (set by `set_autorun`) but
+    # agent_autorun is disabled. Revive agent_autorun in self-improve
+    # mode so the brain-capability loop continues.
     try:
         from bot.agent import agent_autorun as _aa
+        legacy_autorun_on = bool(d.get("autorun"))
+        if not _aa.is_enabled() and legacy_autorun_on:
+            msg_lines.append(
+                "▶ Agent autorun was off but legacy autorun=on — "
+                "starting self-improve mode now that quota's back.")
+            _aa.start(hours=24.0, max_tasks=999,
+                       objective="auto-resume after quota reset",
+                       user="claude_quota_scheduler",
+                       auto_self_improve=True)
+
         if _aa.is_enabled():
             should_stop, stop_reason = _aa.is_due_to_stop()
             if should_stop:
