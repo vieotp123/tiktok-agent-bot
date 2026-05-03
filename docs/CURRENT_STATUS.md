@@ -1,6 +1,60 @@
 # Current Status — Business Agent Platform
 
-_Last updated: 2026-05-02 (dev-agent branch — Autonomous Control Bridge v1)._
+_Last updated: 2026-05-03 (dev-agent branch — NL router v3 confidence calibration)._
+
+## NL router v3 — confidence calibration
+
+`bot/agent/nl_router.classify` (still deterministic, still no LLM)
+gained four guardrails so the backend chat fallback never has to
+hallucinate from a stale partial match:
+
+- **Ambiguous stubs** — `claude` / `task` / `code` / `tự` / `làm` /
+  `làm gì` / `chạy` (and `claude?`) return an `ambiguous` Intent
+  carrying a Vietnamese "ý anh là X hay Y?" prompt instead of
+  falling through to `chat`. Telegram's plain-text dispatcher picks
+  this up and asks the admin which path they meant. See
+  `_PATTERNS_AMBIGUOUS_STUB` and `_ambiguous_stub()` in
+  `bot/agent/nl_router.py`.
+- **Build-question routing** — capability questions
+  (`có tool X không` / `có cách nào để Y` / `bot làm được Z không` /
+  `how to A` / `agent chạy được … không` / `có thể … được không`)
+  classify as `build_missing_tool` so the agent offers to queue a
+  code_task instead of replying with a hallucinated "yes".
+  Pairs with the existing imperative `build_missing_tool` patterns
+  (Owner Tooling Doctrine §10).
+- **`explain_intent(text)`** — debug-friendly API that returns
+  `{intent, confidence, risk_level, requires_confirm, summary_vi,
+  args, translated, reason_vi}`. `reason_vi` is a Vietnamese
+  decision trail explaining what matched, whether translation
+  fired, and why we picked `chat` / `ambiguous` /
+  `build_missing_tool` when relevant.
+- **VN↔EN translation table** — `VN_EN_TABLE` (25 entries) +
+  `translate_command(text)` deterministically maps pure-English
+  imperatives (`stop` → `dừng`, `next` → `tiếp tục`, `list tasks`
+  → `liệt kê task`, `list skills` → `xem skills`, `remember` →
+  `nhớ`, etc.) before `classify()` runs. No-op the moment a
+  Vietnamese diacritic is present, so VN-first inputs are
+  untouched. Multi-word keys are matched longest-first
+  (`list tasks` wins over `list`).
+
+47 new evals in the `nl_router_v3` category lock the contract:
+
+- 8 `v3_stub` cases (each ambiguous stub → `ambiguous` + risk=low).
+- 10 `v3_build` cases (capability questions → `build_missing_tool`
+  + risk=medium).
+- 10 `v3_tr` cases + 3 `v3_tr_noop` cases (translation forward /
+  diacritic no-op).
+- 5 `v3_cross` cases (translate → classify end-to-end:
+  `stop` → `cancel_action`, `next` → `run_next_code_task`, …).
+- 3 `v3_explain_*` cases (keys present, ambiguous reason mentions
+  "stub", build reason mentions "build").
+- 6 `v3_regress` cases (`hello` still chat, `đồng ý` still
+  `confirm_action`, `dừng` still `cancel_action`, etc.).
+- 2 `v3_table_*` cases (table size ≥ 15, all keys lowercase).
+
+`/agent_evals` total: **350/350 in ~3s** (was 303/303 before v3).
+
+
 
 > **Worker validation:** Code worker CLI loop verified end-to-end with
 > task `ctk_a65f61badc` — smoke test, commit, push, finish, and

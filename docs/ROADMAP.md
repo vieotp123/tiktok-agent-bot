@@ -58,13 +58,23 @@ attempted in this session.
       Touch `bot/memory_store.py`, `bot/memory.py`, `bot/agent/runner.py`.
       Evals: 13 new in `memory_v2` category (dedup, decay, retry recall).
 
-- [ ] NL router v3 — confidence calibration (don't fall to chat when
-      a partial pattern matched; ask "ý anh là X hay Y?"), unknown-
-      intent → propose `build_missing_tool` automatically, intent
-      explanation API ("vì sao em hiểu thế"), and a deterministic
-      VN->EN intent translation table for cross-cultural commands.
-      Touch `bot/agent/nl_router.py`. Add 30+ new evals covering
-      ambiguous phrases.
+- [x] NL router v3 — confidence calibration. Short stub directives
+      (`claude` / `task` / `code` / `tự` / `làm` / `chạy`) now return
+      an `ambiguous` intent with a "ý anh là X hay Y?" prompt instead
+      of falling to chat where the backend would hallucinate from
+      stale state. Capability questions (`có tool X không` / `bot làm
+      được Y không` / `how to Z`) route to `build_missing_tool`
+      automatically. New `explain_intent(text)` API surfaces a
+      Vietnamese decision trail ("vì sao em hiểu thế") with the
+      matched intent, confidence, risk, and translation. New
+      `VN_EN_TABLE` + `translate_command()` deterministically maps
+      pure-English imperatives (`stop` / `next` / `list tasks` /
+      `list skills` / `remember` …) to their VN equivalents before
+      `classify()`, no-op when diacritics are present. All in
+      `bot/agent/nl_router.py`. 47 new evals in the `nl_router_v3`
+      category (`v3_stub`, `v3_build`, `v3_tr`, `v3_tr_noop`,
+      `v3_cross`, `v3_explain_*`, `v3_regress`, `v3_table_*`).
+      `/agent_evals` total now 350/350 in ~3s.
 
 - [ ] Brain context builder — when answering a free-form admin
       question (chat fallback), inject the most relevant 3-5 memories,
