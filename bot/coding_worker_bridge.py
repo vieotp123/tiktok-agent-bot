@@ -673,6 +673,18 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
     pre_snapshot = dirty_tree_snapshot()
     out["dirty_tree_before"] = pre_snapshot["dirty"]
     out["dirty_files_before"] = list(pre_snapshot["files"])
+    # Capture HEAD sha so we can detect Claude's self-commits. The
+    # autonomous Claude CLI now commits + pushes inside its own run
+    # (much cleaner than relying on the bridge's add+commit step). If
+    # HEAD moves during the run, the working tree will be CLEAN
+    # afterward and the bridge would otherwise report "no_changes" —
+    # confusing owner and wasting smoke+evals time. Compare HEAD
+    # before/after to detect this case.
+    pre_head_proc = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+    pre_head_sha = (pre_head_proc.stdout or "").strip()
     if pre_snapshot["dirty"] and not allow_dirty:
         # Leave the task queued so admin can stash/commit and retry.
         # Don't mark it failed.
@@ -836,6 +848,71 @@ async def run_once(*, dry_run: bool = False, user: str = "tg_admin",
         out["summary"] = (f"{tool.name} exited rc={rc} after {duration}s. "
                           f"Log: {log_path.name}")
         code_fail(nx["id"], test_summary=out["summary"][:300])
+        return out
+
+    # ── Detect Claude's self-commit fast-path ────────────────────────
+    # Claude CLI Opus 4.7 now does its OWN smoke+evals+commit+push
+    # inside the worker run. When that happens HEAD has moved and the
+    # working tree is clean. Trust Claude's own gates and skip the
+    # bridge's redundant smoke+evals (~20-30s saved per cycle). The
+    # auto-deploy hook still fires because we surface worker_changed
+    # via `git diff-tree HEAD~1 HEAD`.
+    post_head_proc = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+    post_head_sha = (post_head_proc.stdout or "").strip()
+    if post_head_sha and pre_head_sha and post_head_sha != pre_head_sha:
+        # Claude self-committed. Fast-path: report done immediately.
+        diff_proc = subprocess.run(
+            ["git", "-C", str(REPO), "diff-tree", "--no-commit-id",
+             "--name-only", "-r", post_head_sha],
+            capture_output=True, text=True, timeout=5,
+        )
+        worker_changed = [ln for ln in (diff_proc.stdout or "").splitlines()
+                           if ln.strip()]
+        out["worker_changed"] = worker_changed
+        out["self_committed"] = True
+
+        # Auto-deploy: same logic as bridge's own commit path.
+        deploy_summary = ""
+        services: list[str] = []
+        if any(f.startswith("bot/") for f in worker_changed):
+            services.append("tiktok-telegram")
+        if any(f.startswith("backend/") for f in worker_changed):
+            services.append("tiktok-backend")
+        if services:
+            try:
+                cmd = (f"sleep 6 && systemctl restart "
+                       f"{' '.join(services)} >/dev/null 2>&1")
+                subprocess.Popen(["nohup", "bash", "-c", cmd],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+                deploy_summary = (
+                    f"auto-deploy scheduled: restart "
+                    f"{', '.join(services)} in 6s")
+            except Exception as e:
+                deploy_summary = f"auto-deploy failed: {e}"
+
+        sha_short = post_head_sha[:7]
+        code_finish(nx["id"], commit_hash=sha_short,
+                    test_summary=(f"claude self-committed {sha_short}; "
+                                  f"bridge skipped redundant gates"),
+                    deploy_summary=deploy_summary)
+        out["status"]  = "done"
+        out["commit"]  = sha_short
+        out["deploy_summary"] = deploy_summary
+        out["summary"] = (f"worker done (self-commit fast-path). "
+                          f"tool={tool.name} duration={duration}s "
+                          f"commit={sha_short} log={log_path.name}"
+                          + (f" · {deploy_summary}" if deploy_summary else ""))
+        log_action(user=user, action="code_worker_done",
+                   risk_level="medium", status="done",
+                   result_summary=f"task={nx['id']} commit={sha_short} "
+                                  f"self_committed=yes "
+                                  f"deploy={'yes' if services else 'no'}")
         return out
 
     # smoke + evals are sync subprocess calls (10-30s each). Owner asked

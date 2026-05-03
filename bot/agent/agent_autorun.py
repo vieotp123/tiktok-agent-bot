@@ -513,30 +513,32 @@ def status_panel_vi() -> str:
 
 async def pump_loop(user: str = "tg_admin",
                      report_callback=None,
-                     poll_interval_sec: float = 5.0) -> None:
+                     poll_interval_sec: float = 5.0,
+                     parallel_workers: int = 1) -> None:
     """Continuously call advance_one() until is_due_to_stop() returns True.
 
-    Designed to be spawned as `asyncio.create_task(pump_loop(...))` from
-    the Telegram handler when admin starts autorun. Sends each task
-    result to report_callback (typically a wrapper around
-    send_chat_reply). Sleeps poll_interval_sec between cycles so we
-    don't hammer the bridge.
+    parallel_workers >= 2 spawns multiple concurrent worker coroutines,
+    each running its own bridge.run_once cycle on different queued
+    tasks. Burns Claude quota faster (owner directive 2026-05-03:
+    "làm cho mau hết quota hơn"). Each worker uses a distinct user
+    label (autorun_w0/w1/...) so audit + bridge logs are
+    distinguishable.
 
-    Pause behaviour:
-      - When advance_one returns a paused status (quota_limited /
-        auth_required / no_tool / interactive_only), the autorun state
-        records paused_reason + next_probe_at. The pump loop then
-        sleeps until next_probe_at and retries.
-      - The claude_quota scheduler tick may also pump us in parallel
-        when reset_at arrives — record_outcome is idempotent so the
-        race is safe.
-
-    Stop conditions (mirrors is_due_to_stop):
-      - state.enabled flipped to False (admin /agent_autorun_stop)
-      - stop_at reached (hours budget exhausted)
-      - completed_tasks >= max_tasks
-      - 2 consecutive non-quota failures
+    Risk: simultaneous Claude sessions can race on git operations.
+    Bridge already uses _filter_forbidden_staged + dirty-tree gate
+    + atomic add+commit; the new self-commit fast-path (in
+    coding_worker_bridge) detects HEAD movement and skips redundant
+    gates so two workers won't fight over the same commit slot.
+    Empirically OK at parallel_workers <= 3.
     """
+    if parallel_workers > 1:
+        return await _pump_loop_parallel(user, report_callback,
+                                           poll_interval_sec,
+                                           parallel_workers)
+    # Single-worker path (default + backward compat). Spawned as an
+    # asyncio.create_task by the Telegram handler. Sleeps
+    # poll_interval_sec between cycles. Pause behaviour: see
+    # can_probe_now(); stop conditions: see is_due_to_stop().
     import asyncio as _asy
 
     # Track local state to avoid spamming the same notification every
@@ -656,6 +658,125 @@ async def pump_loop(user: str = "tg_admin",
         # If paused, the next iteration will catch it via can_probe_now().
         # Otherwise short sleep to avoid runaway loop on fast no-changes.
         await _asy.sleep(poll_interval_sec)
+
+
+async def _pump_loop_parallel(user: str, report_callback,
+                                poll_interval_sec: float,
+                                parallel: int) -> None:
+    """Multi-worker pump. Each worker runs its own cycle stream.
+
+    Workers share state (cycle_history, attempted_items) via state(),
+    so they collectively walk the roadmap and won't double-pull the
+    same item (skip-list dedup in self_improve.self_improve_once).
+    """
+    import asyncio as _asy
+
+    parallel = max(2, min(int(parallel), 4))  # safety cap
+
+    async def _worker(idx: int) -> None:
+        wlabel = f"{user}_w{idx}"
+        last_pause_signature = ""
+        was_paused = False
+        while True:
+            should_stop, reason = is_due_to_stop()
+            if should_stop:
+                # First worker to detect stop calls stop()
+                stop(user=f"autorun_pump_w{idx}", reason=reason)
+                if report_callback and idx == 0:
+                    try:
+                        await report_callback(
+                            f"⏹ <b>Agent Autorun stopped</b> — "
+                            f"{_esc(reason)}",
+                        )
+                    except Exception:
+                        pass
+                return
+
+            if not can_probe_now():
+                d = state()
+                nxt = d.get("next_probe_at") or ""
+                pr  = d.get("paused_reason", "")
+                sig = f"{pr}|{nxt}"
+                if (idx == 0 and sig != last_pause_signature
+                        and report_callback):
+                    try:
+                        await report_callback(
+                            f"⏸ <b>Autorun paused</b> — {_esc(pr)}\n"
+                            f"Probe lại lúc <code>{_esc(nxt)}</code>. "
+                            f"All {parallel} workers idle.",
+                        )
+                    except Exception:
+                        pass
+                    last_pause_signature = sig
+                was_paused = True
+                await _asy.sleep(30)
+                continue
+
+            if was_paused and idx == 0 and report_callback:
+                try:
+                    await report_callback(
+                        f"▶ <b>Autorun resumed</b> — {parallel} workers "
+                        f"đang quẩy lại.",
+                    )
+                except Exception:
+                    pass
+                was_paused = False
+                last_pause_signature = ""
+
+            try:
+                result = await advance_one(user=wlabel)
+            except Exception as e:
+                if report_callback:
+                    try:
+                        await report_callback(
+                            f"⚠ Worker {idx} cycle error: "
+                            f"<code>{_esc(str(e))[:160]}</code>",
+                        )
+                    except Exception:
+                        pass
+                await _asy.sleep(15)
+                continue
+
+            rstatus = (result or {}).get("status", "?")
+            if report_callback and rstatus not in ("noop",):
+                try:
+                    tid = (result or {}).get("task_id", "")
+                    summ = ((result or {}).get("summary") or "")[:200]
+                    d = state()
+                    done = d.get("completed_tasks", 0)
+                    cap  = d.get("max_tasks", 0)
+                    icons = {
+                        "done": "✅", "no_changes": "💤",
+                        "quota_limited": "🚫", "auth_required": "🔒",
+                        "no_tool": "❌", "pending_action": "⏸",
+                        "worker_failed": "💥", "smoke_failed": "🚫",
+                        "evals_failed": "🚫", "commit_failed": "💥",
+                        "push_failed": "💥", "exec_error": "💥",
+                        "blocked_staged": "🛑",
+                    }
+                    icon = icons.get(rstatus, "•")
+                    msg = (f"{icon} <b>w{idx}</b> — task "
+                           f"<code>{_esc(str(tid))}</code> → "
+                           f"<i>{_esc(rstatus)}</i> ({done}/{cap})"
+                           + (f"\n  <i>{_esc(summ)}</i>" if summ else ""))
+                    await report_callback(msg)
+                except Exception:
+                    pass
+
+            # Stagger sleep so workers don't lockstep on the queue
+            await _asy.sleep(poll_interval_sec + idx * 0.3)
+
+    if report_callback:
+        try:
+            await report_callback(
+                f"🚀 <b>Spawning {parallel} parallel workers</b> — "
+                f"burn quota {parallel}× faster.",
+            )
+        except Exception:
+            pass
+
+    workers = [_asy.create_task(_worker(i)) for i in range(parallel)]
+    await _asy.gather(*workers, return_exceptions=True)
 
 
 async def advance_one(user: str = "tg_admin") -> dict:

@@ -2102,7 +2102,8 @@ async def handle_agent_autorun_start(arg: str = "",
                        # Claude Opus 4.7 is fast. 2s gives Telegram
                        # polling enough time to process admin messages
                        # between cycles without burning CPU.
-                       poll_interval_sec=0.5),
+                       poll_interval_sec=0.5,
+                       parallel_workers=2),
     )
 
     # Surface the control panel as inline buttons so admin can pause /
@@ -4645,7 +4646,8 @@ async def _handle_nl_intent(intent, chat_id, raw_text: str):
                 asyncio.create_task(
                     _aa.pump_loop(user="tg_admin",
                                    report_callback=_autorun_report,
-                                   poll_interval_sec=0.5),
+                                   poll_interval_sec=0.5,
+                       parallel_workers=2),
                 )
                 # Also flip legacy claude_quota.autorun on so the
                 # _on_due scheduler tick fires bridge.run_batch when
@@ -5023,7 +5025,8 @@ async def bot_loop() -> None:
             asyncio.create_task(
                 _aa.pump_loop(user="tg_admin",
                                report_callback=_autorun_report_boot,
-                               poll_interval_sec=0.5),
+                               poll_interval_sec=0.5,
+                       parallel_workers=2),
             )
             try:
                 await send_chat_reply(
