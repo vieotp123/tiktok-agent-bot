@@ -675,27 +675,39 @@ async def advance_one(user: str = "tg_admin") -> dict:
     # Self-improve auto-populate: if queue is empty AND we're in
     # self-improve mode AND not stopped yet, pull next roadmap item
     # and run once more.
+    #
+    # Owner case (2026-05-03): autorun paused 1h on
+    # "roadmap_high_risk_pending_action" because Verify-catalog item
+    # got tagged high-risk by classify_risk and self_improve created a
+    # pending_action (waiting on owner to upload real prices). But
+    # owner can't satisfy that without external data, so the pause
+    # blocks ALL further autorun work. Fix: when pending_action comes
+    # back, skip the item (it's already in attempted_items via
+    # populate_queue_from_roadmap) and try the NEXT roadmap item up to
+    # 5 attempts in one cycle. Only pause if still no actionable item.
     d = state()
     if (d.get("enabled") and d.get("auto_self_improve")
             and (result or {}).get("status") == "noop"):
-        pop = populate_queue_from_roadmap()
-        pop_status = (pop or {}).get("status", "")
-        if pop_status in ("queued", "existing_queue"):
-            # New task in queue — run it.
-            result2 = await bridge.run_once(user=user)
-            record_outcome(result2)
-            return result2
-        if pop_status == "pending_action":
-            # Next roadmap item is high-risk → wait for owner.
-            d["paused_reason"] = "roadmap_high_risk_pending_action"
-            from datetime import timedelta
-            nxt = (_now() + timedelta(hours=1)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ")
-            d["next_probe_at"] = nxt
-            _save(d)
-        elif pop_status == "noop":
-            # Roadmap exhausted → stop politely.
-            stop(user="autorun_pump", reason="roadmap_exhausted")
-        # status="error" or unknown → leave as queue_empty_will_self_improve
-        # (the next pump cycle will retry).
+        for _attempt in range(5):
+            pop = populate_queue_from_roadmap()
+            pop_status = (pop or {}).get("status", "")
+            if pop_status in ("queued", "existing_queue"):
+                # Got an actionable task — run it.
+                result2 = await bridge.run_once(user=user)
+                record_outcome(result2)
+                return result2
+            if pop_status == "pending_action":
+                # Next roadmap item is high-risk and went to
+                # pending_action (waits on owner confirm). The item
+                # is already in attempted_items from
+                # populate_queue_from_roadmap. Loop and pull the
+                # one AFTER it.
+                continue
+            if pop_status == "noop":
+                # Roadmap fully exhausted (all unchecked items
+                # already attempted this session) → stop politely.
+                stop(user="autorun_pump", reason="roadmap_exhausted")
+                return result
+            # status="error" or unknown → bail loop, retry next pump cycle
+            break
     return result
