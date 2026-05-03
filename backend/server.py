@@ -156,6 +156,18 @@ async def call_llm(username: str, content: str, source: str = "backend") -> tupl
     ]
     if mem:
         messages.append({"role": "system", "content": f"Memory về user:\n{mem}"})
+    # Admin chat fallback only: inject brain context (memories, audit,
+    # autorun state, pending_actions). Skipped for tiktok_chat / file
+    # summary / search paths so customer DMs never see admin internals.
+    if source == "telegram" and username.startswith("tg_admin"):
+        try:
+            from bot.agent.brain_context import build_admin_brain_context
+            ctx = build_admin_brain_context(content)
+        except Exception as e:
+            print(f"[backend] brain_context error: {e}", flush=True)
+            ctx = ""
+        if ctx:
+            messages.append({"role": "system", "content": ctx})
     for m in recent[-6:]:
         role = "user" if m["role"] == "user" else "assistant"
         messages.append({"role": role, "content": m["content"]})
