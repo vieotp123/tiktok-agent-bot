@@ -37,3 +37,4 @@ data/content_factory/
 data/skill_overrides.json
 data/intent_stats.json
 data/daily_jobs_state.json
+data/weekly_jobs_state.json

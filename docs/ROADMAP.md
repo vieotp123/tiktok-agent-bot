@@ -106,10 +106,14 @@ attempted in this session.
       `học từ task này`, `lesson cho skill X`. Touch
       `bot/agent/nl_router.py`, `bot/telegram_bot.py` (handlers).
 
-- [ ] NL eval suite — automated weekly eval that runs 200+ admin
+- [x] NL eval suite — automated weekly eval that runs 200+ admin
       phrases and reports classifier drift. Output → Telegram digest.
-      Touch `bot/agent/evals.py`. Add eval cohort file
-      `data/nl_eval_cohort.jsonl`.
+      Cohort lives at `data/nl_eval_cohort.jsonl` (≥200 entries) and is
+      replayed by the `nl_cohort` category in `bot/agent/evals.py`.
+      `bot/agent/weekly_jobs.py` wraps the replay in a per-ISO-week
+      idempotent scheduler that pipes the digest to
+      `bot.telegram_report.send_telegram_message`. CLI:
+      `python -m bot.agent.weekly_jobs [--force] [--no-telegram]`.
 
 ## Next — Business features (after brain layer)
 

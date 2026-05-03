@@ -12,8 +12,12 @@ Categories:
   8. tasks       — code_task lifecycle on the live DB
   9. prompt      — prompt_builder produces a usable Claude prompt
  10. nl_cohort   — 200+ admin-phrase drift suite for nl_router.classify()
-                   (cohort lives at data/nl_eval_cohort.jsonl; intended
-                   for a weekly digest piped to bot.telegram_report).
+                   (cohort lives at data/nl_eval_cohort.jsonl; the
+                   weekly digest is piped to bot.telegram_report by
+                   `bot.agent.weekly_jobs.run_weekly_jobs()`).
+ 11. weekly_jobs — per-ISO-week scheduler that runs the NL cohort drift
+                   digest and ships it to the admin chat. Idempotent
+                   via data/weekly_jobs_state.json.
 
 Runs in <30s. Safe to run on prod (read-only or transactional).
 
@@ -1823,6 +1827,157 @@ def eval_daily_jobs(rep: EvalReport) -> None:
             "must be in .gitignore")
 
 
+def eval_weekly_jobs(rep: EvalReport) -> None:
+    """Weekly-jobs scheduler — NL cohort drift digest + per-ISO-week
+    idempotency. Roadmap contract: 200+ admin phrases, weekly drift
+    digest piped to Telegram.
+
+    Locks:
+      - nl_cohort_drift_check accepts injected cases + classifier so the
+        live cohort and live classifier are not required.
+      - drift detection compares Intent.name against `intent`; matching
+        rows produce zero drift, mismatches surface in `drift_rows`.
+      - format_nl_cohort_drift_html: green when no drift, red when
+        ≥5% drift, escapes `<` so cohort phrases can't break the HTML.
+      - should_run_this_week / mark_ran_this_week round-trip via a temp
+        state file so `data/weekly_jobs_state.json` is untouched.
+      - run_weekly_jobs surfaces the nl_cohort_drift key and respects
+        the per-week skip; `force=True` re-runs without re-sending
+        Telegram (we pass send_telegram=False to keep the eval silent).
+      - State file path is under data/ and listed in .gitignore.
+    """
+    import tempfile
+    from datetime import datetime, timezone, timedelta
+    from pathlib import Path as _Path
+    from bot.agent import weekly_jobs as wj
+
+    class _FakeIntent:
+        def __init__(self, name: str, confidence: float = 0.9):
+            self.name = name
+            self.confidence = confidence
+
+    table = {
+        "hello": "chat",
+        "đăng bài lên TikTok": "create_code_task",   # cohort says high-risk
+        "giá btc": "btc_price",
+        "tìm thông tin eSIM Nhật": "search",
+    }
+
+    def fake_classify(text: str):
+        # "hello" intentionally drifts: cohort wants chat, classifier
+        # returns greeting → forces a drift row.
+        if text == "hello":
+            return _FakeIntent("greeting", 0.5)
+        return _FakeIntent(table.get(text, "unknown"), 0.7)
+
+    cases = [{"text": t, "intent": want, "tag": "test"}
+             for t, want in table.items()]
+
+    res = wj.nl_cohort_drift_check(cases_in=cases, classify_fn=fake_classify)
+    expected_keys = {"job", "run_at", "cohort_path", "total",
+                     "drift_count", "drift_rate", "drift_rows"}
+    rep.add("weekly_jobs_drift_shape", "weekly_jobs",
+            expected_keys.issubset(res.keys())
+            and res["job"] == "nl_cohort_drift",
+            f"keys={sorted(res.keys())}")
+    rep.add("weekly_jobs_drift_total", "weekly_jobs",
+            res["total"] == 4, f"total={res['total']}")
+    rep.add("weekly_jobs_drift_count", "weekly_jobs",
+            res["drift_count"] == 1
+            and res["drift_rows"][0]["text"] == "hello"
+            and res["drift_rows"][0]["got"] == "greeting"
+            and res["drift_rows"][0]["want"] == "chat",
+            f"drift={res['drift_rows']}")
+    rep.add("weekly_jobs_drift_rate", "weekly_jobs",
+            abs(res["drift_rate"] - 0.25) < 1e-6,
+            f"rate={res['drift_rate']}")
+
+    # No-drift path → green digest.
+    res_clean = wj.nl_cohort_drift_check(
+        cases_in=[{"text": "giá btc", "intent": "btc_price"}],
+        classify_fn=fake_classify,
+    )
+    html_clean = wj.format_nl_cohort_drift_html(res_clean)
+    rep.add("weekly_jobs_html_green_when_clean", "weekly_jobs",
+            "🟢" in html_clean and "100%" in html_clean,
+            f"html={html_clean[:80]}")
+
+    html_drift = wj.format_nl_cohort_drift_html(res)
+    rep.add("weekly_jobs_html_warn_when_drift", "weekly_jobs",
+            ("🟡" in html_drift or "🔴" in html_drift)
+            and "hello" in html_drift
+            and "&lt;" not in html_drift,  # nothing to escape in test data
+            f"html={html_drift[:80]}")
+
+    # Empty cohort → no crash, surfaced in the head text.
+    res_empty = wj.nl_cohort_drift_check(
+        cases_in=[], classify_fn=fake_classify,
+    )
+    html_empty = wj.format_nl_cohort_drift_html(res_empty)
+    rep.add("weekly_jobs_html_handles_empty", "weekly_jobs",
+            res_empty["total"] == 0 and "empty" in html_empty,
+            f"html={html_empty[:80]}")
+
+    # iso_week format: YYYY-W##.
+    now = datetime(2026, 5, 4, 12, 0, 0, tzinfo=timezone.utc)  # Mon
+    week = wj.iso_week(now)
+    rep.add("weekly_jobs_iso_week_format", "weekly_jobs",
+            week == "2026-W19",
+            f"week={week} expected=2026-W19")
+
+    # Idempotency state machine via a temp file.
+    tmp_state = _Path(tempfile.mkdtemp()) / "weekly_state.json"
+    saved = wj.STATE_PATH
+    try:
+        wj.STATE_PATH = tmp_state
+        rep.add("weekly_jobs_should_run_when_empty", "weekly_jobs",
+                wj.should_run_this_week("nl_cohort_drift", now=now) is True,
+                "no state file → should run")
+        wj.mark_ran_this_week("nl_cohort_drift", now=now)
+        rep.add("weekly_jobs_should_skip_after_mark", "weekly_jobs",
+                wj.should_run_this_week("nl_cohort_drift", now=now) is False,
+                "after mark → must skip")
+        # Next ISO week (now + 7 days) → eligible again.
+        next_week = now + timedelta(days=7)
+        rep.add("weekly_jobs_should_run_next_week", "weekly_jobs",
+                wj.should_run_this_week(
+                    "nl_cohort_drift", now=next_week) is True,
+                "fresh ISO week → should run again")
+    finally:
+        wj.STATE_PATH = saved
+
+    # run_weekly_jobs surfaces both the drift result and skip semantics.
+    # send_telegram=False keeps the eval silent (no real network call).
+    tmp_state2 = _Path(tempfile.mkdtemp()) / "weekly_state.json"
+    try:
+        wj.STATE_PATH = tmp_state2
+        out = wj.run_weekly_jobs(now=now, send_telegram=False)
+        rep.add("run_weekly_jobs_runs_drift", "weekly_jobs",
+                isinstance(out.get("jobs", {}).get("nl_cohort_drift"), dict)
+                and out.get("iso_week") == week,
+                f"jobs={list(out.get('jobs', {}).keys())} "
+                f"week={out.get('iso_week')}")
+        out2 = wj.run_weekly_jobs(now=now, send_telegram=False)
+        rep.add("run_weekly_jobs_skips_second_call", "weekly_jobs",
+                out2.get("jobs", {}).get("nl_cohort_drift") == "skipped",
+                f"second jobs={out2.get('jobs')}")
+        out3 = wj.run_weekly_jobs(now=now, force=True, send_telegram=False)
+        rep.add("run_weekly_jobs_force_reruns", "weekly_jobs",
+                isinstance(out3.get("jobs", {}).get("nl_cohort_drift"), dict),
+                f"force jobs={out3.get('jobs')}")
+    finally:
+        wj.STATE_PATH = saved
+
+    # Gitignore guard: state file path is under data/ and listed in .gitignore.
+    rep.add("weekly_jobs_state_under_data", "weekly_jobs",
+            str(wj.STATE_PATH).startswith("/opt/tiktok-bot/data/"),
+            f"path={wj.STATE_PATH}")
+    gi = Path("/opt/tiktok-bot/.gitignore").read_text(encoding="utf-8")
+    rep.add("weekly_jobs_state_gitignored", "weekly_jobs",
+            "data/weekly_jobs_state.json" in gi,
+            "must be in .gitignore")
+
+
 def eval_intent_stats(rep: EvalReport) -> None:
     """Intent stats — log + threshold suggestion API.
 
@@ -2099,6 +2254,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_intent_stats_wired(rep)
     if category in (None, "daily_jobs"):
         eval_daily_jobs(rep)
+    if category in (None, "weekly_jobs"):
+        eval_weekly_jobs(rep)
     if category in (None, "nl_cohort"):
         eval_nl_cohort(rep)
 
