@@ -33,6 +33,15 @@ attempted in this session.
 - [x] Owner Command Agent v2 — Vietnamese NL router with 30+ intents,
       autorun pump loop, GPT-5.5 prompt refinement, Claude CLI
       autonomous coding, quota-aware pause+resume
+- [x] Tool registry v2 — `discover_skills()` (handler-presence audit),
+      `compute_skill_stats()` (runs / success-rate / last-used / stale
+      from the audit log), persistent admin overrides via
+      `data/skill_overrides.json` (gitignored). `/skills` shows runs,
+      success%, last-used, ⚠handler / ⚠stale flags. NL toggle
+      ("tắt skill X" / "bật skill X") + `/skill_enable` /
+      `/skill_disable`. Stale threshold: 14d. 18 evals locking
+      discovery shape, stats bounds, NL classification, and override
+      persistence. See `bot/agent/skill_registry.py`.
 
 ## Now — Brain capability layer (memory + tools + NL)
 
@@ -48,13 +57,6 @@ attempted in this session.
       pending — current search remains keyword-based.
       Touch `bot/memory_store.py`, `bot/memory.py`, `bot/agent/runner.py`.
       Evals: 13 new in `memory_v2` category (dedup, decay, retry recall).
-
-- [ ] Tool registry v2 — auto-discover registered skills at startup,
-      surface them in `/skills` with risk/last-used/success-rate, allow
-      admin to enable/disable a skill via NL ("tắt skill X"), warn when
-      a skill hasn't been used in N days. Touch
-      `bot/agent/skill_registry.py`, `bot/agent/runner.py`.
-      Add evals: skill discovery, enable/disable NL, stats.
 
 - [ ] NL router v3 — confidence calibration (don't fall to chat when
       a partial pattern matched; ask "ý anh là X hay Y?"), unknown-

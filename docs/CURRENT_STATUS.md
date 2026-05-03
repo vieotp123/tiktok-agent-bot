@@ -128,6 +128,65 @@ cần anh bấm Đồng ý trước khi chạy."** instead of generic "no
 permission". Low/medium auto-runs silently with audit log; high-risk
 shows the inline ✅ Đồng ý / ❌ Hủy keyboard.
 
+## Tool Registry v2
+
+`bot/agent/skill_registry.py` discovers built-in skills at import time
+(every `register(Skill(...))` call runs when the module is loaded), so
+adding a new skill to the registry is the only wiring needed — no
+extra startup hook. Three helpers expose the live state:
+
+- **`discover_skills()`** — re-applies persisted admin overrides and
+  returns one row per skill enriched with `handler_found` (does the
+  `Skill.handler` string still resolve to a callable in `bot.tools`,
+  `bot.agent.runner`, `bot.telegram_bot`, `bot.seo_research`,
+  `bot.content_factory`, `bot.ocr`, or `backend.server`?).
+- **`compute_skill_stats(stale_days=14)`** — single pass over
+  `data/audit/actions.jsonl` returning `{runs, successes,
+  success_rate, last_used, stale}` per skill. Reads `action="<skill>"`
+  and `action="run_task:<skill>"` entries; skills with zero runs
+  appear with `runs=0, stale=True`.
+- **`set_skill_enabled(name, enabled)`** — persists an admin override
+  in `data/skill_overrides.json` (gitignored). Overrides are
+  re-applied on every import via `apply_overrides()` so toggles
+  survive a restart.
+
+### `/skills` panel
+
+```
+✅ 🟢 search_web — Tìm kiếm web qua DuckDuckGo, tóm tắt kết quả bằng…
+   runs=12 success=92% · last=2026-05-02
+❌ 🟡 content_factory — Caption writer (cx/gpt-5.5) + image-brief stub.…
+   never run
+✅ 🔴 send_tiktok_dm — Gửi tin nhắn vào TikTok DM — cần xác nhận trước…
+   runs=3 success=100% · last=2026-04-15 ⚠stale
+```
+
+`✅` / `❌` = enabled state · 🟢/🟡/🔴 = risk level · `⚠handler` if the
+handler string no longer resolves · `⚠stale` if the skill ran before
+but has been idle > `STALE_DAYS_DEFAULT` (14d).
+
+### Admin toggles
+
+- Slash: `/skill_enable <name>` / `/skill_disable <name>`.
+- NL (Vietnamese): "tắt skill X" / "bật skill X" / "xem skills".
+- `/skill <name>` shows the detail card (description, risk, handler,
+  runs / success% / last_used, examples).
+
+Toggling a skill emits an audit entry (`action="skill_enable"` /
+`"skill_disable"`, `risk_level="medium"`) per
+`docs/OPERATING_RULES.md` §6.
+
+### Evals
+
+18 evals (`skill_v2_*` prefix) lock:
+- discovery shape (`handler_found` boolean per skill, all built-in
+  skills present)
+- stats bounds (success_rate ∈ [0, 1], `stale` true when `runs=0`)
+- NL classification of "tắt skill X" / "bật skill X" / "xem skills"
+- override persistence (write → reload module → state restored)
+
+`/agent_evals` total: 350/350 in ~3.6s.
+
 ## Claude Quota Probe + Retry v1
 
 - **`bot/claude_quota.py`** extended with v2 honest-tracking schema.
