@@ -812,7 +812,7 @@ def eval_agent_autorun_state(rep: EvalReport) -> None:
     backup    = real_path.read_text(encoding="utf-8") if real_path.exists() else None
     try:
         # Start a fresh autorun
-        d = _aa.start(hours=2.0, max_tasks=5,
+        d = _aa.start(hours=2.0, max_tasks=50,
                       objective="eval test", user="evals")
         rep.add("autorun_started", "agent_autorun",
                 d.get("enabled") is True and d.get("hours") == 2.0,
@@ -839,13 +839,19 @@ def eval_agent_autorun_state(rep: EvalReport) -> None:
                 and s.get("paused_reason") == "quota_limited",
                 f"paused_reason={s.get('paused_reason')}")
 
-        # 2 consecutive failures → due_to_stop True
+        # Owner directive 2026-05-03: stop logic moved from
+        # "2 consecutive failures" → supervisor drift threshold
+        # (>1 critical fail in last 6 non-pause cycles).
+        # Need >= 6 non-pause cycles + 2 critical fails to trip stop.
+        # Replay history with 5 wins + 2 fails → drift verdict=stop.
+        for _ in range(5):
+            _aa.record_outcome({"status": "done", "task_id": "tw"})
         _aa.record_outcome({"status": "worker_failed", "task_id": "t3"})
         _aa.record_outcome({"status": "smoke_failed",  "task_id": "t4"})
         should, reason = _aa.is_due_to_stop()
-        rep.add("autorun_due_two_failures", "agent_autorun",
-                should and reason == "two_failures",
-                f"should={should} reason={reason}")
+        rep.add("autorun_due_drift", "agent_autorun",
+                should and reason.startswith("drift"),
+                f"should={should} reason={reason!r}")
 
         # stop()
         _aa.stop(user="evals", reason="test_done")
@@ -866,6 +872,66 @@ def eval_agent_autorun_state(rep: EvalReport) -> None:
                 real_path.unlink()
             except Exception:
                 pass
+
+
+def eval_supervisor(rep: EvalReport) -> None:
+    """Drift detector — owner directive: 1 critical fail / 6 non-pause
+    cycles → stop, otherwise continue. Quota pauses don't count."""
+    from bot.agent import supervisor as _sup
+
+    # Empty history → continue
+    r = _sup.check_drift([])
+    rep.add("supervisor_empty_history", "supervisor",
+            r["verdict"] == "continue",
+            f"got={r['verdict']}")
+
+    # 6 wins → continue
+    h: list = []
+    for _ in range(6):
+        _sup.record_cycle(h, {"status": "done", "task_id": "t"})
+    r = _sup.check_drift(h)
+    rep.add("supervisor_6_done_continue", "supervisor",
+            r["verdict"] == "continue" and r["critical_count"] == 0,
+            f"got={r}")
+
+    # 6 wins + 5 quota_limited (pauses skipped) + 2 wins → still continue
+    h2: list = []
+    for _ in range(6):
+        _sup.record_cycle(h2, {"status": "done"})
+    for _ in range(5):
+        _sup.record_cycle(h2, {"status": "quota_limited"})
+    for _ in range(2):
+        _sup.record_cycle(h2, {"status": "done"})
+    r = _sup.check_drift(h2)
+    rep.add("supervisor_quota_skipped", "supervisor",
+            r["verdict"] == "continue",
+            f"pauses must not count as fail; got={r}")
+
+    # 5 done + 2 worker_failed in last 6 non-pause → stop
+    h3: list = []
+    for _ in range(5):
+        _sup.record_cycle(h3, {"status": "done"})
+    for _ in range(2):
+        _sup.record_cycle(h3, {"status": "worker_failed", "task_id": "ctk_x"})
+    r = _sup.check_drift(h3)
+    rep.add("supervisor_2_fails_stop", "supervisor",
+            r["verdict"] == "stop" and r["critical_count"] == 2,
+            f"got={r}")
+
+    # Pause-only history → continue (no real signal yet)
+    h4: list = []
+    for _ in range(10):
+        _sup.record_cycle(h4, {"status": "quota_limited"})
+    r = _sup.check_drift(h4)
+    rep.add("supervisor_all_pause_continue", "supervisor",
+            r["verdict"] == "continue",
+            f"all-pause should never trigger stop; got={r}")
+
+    # Format helper renders without raising
+    text = _sup.format_drift_report(r, h4)
+    rep.add("supervisor_format_drift_report", "supervisor",
+            isinstance(text, str) and "Supervisor" in text,
+            f"got_len={len(text)}")
 
 
 def eval_handler_safety(rep: EvalReport) -> None:
@@ -1548,6 +1614,62 @@ def eval_nl_router_v3(rep: EvalReport) -> None:
             "all keys lowercase")
 
 
+def eval_brain_context(rep: EvalReport) -> None:
+    """Brain context builder — admin chat fallback injection.
+
+    Locks the contract that `bot.agent.brain_context.build_admin_brain_context`
+    composes the four required sections (memories / audit / autorun /
+    pending_actions), respects its char cap, never leaks `payload_json`,
+    and is wired into `backend.server.call_llm` ONLY for telegram admin.
+    """
+    from bot.agent.brain_context import build_admin_brain_context
+
+    out = build_admin_brain_context("status")
+    rep.add("brain_ctx_returns_str", "brain_context",
+            isinstance(out, str), f"type={type(out).__name__}")
+    rep.add("brain_ctx_cap_respected", "brain_context",
+            len(out) <= 4000, f"len={len(out)}")
+
+    short = build_admin_brain_context("status", max_chars=600)
+    rep.add("brain_ctx_custom_cap", "brain_context",
+            len(short) <= 600, f"len={len(short)}")
+
+    rep.add("brain_ctx_no_payload_json", "brain_context",
+            "payload_json" not in out, "payload_json must not appear")
+
+    has_any_section = any(s in out for s in (
+        "**Relevant memories**",
+        "**Recent audit**",
+        "**Autorun state:**",
+        "**Pending actions**",
+    ))
+    rep.add("brain_ctx_header_if_data", "brain_context",
+            (out == "") or (out.startswith("### Brain Context")
+                            and has_any_section),
+            f"out_head={out[:60]!r}")
+
+    # Empty / odd queries do not raise.
+    for q in ("", "????", "tdtfgkjhgkj"):
+        try:
+            r = build_admin_brain_context(q)
+            ok = isinstance(r, str)
+        except Exception:
+            ok = False
+        rep.add(f"brain_ctx_safe[{q!r}]", "brain_context",
+                ok, "must not raise")
+
+    # Wiring: backend.server.call_llm references the builder via its
+    # public symbol name, only inside the telegram admin guard.
+    import inspect
+    from backend import server as _be
+    src = inspect.getsource(_be.call_llm)
+    rep.add("brain_ctx_wired_in_call_llm", "brain_context",
+            "build_admin_brain_context" in src
+            and 'source == "telegram"' in src
+            and 'tg_admin' in src,
+            "call_llm must guard injection by source+username")
+
+
 async def run_all_evals(category: str | None = None) -> EvalReport:
     rep = EvalReport(started_at=time.time())
 
@@ -1587,6 +1709,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_owner_command_agent(rep)
     if category in (None, "agent_autorun"):
         eval_agent_autorun_state(rep)
+    if category in (None, "supervisor"):
+        eval_supervisor(rep)
     if category in (None, "handler_safety"):
         eval_handler_safety(rep)
     if category in (None, "ocr"):
@@ -1599,6 +1723,8 @@ async def run_all_evals(category: str | None = None) -> EvalReport:
         eval_skill_registry_v2(rep)
     if category in (None, "nl_router_v3"):
         eval_nl_router_v3(rep)
+    if category in (None, "brain_context"):
+        eval_brain_context(rep)
 
     rep.finished_at = time.time()
     return rep

@@ -69,6 +69,10 @@ _DEFAULT: dict = {
     # Rules §4 "never invent prices") and self_improve keeps re-pulling
     # the same first-unchecked item.
     "attempted_items":      [],
+    # Rolling cycle outcomes for the supervisor's drift detector.
+    # Schema per entry: {ts, task_id, status, category, summary}.
+    # Capped at 50 by bot.agent.supervisor.MAX_HISTORY.
+    "cycle_history":        [],
 }
 
 _FAIL_STATUSES = {
@@ -125,20 +129,41 @@ def start(
     *,
     user: str = "tg_admin",
     auto_self_improve: bool = False,
+    stop_at_iso: str | None = None,
 ) -> dict:
-    h = float(max(0.1, min(hours, 24.0)))
-    # Self-improve mode allows up to 999 tasks (effectively unlimited
-    # for the hour budget); regular autorun caps at 200.
-    cap = 999 if auto_self_improve else 200
-    n = int(max(1, min(int(max_tasks), cap)))
+    """Start (or restart) an autorun session.
+
+    Either pass `hours` (≤ 24*120 days) or pass `stop_at_iso`
+    (absolute UTC deadline). Owner directive 2026-05-03:
+    "đặt giới hạn autorun là 1/6/2026" → use stop_at_iso=
+    '2026-06-01T00:00:00Z'. The hour cap is relaxed to 24*120
+    (~120 days) to support multi-week sessions.
+    """
     started = _now()
-    stop_at = started + timedelta(hours=h)
+    if stop_at_iso:
+        try:
+            stop_at_dt = _parse_iso(stop_at_iso)
+            if stop_at_dt is None:
+                raise ValueError(f"bad stop_at_iso: {stop_at_iso}")
+            # Compute hours from started → stop_at_dt for display
+            h = max(0.1, (stop_at_dt - started).total_seconds() / 3600.0)
+        except Exception:
+            stop_at_dt = started + timedelta(hours=float(hours or 12.0))
+            h = float(hours or 12.0)
+    else:
+        # Relaxed cap: support multi-week long sessions per owner directive.
+        h = float(max(0.1, min(float(hours), 24.0 * 120)))
+        stop_at_dt = started + timedelta(hours=h)
+    # Self-improve mode allows up to 9999 tasks for very long sessions;
+    # regular autorun caps at 200.
+    cap = 9999 if auto_self_improve else 200
+    n = int(max(1, min(int(max_tasks), cap)))
     d = state()
     d["enabled"]              = True
     d["objective"]            = (objective or "")[:500]
     d["started_at"]           = started.strftime("%Y-%m-%dT%H:%M:%SZ")
-    d["stop_at"]              = stop_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-    d["hours"]                = h
+    d["stop_at"]              = stop_at_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    d["hours"]                = round(h, 2)
     d["max_tasks"]            = n
     d["completed_tasks"]      = 0
     d["consecutive_failures"] = 0
@@ -148,6 +173,7 @@ def start(
     d["auto_self_improve"]    = bool(auto_self_improve)
     d["self_improve_runs"]    = 0
     d["attempted_items"]      = []
+    d["cycle_history"]        = []
     _save(d)
     try:
         from bot.agent.audit_log import log_action
@@ -221,19 +247,41 @@ def is_enabled() -> bool:
 
 
 def is_due_to_stop() -> tuple[bool, str]:
-    """Returns (should_stop, reason). Called by scheduler before each tick."""
+    """Returns (should_stop, reason). Called by scheduler before each tick.
+
+    Owner directive 2026-05-03: "nó chỉ dừng khi claude bị limit, hết
+    limit lại chạy tiếp" — quota pauses must NEVER stop. Plus the
+    supervisor's drift threshold (1 critical fail in last 6 non-pause
+    cycles) replaces the old two-failures cap.
+
+    Stop reasons in priority order:
+      1. not_enabled           — admin called stop()
+      2. deadline_reached      — stop_at passed (1/6/2026 by default)
+      3. max_tasks_reached     — completed >= max_tasks
+      4. drift                 — supervisor.check_drift verdict=stop
+    Quota pauses are HANDLED ELSEWHERE (pump_loop sleeps until
+    can_probe_now()) and do not return True here.
+    """
     d = state()
     if not d.get("enabled"):
         return True, "not_enabled"
     stop_at = _parse_iso(d.get("stop_at") or "")
     if stop_at and _now() >= stop_at:
-        return True, "hours_reached"
+        return True, "deadline_reached"
     completed  = int(d.get("completed_tasks") or 0)
     max_tasks  = int(d.get("max_tasks") or 0)
     if max_tasks > 0 and completed >= max_tasks:
         return True, "max_tasks_reached"
-    if int(d.get("consecutive_failures") or 0) >= 2:
-        return True, "two_failures"
+    # Supervisor drift check — only in long-horizon mode where we have
+    # a real history to look at. < 6 non-pause cycles → continue.
+    try:
+        from bot.agent import supervisor as _sup
+        check = _sup.check_drift(d.get("cycle_history") or [],
+                                  window=6, max_failures=1)
+        if check.get("verdict") == "stop":
+            return True, f"drift:{check.get('summary','')[:80]}"
+    except Exception:
+        pass
     return False, ""
 
 
@@ -272,7 +320,11 @@ def can_probe_now() -> bool:
 
 
 def record_outcome(result: dict) -> None:
-    """Update state after one bridge.run_once cycle."""
+    """Update state after one bridge.run_once cycle.
+
+    Also appends to cycle_history via supervisor.record_cycle so the
+    drift detector has data on hand.
+    """
     d = state()
     if not d.get("enabled"):
         return
@@ -284,6 +336,15 @@ def record_outcome(result: dict) -> None:
     d["last_task_id"] = task_id
     d["last_status"]  = status
     d["last_summary"] = summary
+
+    # Append to rolling cycle_history (FIFO, capped at MAX_HISTORY).
+    try:
+        from bot.agent import supervisor as _sup
+        history = d.get("cycle_history") or []
+        _sup.record_cycle(history, result or {})
+        d["cycle_history"] = history
+    except Exception:
+        pass
 
     if status in _OK_STATUSES:
         d["completed_tasks"]      = int(d.get("completed_tasks") or 0) + 1

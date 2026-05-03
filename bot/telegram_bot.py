@@ -2040,6 +2040,25 @@ def handle_agent_autorun_status() -> str:
     return _aa.status_panel_vi()
 
 
+def handle_supervisor() -> str:
+    """Show drift-detection report from supervisor on the last 6 cycles.
+
+    Owner directive: autorun should keep running through quota pauses;
+    only the supervisor's drift threshold (1 critical fail / 6 cycles)
+    can hard-stop. Surface what it sees so admin can debug if it ever
+    triggers.
+    """
+    try:
+        from bot.agent import supervisor as _sup
+        from bot.agent import agent_autorun as _aa
+        d = _aa.state()
+        history = d.get("cycle_history") or []
+        check = _sup.check_drift(history, window=6, max_failures=1)
+        return _sup.format_drift_report(check, history)
+    except Exception as e:
+        return f"⚠ supervisor: {_esc(str(e))[:160]}"
+
+
 # ── /agent_progress — current task progress ──────────────────────────────────
 
 async def handle_agent_progress() -> str:
@@ -4060,6 +4079,7 @@ async def dispatch(text: str, chat_id: str | int = "") -> str:
     if cmd == "/agent_autorun_start":  return await handle_agent_autorun_start(arg, chat_id=chat_id)
     if cmd == "/agent_autorun_stop":   return handle_agent_autorun_stop()
     if cmd == "/agent_autorun_status": return handle_agent_autorun_status()
+    if cmd == "/supervisor":           return handle_supervisor()
     if cmd == "/agent_progress":       return await handle_agent_progress()
     # ── EsimAccess shortcuts ─────────────────────────────────────────────
     if cmd == "/esim_docs":            return handle_esim_docs()
