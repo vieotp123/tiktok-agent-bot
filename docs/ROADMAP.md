@@ -146,7 +146,9 @@ attempted in this session.
 - [ ] Competitor scrape with login (would need credential vault — out of
   scope until secret management is added).
 - [ ] Cross-channel CRM merge (Telegram + TikTok + email) — needs an
-  email integration first.
+  email integration first. Design captured in
+  `docs/CROSS_CHANNEL_CRM.md`; phased plan starts after the email
+  worker lands.
 
 ## Operating-rule additions to consider
 
